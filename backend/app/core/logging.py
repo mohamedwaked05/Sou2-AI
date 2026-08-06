@@ -18,7 +18,7 @@ def configure_logging(log_level: str) -> None:
     )
     if handler is None:
         handler = logging.StreamHandler()
-        setattr(handler, "_sou2ai_handler", True)
+        handler._sou2ai_handler = True
         root_logger.addHandler(handler)
 
     handler.setLevel(log_level.upper())

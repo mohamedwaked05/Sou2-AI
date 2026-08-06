@@ -1,8 +1,7 @@
 """Tests for the public health endpoint."""
 
-from fastapi.testclient import TestClient
-
 from app.main import app
+from fastapi.testclient import TestClient
 
 
 def test_health_endpoint_returns_service_status() -> None:
