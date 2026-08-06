@@ -1,0 +1,32 @@
+# Python and backend environments
+backend/.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Environment and local editor files
+.env
+backend/.env
+.vscode/settings.json
+.vscode/tasks.json
+.vscode/launch.json
+
+# Future frontend dependencies and builds
+frontend/node_modules/
+frontend/dist/
+
+# Runtime data and local databases
+data/uploads/*
+!data/uploads/.gitkeep
+data/generated/*
+!data/generated/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
+
+# OS files
+.DS_Store
+Thumbs.db
