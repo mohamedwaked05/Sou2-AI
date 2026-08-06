@@ -1,296 +1,165 @@
 # AGENTS.md  Sou2AI Development Rules
 
-## Project
-
-Sou2AI is a local-first AI assistant for small businesses.
-
-Planned stack:
-
-- FastAPI
-- Python
-- PostgreSQL
-- pgvector
-- Ollama
-- Qwen2.5 7B
-- BGE-M3
-- React
-
-Supported languages:
-
-- English
-- Arabic
-- Lebanese Arabic
-- Franco-Arabic
-- Mixed Arabic and English
-- Mixed Franco-Arabic and English
-
-Development must be incremental.
-
-Do not build future milestones before they are explicitly requested.
-
 ## Core Working Rule
 
-Work only on the task requested in the current prompt.
-
-Do not continue automatically into the next milestone.
-
-Do not add features only because they may be useful later.
+Work only on the task requested in the current prompt. Do not continue into a
+future milestone or add features merely because they may be useful later.
 
 When the requested task is complete, stop and provide a concise summary.
 
+## Project References
+
+Read `PROJECT.md` for project goals, users, roadmap, and technical stack.
+
+Read `ARCHITECTURE.md` only when the current task affects system architecture,
+RAG, models, tools, memory, database design, language handling, or deployment.
+
+Do not reread or summarize those files when they are unrelated to the current
+task.
+
+Project documents describe planned work, not authorization to implement it.
+Follow the current user request when defining scope.
+
 ## Session Startup and Token Usage
 
-At the beginning of a new session:
+At the beginning of a session:
 
-1. Read this `AGENTS.md`.
-2. Read the current user request.
-3. Inspect only files directly relevant to the request.
-4. Do not scan or summarize the entire repository unless necessary.
-5. Do not repeat the complete project architecture.
-6. Do not restate information already available in this file.
-7. Do not produce a long introduction.
-8. Begin with a concise statement of what will change.
+1. Read this file and the current user request.
+2. Inspect only files directly relevant to that request.
+3. State concisely what will change.
 
-Prefer targeted file inspection over broad repository exploration.
+Do not scan or summarize the entire repository unless necessary. Do not read
+virtual environments, caches, generated files, uploaded runtime data, or
+dependency folders unless the task requires them. Avoid repeated architecture
+explanations and unnecessary context use.
 
-Do not read virtual environments, caches, generated files, uploaded runtime data, or dependency folders unless the task requires them.
-
-Avoid unnecessary token usage while maintaining correctness.
+Use targeted searches before broad listings. Read configuration, tests, and
+documentation only when they affect the requested change. Do not repeat facts
+already available in the user request or these rules.
 
 ## Step-by-Step Development
 
-The user wants development performed one step at a time.
+For each task:
 
-For every task:
-
-1. Inspect the relevant files.
+1. Inspect relevant files.
 2. Identify the smallest required change.
 3. Implement only that change.
-4. Run the relevant validation or test.
-5. Explain the result briefly.
-6. Stop.
+4. Run relevant validation or tests.
+5. Report the result briefly and stop.
 
-Do not provide several future steps at once.
+Do not rush ahead or implement the next milestone without a new explicit
+request.
 
-Do not rush ahead.
-
-Do not implement the next milestone without a new explicit request.
+For a small task, begin after the targeted inspection. For a larger task, use a
+short plan of no more than five items. Ask a question only when missing
+information materially prevents correct work.
 
 ## Dependency Compatibility
 
-Assume dependencies already selected for the project are compatible unless the user explicitly asks to verify them.
+Assume selected dependencies are compatible unless the user asks for
+verification. Do not browse package registries before every implementation.
 
-Do not browse documentation or package registries before every implementation.
+Verify compatibility only when introducing a dependency, upgrading a major
+version, or diagnosing an installation problem. Do not add future milestone
+dependencies early.
 
-Only verify compatibility when:
+Do not change the current Python version unless explicitly requested. Use
+Windows PowerShell commands in documentation and prefer `python -m pip` when
+interpreter selection matters.
 
-- introducing a new dependency
-- upgrading a major version
-- diagnosing an installation problem
-
-Avoid unnecessary web lookups.
+Before adding a dependency, confirm it is required for the current milestone,
+add it to `pyproject.toml`, and explain its purpose briefly. Do not change
+versions unless an installation error clearly requires it.
 
 ## Architecture Boundaries
 
-Maintain these responsibilities:
+- `app/api/` handles HTTP routes; `app/api/v1/` contains version 1 APIs.
+- `app/core/` holds configuration, logging, and shared exceptions.
+- `app/database/` manages persistence infrastructure.
+- `app/rag/` manages ingestion and retrieval.
+- `app/agent/` decides which capabilities to use.
+- `app/tools/` exposes controlled operations.
+- `app/memory/` stores and retrieves conversation or semantic memory.
+- `app/services/` contains application logic.
+- `app/schemas/` contains Pydantic request and response schemas.
+- `app/utils/` contains small shared utilities.
 
-- `app/api/`  HTTP routes and request handling
-- `app/api/v1/`  version 1 API routes and router
-- `app/core/`  configuration, logging, and shared exceptions
-- `app/database/`  database infrastructure
-- `app/rag/`  ingestion and retrieval pipeline
-- `app/agent/`  agent orchestration
-- `app/tools/`  controlled agent tools
-- `app/memory/`  structured and semantic memory
-- `app/services/`  application business logic
-- `app/schemas/`  Pydantic request and response schemas
-- `app/utils/`  small shared utilities
+Keep routes focused on HTTP concerns. Do not combine API, database, RAG, agent,
+or memory responsibilities in one module, and do not put database queries in
+routes.
 
-Do not place business logic directly inside API route files.
+Do not create fake implementations of future capabilities. When those
+capabilities are introduced, preserve clear separation between ingestion,
+retrieval, persistence, tools, and response generation.
 
-Do not place database queries directly inside route files.
-
-Do not combine API, RAG, database, agent, and memory responsibilities in one module.
+Keep configuration and shared infrastructure reusable, but do not add empty
+business abstractions solely for future convenience.
 
 ## Coding Style
 
-Use production-ready but beginner-readable code.
+Use production-ready, beginner-readable code with clear names, type hints, and
+focused modules and functions. Prefer simple code over unnecessary abstractions,
+duplicate logic, or fake placeholder implementations.
 
-Required practices:
+Preserve existing naming and structure unless there is a strong reason to
+change it. Use Ruff for formatting and linting. Do not introduce unnecessary
+dependencies.
 
-- Use clear names.
-- Use type hints.
-- Keep functions focused.
-- Keep modules focused on one responsibility.
-- Prefer simple code over unnecessary abstraction.
-- Avoid placeholder implementations that pretend to work.
-- Avoid duplicate logic.
-- Preserve existing naming and structure unless there is a strong reason to change them.
-- Use Ruff for formatting and linting.
-- Do not introduce unnecessary dependencies.
-
-## AI Reliability Rules
-
-When AI functionality is added later:
-
-- Never fabricate prices.
-- Never fabricate stock quantities.
-- Never fabricate customers or orders.
-- Never fabricate business policies.
-- Never claim an action succeeded unless a tool confirms it.
-- Retrieve business knowledge before answering.
-- Clearly state when information is unavailable.
-- Keep confirmed facts separate from recommendations.
-- Require confirmation before destructive actions.
-
-## RAG Rules
-
-When the RAG milestone begins:
-
-- Keep ingestion separate from retrieval.
-- Keep embeddings separate from LLM generation.
-- Store source metadata for every chunk.
-- Return sources with answers.
-- Use similarity thresholds.
-- Do not answer from unrelated retrieved chunks.
-- Do not use the LLM instead of structured database queries.
-- Test English, Arabic, Lebanese Arabic, Franco-Arabic, and mixed-language queries.
-
-Do not add LangChain or LlamaIndex unless explicitly requested.
-
-## Local Model Rules
-
-Planned local models:
-
-- Chat model: `qwen2.5:7b`
-- Embedding model: `bge-m3`
-- Runtime: Ollama
-- Ollama address: `http://localhost:11434`
-
-Do not assume a model is installed or running.
-
-Verify availability before using it.
-
-Do not silently substitute another model.
-
-Do not introduce paid APIs unless explicitly requested.
-
-## Python Environment
-
-Development is on Windows.
-
-Do not change the current Python version unless explicitly requested.
-
-Before adding a new dependency:
-
-1. Confirm it is needed for the current milestone.
-2. Add it to `pyproject.toml`.
-3. Explain briefly why it is needed.
-4. Do not install future milestone dependencies early.
-
-Use Windows PowerShell commands in documentation.
-
-Prefer:
-
-```powershell
-python -m pip
-```
-
-when interpreter selection matters.
+Add comments only when the reason is not obvious. Avoid generic base classes,
+repositories, and helpers unless they solve a current requirement.
 
 ## File Safety
 
-Before modifying files:
+Inspect files before modifying them. Preserve unrelated user work; do not
+overwrite files blindly, delete files without explanation, rename major
+directories without approval, or manually modify generated/dependency files.
 
-* Inspect their contents.
-* Preserve unrelated user work.
-* Do not overwrite files blindly.
-* Do not delete files without explaining why.
-* Do not rename major directories without approval.
-* Do not modify generated or dependency files manually.
-* Do not create duplicate modules.
-
-Never expose secrets from `.env`.
-
-Never commit:
-
-* `.env`
-* Passwords
-* API keys
-* Database credentials
-* Private customer data
-
+Never expose secrets from `.env`. Never commit credentials, private customer
+data, virtual environments, caches, generated runtime data, or uploaded files.
 Keep `.env.example` safe for source control.
+
+Resolve exact paths before destructive actions. Prefer recoverable operations
+when practical and report material deletions. Do not access or disclose the
+contents of secret files.
+
+Do not modify unrelated files to make a requested change appear cleaner.
 
 ## Testing
 
-Run only tests relevant to the current change.
+Run only tests relevant to the current change, plus Ruff checks where relevant.
+Report commands and results honestly. Do not claim success without validation
+or repair unrelated failures unless requested.
 
-After making changes:
-
-* Run targeted tests.
-* Run Ruff checks where relevant.
-* Report the command used.
-* Report whether it passed.
-* Report failures honestly.
-* Do not claim success without validation.
-* Do not repair unrelated failures unless requested.
+Run the smallest useful test first. If validation cannot run because of an
+environment or dependency failure, report the exact failure and do not pretend
+the feature is verified.
 
 ## Commands and Git
 
-Before running a command that:
+Before running installation, deletion, system-configuration, database, or other
+destructive commands, explain the action briefly. Safe inspection commands may
+run directly.
 
-* installs packages
-* deletes files
-* changes system configuration
-* modifies the database
-* or may be destructive
+Do not force-push, delete remote branches, overwrite unrelated remote history,
+or commit secrets. Do not initialize, commit, or push Git changes unless the
+user explicitly requests it.
 
-explain it briefly.
-
-Safe inspection commands may be run directly.
-
-Do not use force push.
-
-Do not delete remote branches.
-
-Do not overwrite unrelated remote history.
-
-Do not commit secrets, virtual environments, caches, generated runtime data, or uploaded files.
+Inspect status and staged changes before committing. Fetch and compare remote
+history before pushing when a remote may already contain commits. Stop rather
+than resolving unrelated or conflicting remote history destructively.
 
 ## Communication Style
 
-Keep responses concise and practical.
+Keep responses concise and practical. State what you understood and the small
+area being changed. On completion, report files changed, implementation,
+validation, and unresolved issues without long introductions or unrequested
+tutorials.
 
-At the start of a task, state:
-
-* What you understood.
-* Which small area you will work on.
-
-After completing a task, report:
-
-* Files changed.
-* What was implemented.
-* Validation performed.
-* Any unresolved issue.
-
-Do not include long introductions, repeated project descriptions, or unrequested tutorials.
-
-## Planning Rules
-
-For a small task, inspect the relevant files and begin directly.
-
-For a larger task, provide a short plan with no more than five items.
-
-Ask a question only when missing information materially prevents correct implementation.
+Use links to relevant local files when handing off code changes. Lead with the
+outcome rather than a long description of the process.
 
 ## Definition of Done
 
-A task is complete when:
-
-* The requested change is implemented.
-* Relevant tests and checks were run.
-* Existing unrelated behavior was preserved.
-* No unrequested milestone was started.
-* The result was summarized concisely.
-* Codex stopped and waited for the next instruction.
+A task is complete when the requested change is implemented, relevant checks
+have run, unrelated behavior is preserved, no unrequested milestone started,
+and the result is summarized concisely before stopping.
