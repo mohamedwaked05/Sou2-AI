@@ -124,6 +124,16 @@ contents of secret files.
 
 Do not modify unrelated files to make a requested change appear cleaner.
 
+## Preserve Existing Architecture
+
+Before creating a new file, class, function, or dependency:
+
+1. Inspect whether an appropriate implementation already exists.
+2. Extend existing code when reasonable.
+3. Do not create duplicate modules or parallel implementations.
+4. Prefer improving existing architecture over introducing new abstractions.
+5. If a refactor would affect multiple modules, explain it first instead of performing it automatically.
+
 ## Testing
 
 Run only tests relevant to the current change, plus Ruff checks where relevant.
