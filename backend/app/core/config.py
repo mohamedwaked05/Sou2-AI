@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 
-from pydantic import Field, ValidationInfo, field_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,7 +34,15 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_chat_model: str = "qwen2.5:7b"
     ollama_embedding_model: str = "bge-m3"
-    postgresql_database_url: str | None = None
+    postgresql_database_url: str = (
+        "postgresql+psycopg://sou2ai:sou2ai_local@127.0.0.1:5433/sou2ai_dev"
+    )
+    test_postgresql_database_url: str = (
+        "postgresql+psycopg://sou2ai:sou2ai_local@127.0.0.1:5433/sou2ai_test"
+    )
+    postgresql_connect_timeout_seconds: int = Field(default=5, ge=1)
+    tool_call_audit_retention_days: int = Field(default=90, ge=1)
+    tool_call_audit_hmac_secret: SecretStr | None = None
 
     @field_validator("allowed_cors_origins", mode="before")
     @classmethod

@@ -72,12 +72,13 @@ Testing and quality:
 
 ## Current status
 
-Milestone 1, the FastAPI backend foundation, is complete.
+Milestone 2, the PostgreSQL platform foundation, is complete. The repository now
+contains Docker-based development and test databases, SQLAlchemy sessions,
+Alembic migrations, foundational platform models, weekly schedules, guarded
+business activation, a minimal tool-call audit table, and database/API tests.
 
 The current repository does not yet contain:
 
-* Database connectivity
-* Database migrations
 * pgvector integration
 * Ollama connectivity
 * Embeddings
@@ -87,7 +88,7 @@ The current repository does not yet contain:
 * React functionality
 * WhatsApp integration
 
-The next milestone is Milestone 2: PostgreSQL database infrastructure.
+The next milestone is Milestone 3: local Ollama connectivity.
 
 ## Development roadmap
 
@@ -99,16 +100,22 @@ The next milestone is Milestone 2: PostgreSQL database infrastructure.
 * Health endpoint
 * Testing and formatting foundation
 
-### Milestone 2: PostgreSQL database infrastructure — Next
+### Milestone 2: PostgreSQL platform foundation — Complete
 
-* Run PostgreSQL locally with Docker Compose
-* Configure the database connection through environment variables
-* Add the SQLAlchemy database engine and session management
-* Add Alembic migrations
-* Verify connectivity through a database health check
-* Add automated tests that do not depend on a permanently running external database
+* Docker Compose creates separate `sou2ai_dev` and `sou2ai_test` databases.
+* SQLAlchemy and Psycopg provide scoped synchronous database sessions.
+* Alembic owns native enums, foundational platform tables, constraints, indexes,
+  and database triggers.
+* Users, business profiles, single-owner MVP memberships, weekly opening hours,
+  and privacy-minimal tool-call audit metadata are represented.
+* Profile completion is derived from current data; activation is guarded in
+  PostgreSQL so direct SQL cannot activate an incomplete business.
+* Database health, schedule normalization, retention, migration, model, and API
+  behavior are covered by automated tests using `sou2ai_test`.
 
-This milestone establishes infrastructure only. It does not add business tables, pgvector, RAG, or AI functionality.
+This milestone does not add authentication or business-creation endpoints,
+pgvector, RAG, AI tools/adapters, operational business data, inventory, billing,
+or a platform-admin dashboard.
 
 ### Milestone 3: Local Ollama connectivity
 
@@ -164,11 +171,13 @@ This milestone does not add RAG, memory, agent tools, or business-answering logi
 * Display answer sources
 * Show clear loading and error states
 
-### Milestone 10: Structured business data
+### Milestone 10: Controlled operational integrations
 
-* Design relational tables for business facts
-* Add controlled read operations
-* Keep relational data separate from unstructured RAG knowledge
+* Connect to each business's source system through a controlled API, read-only
+  database integration, or Sou2AI-managed operational system.
+* Add scoped read operations without copying live products, inventory, orders,
+  customers, appointments, or sales into the platform database unnecessarily.
+* Keep operational integrations separate from unstructured RAG knowledge.
 
 ### Milestone 11: Agent tool calling
 

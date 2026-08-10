@@ -1,0 +1,53 @@
+"""PostgreSQL integration fixtures with an explicit test-database safety gate."""
+
+import os
+from collections.abc import Generator
+
+import pytest
+from alembic import command
+from alembic.config import Config
+from app.core.config import Settings, get_settings
+from app.database.session import ensure_test_database_url
+from sqlalchemy import Engine, create_engine, text
+from sqlalchemy.orm import Session, sessionmaker
+
+TEST_SETTINGS = Settings()
+TEST_DATABASE_URL = TEST_SETTINGS.test_postgresql_database_url
+os.environ["POSTGRESQL_DATABASE_URL"] = TEST_DATABASE_URL
+get_settings.cache_clear()
+ensure_test_database_url(TEST_DATABASE_URL)
+
+
+@pytest.fixture(scope="session")
+def alembic_config() -> Config:
+    return Config("alembic.ini")
+
+
+@pytest.fixture(scope="session")
+def database_engine(alembic_config: Config) -> Generator[Engine]:
+    ensure_test_database_url(TEST_DATABASE_URL)
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(
+        TEST_DATABASE_URL,
+        pool_pre_ping=True,
+        connect_args={
+            "connect_timeout": TEST_SETTINGS.postgresql_connect_timeout_seconds,
+        },
+    )
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture
+def db_session(database_engine: Engine) -> Generator[Session]:
+    factory = sessionmaker(bind=database_engine, expire_on_commit=False)
+    with factory() as session:
+        yield session
+        session.rollback()
+    with database_engine.begin() as connection:
+        connection.execute(
+            text(
+                "TRUNCATE tool_call_logs, business_opening_shifts, "
+                "business_opening_days, business_memberships, businesses, users CASCADE"
+            )
+        )

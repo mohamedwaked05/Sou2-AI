@@ -4,7 +4,12 @@ Sou2AI is planned as a local AI assistant for small businesses, supporting Engli
 
 ## Status
 
-The project is at its initial setup milestone. It contains a production-ready FastAPI foundation only; no database, AI, RAG, document ingestion, or frontend functionality has been implemented.
+Milestone 2 is complete: the backend has its FastAPI foundation, Dockerized
+PostgreSQL development/test databases, SQLAlchemy models and sessions, Alembic
+migrations, business profile/schedule safeguards, minimal tool-call audit
+infrastructure, and database integration tests. AI, RAG, tool execution,
+operational integrations, document ingestion, and frontend functionality remain
+future work.
 
 The planned architecture is a FastAPI backend, PostgreSQL with pgvector, local Ollama models, and a React frontend. The backend lives in [`backend/`](backend/README.md).
 

@@ -44,7 +44,8 @@ During early milestones, the agent layer may not be active and the API can call 
 
 * React frontend provides the future browser interface.
 * FastAPI backend exposes HTTP APIs and coordinates application services.
-* PostgreSQL will hold structured business data and application metadata.
+* PostgreSQL holds platform-owned identity, business-profile, schedule, and audit
+  metadata. It does not mirror live operational business data.
 * pgvector will support vector similarity search in PostgreSQL.
 * Ollama will run local models.
 * Qwen2.5 7B will provide chat generation.
@@ -105,9 +106,17 @@ flowchart LR
 
 The system must state that information is unavailable when retrieval does not provide sufficient context.
 
-## 8. Structured data versus unstructured data
+## 8. Platform data versus operational business data
 
-Structured PostgreSQL data will include products, prices, inventory, customers, orders, payments, and sales. Unstructured RAG data will include policies, product descriptions, warranty documents, supplier documents, FAQs, and business notes. Future questions may combine both sources.
+Sou2AI PostgreSQL stores data the platform owns: users, business profiles,
+memberships, weekly opening hours, and minimal tool-call audit metadata. Products,
+inventory, orders, sales, revenue, customers, appointments, and billing remain in
+the business's source system. Future controlled tools will access those systems
+through an API, a read-only database integration, or a Sou2AI-managed operational
+system. This avoids stale copies and preserves the business's source of truth.
+
+Unstructured RAG data remains separate and will later cover approved documents
+such as policies, descriptions, warranties, FAQs, and business notes.
 
 ## 9. Agent flow
 
@@ -142,12 +151,58 @@ Sou2AI is planned to support English, Arabic, Lebanese Arabic, Franco-Arabic, an
 * Log tool calls and errors.
 * Do not expose internal exception details in production.
 
-## 12. Local deployment
+## 12. PostgreSQL platform foundation
+
+The Milestone 2 tables are:
+
+* `users`: platform accounts with normalized, case-insensitively unique email.
+* `businesses`: lightweight profiles, Lebanese defaults, and disabled-by-default
+  activation state.
+* `business_memberships`: the one-owner MVP association. Its relational shape can
+  later support roles and multiple members without duplicating ownership.
+* `business_opening_days`: one row per business weekday, with Monday `0` through
+  Sunday `6`.
+* `business_opening_shifts`: one to three local wall-clock intervals per open day.
+  A closing time before opening crosses midnight. Touching proposed intervals are
+  merged; overlaps are rejected.
+* `tool_call_logs`: business-scoped audit metadata only.
+
+Profile completion is calculated, never stored. It requires all profile text, a
+valid default language, seven days, no shifts on closed days, and one to three
+valid normalized shifts on open days. PostgreSQL rejects a disabled-to-active
+transition when these rules are not met. The platform owner may activate a
+complete business directly only after confirming offline payment; the database
+can validate completeness but cannot infer payment.
+
+Owner-scoped business-name uniqueness is serialized with a transaction advisory
+lock and enforced by triggers on memberships and business renames. This prevents
+query-then-insert races without duplicating owner data on `businesses`.
+
+Schedule replacement validates the complete proposal first and writes all seven
+days in one transaction. Deferred database triggers prevent an active business
+from ending a transaction with an invalid schedule.
+
+## 13. Minimal tool-call auditing
+
+The audit table stores only tool name, business/user scope, outcome, machine error
+code, latency, timestamp, and an HMAC-SHA-256 digest of deterministic canonical
+JSON arguments. It never stores raw arguments, return payloads, prompts,
+responses, reasoning, conversation text, customer PII, raw errors, or stack
+traces. Retention defaults to 90 days and is configurable; a reusable deletion
+operation is intended for a future external scheduler. No internal scheduler or
+`pg_cron` is used.
+
+A future centralized tool-execution service—not the model and not individual
+adapters—will write exactly one audit row after business-scope and permission
+checks for every success, error, or denial. That executor and its adapters remain
+out of scope.
+
+## 14. Local deployment
 
 ```text
 React: 5173
 FastAPI: 8000
-PostgreSQL: 5432
+PostgreSQL host port: 5433 (container port: 5432)
 Ollama: 11434
 ```
 
@@ -156,14 +211,26 @@ flowchart TD
     PC[Windows Development Machine]
     PC --> FE[React on 5173]
     PC --> BE[FastAPI on 8000]
-    PC --> PG[PostgreSQL on 5432]
+    PC --> PG[PostgreSQL on host port 5433]
     PC --> OL[Ollama on 11434]
 ```
 
-## 13. Future deployment
+Docker Compose persists `sou2ai_dev` in a named volume and creates isolated
+`sou2ai_test` automatically. Tests reject any database name other than
+`sou2ai_test`. `GET /api/v1/health/database` performs `SELECT 1` and returns only
+`healthy` or `unavailable` without connection details.
 
-React may be hosted separately, FastAPI may run on a cloud server, and PostgreSQL may become managed. Ollama may be replaced by a hosted inference provider or GPU server. A provider interface should allow changing the LLM without rewriting the application. WhatsApp is a future input channel, not the core system.
+## 15. Model-provider boundary and future deployment
 
-## 14. Current implementation boundary
+React may be hosted separately, FastAPI may run on a cloud server, and PostgreSQL
+may become managed. Ollama is only the local-development and early-testing
+provider. Production will use a cloud provider behind a provider abstraction, so
+database and domain code must never depend on Ollama or a particular model.
+WhatsApp is a future input channel, not the core system.
 
-Currently, the repository contains only the FastAPI foundation: configuration, logging, CORS preparation, exception handlers, service metadata, and a versioned health endpoint. Database persistence, model connectivity, RAG, agent orchestration, memory, document ingestion, and frontend functionality remain future work.
+## 16. Current implementation boundary
+
+The repository contains the FastAPI and PostgreSQL platform foundations described
+above. Authentication/business APIs, model connectivity, pgvector, RAG, tool
+execution, adapters, operational data, memory, document ingestion, billing, and
+frontend functionality remain future work.
