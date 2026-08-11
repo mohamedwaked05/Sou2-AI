@@ -1,4 +1,4 @@
-"""Milestone 2 platform-owned relational models."""
+"""Platform-owned relational models."""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ def normalize_business_name(value: str) -> str:
 
 
 class User(Base):
-    """A platform account; authentication endpoints remain out of scope."""
+    """A platform account identified independently from business access."""
 
     __tablename__ = "users"
     __table_args__ = (
@@ -99,10 +99,20 @@ class User(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+    email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     memberships: Mapped[list[BusinessMembership]] = relationship(back_populates="user")
     tool_call_logs: Mapped[list[ToolCallLog]] = relationship(
         back_populates="user", passive_deletes=True
+    )
+    refresh_sessions: Mapped[list[RefreshSession]] = relationship(
+        back_populates="user", cascade="all, delete-orphan", passive_deletes=True
+    )
+    email_verification_tokens: Mapped[list[EmailVerificationToken]] = relationship(
+        back_populates="user", cascade="all, delete-orphan", passive_deletes=True
+    )
+    password_reset_tokens: Mapped[list[PasswordResetToken]] = relationship(
+        back_populates="user", cascade="all, delete-orphan", passive_deletes=True
     )
 
     @validates("email")
@@ -112,6 +122,138 @@ class User(Base):
     @validates("first_name", "last_name")
     def trim_name(self, _key: str, value: str) -> str:
         return value.strip()
+
+
+class RefreshSession(Base):
+    """One hashed refresh-token generation within a device session family."""
+
+    __tablename__ = "refresh_sessions"
+    __table_args__ = (
+        CheckConstraint(
+            "token_hash ~ '^[0-9a-f]{64}$'", name="ck_refresh_sessions_hash_format"
+        ),
+        CheckConstraint(
+            "expires_at > created_at", name="ck_refresh_sessions_expiration"
+        ),
+        Index("ix_refresh_sessions_user_active", "user_id", "revoked_at"),
+        Index("ix_refresh_sessions_family", "session_family_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    session_family_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, default=uuid.uuid4
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    replaced_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("refresh_sessions.id", ondelete="SET NULL")
+    )
+
+    user: Mapped[User] = relationship(back_populates="refresh_sessions")
+
+
+class EmailVerificationToken(Base):
+    """Single-use hashed token proving control of a user's email address."""
+
+    __tablename__ = "email_verification_tokens"
+    __table_args__ = (
+        CheckConstraint(
+            "token_hash ~ '^[0-9a-f]{64}$'", name="ck_email_verification_hash_format"
+        ),
+        CheckConstraint(
+            "expires_at > created_at", name="ck_email_verification_expiration"
+        ),
+        Index("ix_email_verification_user", "user_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    user: Mapped[User] = relationship(back_populates="email_verification_tokens")
+
+
+class PasswordResetToken(Base):
+    """Single-use hashed token authorizing a password reset."""
+
+    __tablename__ = "password_reset_tokens"
+    __table_args__ = (
+        CheckConstraint(
+            "token_hash ~ '^[0-9a-f]{64}$'", name="ck_password_reset_hash_format"
+        ),
+        CheckConstraint("expires_at > created_at", name="ck_password_reset_expiration"),
+        Index("ix_password_reset_user", "user_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    user: Mapped[User] = relationship(back_populates="password_reset_tokens")
+
+
+class AuthenticationEvent(Base):
+    """Persistent, privacy-limited counters for authentication abuse controls."""
+
+    __tablename__ = "authentication_events"
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('login_failure', 'login_block', "
+            "'verification_resend', 'password_reset_request')",
+            name="ck_auth_events_type",
+        ),
+        Index(
+            "ix_auth_events_scope_created",
+            "event_type",
+            "normalized_email",
+            "client_ip",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    normalized_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    client_ip: Mapped[str] = mapped_column(String(45), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class Business(Base):

@@ -1,8 +1,9 @@
 """Application settings loaded from environment variables."""
 
 from functools import lru_cache
+from typing import Literal
 
-from pydantic import Field, SecretStr, ValidationInfo, field_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -43,6 +44,27 @@ class Settings(BaseSettings):
     postgresql_connect_timeout_seconds: int = Field(default=5, ge=1)
     tool_call_audit_retention_days: int = Field(default=90, ge=1)
     tool_call_audit_hmac_secret: SecretStr | None = None
+    access_token_secret: SecretStr = Field(
+        default=SecretStr("development-only-change-this-access-token-secret"),
+        min_length=32,
+    )
+    access_token_algorithm: Literal["HS256", "HS384", "HS512"] = "HS256"
+    access_token_lifetime_minutes: int = Field(default=15, ge=1)
+    access_token_issuer: str = "sou2ai"
+    access_token_audience: str = "sou2ai-api"
+    refresh_session_lifetime_days: int = Field(default=1, ge=1)
+    remembered_refresh_session_lifetime_days: int = Field(default=30, ge=1)
+    refresh_cookie_name: str = "sou2ai_refresh_token"
+    refresh_cookie_secure: bool = False
+    refresh_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
+    refresh_cookie_domain: str | None = None
+    refresh_cookie_path: str = "/api/v1/auth"
+    trust_proxy_headers: bool = False
+    resend_api_key: SecretStr | None = None
+    resend_sender_email: str = "onboarding@resend.dev"
+    frontend_base_url: str = "http://localhost:5173"
+    verification_link_path: str = "/verify-email"
+    password_reset_link_path: str = "/reset-password"
 
     @field_validator("allowed_cors_origins", mode="before")
     @classmethod
@@ -62,6 +84,25 @@ class Settings(BaseSettings):
         if environment.lower() == "production" and "*" in value:
             raise ValueError("ALLOWED_CORS_ORIGINS cannot contain '*' in production.")
         return value
+
+    @model_validator(mode="after")
+    def protect_production_authentication(self) -> Settings:
+        """Reject development-only authentication settings in production."""
+        if self.refresh_cookie_samesite == "none" and not self.refresh_cookie_secure:
+            raise ValueError("SameSite=None requires REFRESH_COOKIE_SECURE=true.")
+        if self.environment.lower() != "production":
+            return self
+        if self.access_token_secret.get_secret_value().startswith("development-only"):
+            raise ValueError("ACCESS_TOKEN_SECRET must be changed in production.")
+        if not self.refresh_cookie_secure:
+            raise ValueError("REFRESH_COOKIE_SECURE must be true in production.")
+        if (
+            self.resend_api_key is None
+            or not self.resend_api_key.get_secret_value()
+            or "replace" in self.resend_api_key.get_secret_value().lower()
+        ):
+            raise ValueError("RESEND_API_KEY is required in production.")
+        return self
 
 
 @lru_cache
