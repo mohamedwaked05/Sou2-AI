@@ -216,8 +216,11 @@ Authentication events contain a normalized email address, client IP address,
 event type, and timestamp only for temporary abuse-control decisions. The longest
 current decision window is one hour, so retention defaults to 24 hours and is
 enforced at a minimum of two hours. Login, verification-resend, and password-reset
-requests opportunistically remove one bounded batch of expired rows. A nonblocking
-PostgreSQL transaction advisory lock coordinates cleanup across API processes;
+requests opportunistically remove one bounded batch of expired rows. A persistent
+PostgreSQL maintenance-task row throttles attempts to once per configured interval
+(60 minutes by default) across processes, instances, and restarts. A nonblocking
+transaction advisory lock and atomic due-time claim coordinate workers. The claim
+advances before deletion so a failed attempt cannot cause retries on every request;
 maintenance failure does not change the authentication response or its counters.
 An external database maintenance job may replace or supplement this mechanism if
 future volume requires it.

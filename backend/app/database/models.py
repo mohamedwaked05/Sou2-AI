@@ -269,6 +269,26 @@ class AuthenticationEvent(Base):
     )
 
 
+class AuthenticationMaintenanceTask(Base):
+    """Persistent coordination state for one authentication maintenance task."""
+
+    __tablename__ = "authentication_maintenance_tasks"
+    __table_args__ = (
+        CheckConstraint(
+            "btrim(task_name) <> ''",
+            name="ck_auth_maintenance_task_name_not_blank",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    task_name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    next_run_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 class Business(Base):
     """A lightweight business profile owned through one MVP membership."""
 

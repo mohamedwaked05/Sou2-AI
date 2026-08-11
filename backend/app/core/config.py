@@ -50,6 +50,7 @@ class Settings(BaseSettings):
         default=24,
         ge=AUTH_EVENT_MINIMUM_RETENTION_HOURS,
     )
+    auth_event_cleanup_interval_minutes: int = Field(default=60, ge=1)
     access_token_secret: SecretStr = Field(
         default=SecretStr("development-only-change-this-access-token-secret"),
         min_length=32,

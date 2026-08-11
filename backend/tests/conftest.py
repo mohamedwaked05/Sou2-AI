@@ -50,7 +50,8 @@ def db_session(database_engine: Engine) -> Generator[Session]:
     with database_engine.begin() as connection:
         connection.execute(
             text(
-                "TRUNCATE authentication_events, password_reset_tokens, "
+                "TRUNCATE authentication_maintenance_tasks, authentication_events, "
+                "password_reset_tokens, "
                 "email_verification_tokens, refresh_sessions, tool_call_logs, "
                 "business_opening_shifts, "
                 "business_opening_days, business_memberships, businesses, users CASCADE"

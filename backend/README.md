@@ -109,10 +109,14 @@ longest current rate-limit window is one hour. `AUTH_EVENT_RETENTION_HOURS`
 therefore defaults to 24 and rejects values below 2 hours, keeping cleanup safely
 beyond every active decision window.
 
-Login, verification-resend, and forgot-password requests opportunistically check
-for expired rows. Cleanup deletes at most 1,000 rows per invocation, uses a
-nonblocking PostgreSQL transaction advisory lock to coordinate API processes, and
-is best-effort so a maintenance failure cannot change a valid authentication
+Login, verification-resend, and forgot-password requests opportunistically trigger
+cleanup. `AUTH_EVENT_CLEANUP_INTERVAL_MINUTES` is a positive integer that defaults
+to 60. PostgreSQL stores the next eligible attempt, so requests inside that shared
+interval return before querying expired authentication events, including across
+processes, instances, and restarts. A nonblocking transaction advisory lock and an
+atomic due-time claim prevent duplicate work. The claim advances before deletion,
+which bounds retries after a failure. Cleanup deletes at most 1,000 rows per
+invocation and is best-effort, so maintenance cannot change a valid authentication
 response or bypass its rate-limit transaction. An external database maintenance
 job may replace or supplement this mechanism later if event volume requires it.
 
