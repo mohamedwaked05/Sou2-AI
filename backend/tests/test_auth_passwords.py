@@ -3,7 +3,13 @@
 from datetime import timedelta
 
 import pytest
-from app.core.security import token_digest, utc_now, verify_password
+from app.core import security
+from app.core.security import (
+    hash_password,
+    token_digest,
+    utc_now,
+    verify_password,
+)
 from app.database.models import (
     AuthenticationEvent,
     PasswordResetToken,
@@ -22,6 +28,41 @@ from tests.test_auth_sessions import (
     refresh_cookie,
     set_refresh_cookie,
 )
+
+
+def test_verify_password_returns_true_for_correct_password() -> None:
+    encoded_hash = hash_password("Correct1!Password")
+
+    assert verify_password("Correct1!Password", encoded_hash) is True
+
+
+def test_verify_password_returns_false_for_incorrect_password() -> None:
+    encoded_hash = hash_password("Correct1!Password")
+
+    assert verify_password("Incorrect2@Password", encoded_hash) is False
+
+
+@pytest.mark.parametrize(
+    "encoded_hash",
+    [
+        "not-a-supported-password-hash",
+        "$argon2id$v=19$m=65536,t=3,p=4$bad$bad",
+    ],
+)
+def test_verify_password_returns_false_for_invalid_hash(encoded_hash: str) -> None:
+    assert verify_password("Candidate1!Password", encoded_hash) is False
+
+
+def test_verify_password_does_not_swallow_unexpected_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_unexpected_error(password: str, encoded_hash: str) -> bool:
+        raise RuntimeError("unexpected verification failure")
+
+    monkeypatch.setattr(security.password_hash, "verify", raise_unexpected_error)
+
+    with pytest.raises(RuntimeError, match="unexpected verification failure"):
+        verify_password("Candidate1!Password", "stored-password-hash")
 
 
 def test_forgot_password_has_identical_public_response_and_mocked_delivery(
@@ -248,26 +289,14 @@ def test_change_password_keeps_current_family_and_revokes_other_devices(
     assert login(api_client, password="Completely2@New").status_code == 200
 
 
-@pytest.mark.parametrize(
-    ("current", "new", "confirmation", "expected_code"),
-    [
-        (
-            "Wrong1!Password",
-            "Completely2@New",
-            "Completely2@New",
-            "current_password_invalid",
-        ),
-        (PASSWORD, PASSWORD, PASSWORD, "password_reused"),
-        (PASSWORD, "weak", "weak", "password_policy_violation"),
-        (PASSWORD, "Completely2@New", "Different3#Value", "validation_error"),
-    ],
-)
-def test_change_password_validation_errors(
+def assert_change_password_error(
     api_client: TestClient,
     db_session: Session,
+    *,
     current: str,
     new: str,
     confirmation: str,
+    expected_status: int,
     expected_code: str,
 ) -> None:
     create_user(db_session)
@@ -281,8 +310,64 @@ def test_change_password_validation_errors(
             "new_password_confirmation": confirmation,
         },
     )
-    assert response.status_code in {400, 422}
+    assert response.status_code == expected_status
     assert response.json()["error"]["code"] == expected_code
     assert current not in response.text
     assert new not in response.text
     assert confirmation not in response.text
+
+
+def test_change_password_incorrect_current_password_returns_400(
+    api_client: TestClient, db_session: Session
+) -> None:
+    assert_change_password_error(
+        api_client,
+        db_session,
+        current="Wrong1!Password",
+        new="Completely2@New",
+        confirmation="Completely2@New",
+        expected_status=400,
+        expected_code="current_password_invalid",
+    )
+
+
+def test_change_password_current_password_reuse_returns_400(
+    api_client: TestClient, db_session: Session
+) -> None:
+    assert_change_password_error(
+        api_client,
+        db_session,
+        current=PASSWORD,
+        new=PASSWORD,
+        confirmation=PASSWORD,
+        expected_status=400,
+        expected_code="password_reused",
+    )
+
+
+def test_change_password_policy_violation_returns_422(
+    api_client: TestClient, db_session: Session
+) -> None:
+    assert_change_password_error(
+        api_client,
+        db_session,
+        current=PASSWORD,
+        new="weak",
+        confirmation="weak",
+        expected_status=422,
+        expected_code="password_policy_violation",
+    )
+
+
+def test_change_password_confirmation_mismatch_returns_422(
+    api_client: TestClient, db_session: Session
+) -> None:
+    assert_change_password_error(
+        api_client,
+        db_session,
+        current=PASSWORD,
+        new="Completely2@New",
+        confirmation="Different3#Value",
+        expected_status=422,
+        expected_code="validation_error",
+    )

@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 import jwt
 from jwt import InvalidTokenError
 from pwdlib import PasswordHash
+from pwdlib.exceptions import UnknownHashError
 
 from app.core.config import Settings
 
@@ -31,7 +32,7 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, encoded_hash: str) -> bool:
     try:
         return password_hash.verify(password, encoded_hash)
-    except Exception:
+    except UnknownHashError:
         return False
 
 
