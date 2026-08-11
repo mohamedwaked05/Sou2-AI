@@ -4,12 +4,11 @@ Sou2AI is a local AI assistant planned for small businesses, with future support
 
 ## Current milestone
 
-Milestone 2 provides the FastAPI foundation plus PostgreSQL infrastructure,
-SQLAlchemy sessions/models, Alembic migrations, business profiles and weekly
-schedules, database activation safeguards, minimal tool-call audit metadata, and
-database health checking.
+Milestone 3 adds user registration, required email verification, password login,
+rotating refresh sessions, logout, account recovery, and authenticated password
+changes to the existing PostgreSQL platform foundation.
 
-It does **not** include authentication or business APIs, pgvector, Ollama
+It does **not** include business onboarding or authorization, pgvector, Ollama
 connections, RAG, tool execution/adapters, operational business data, inventory,
 billing, memory, or a React frontend.
 
@@ -30,6 +29,21 @@ Copy-Item .env.example .env
 ```
 
 Edit `.env` only for local configuration. Do not commit it. The default CORS origins target a future local React development server. In production, set `ALLOWED_CORS_ORIGINS` to explicit trusted origins; wildcard origins are rejected.
+
+Authentication also requires a strong `ACCESS_TOKEN_SECRET` and Resend settings.
+For initial Resend testing, `onboarding@resend.dev` can send only to the email
+address associated with the Resend account. To send to other recipients, verify a
+domain in Resend and configure `RESEND_SENDER_EMAIL` with that domain. Put the API
+key only in `.env`; never commit it. Local links default to:
+
+- `http://localhost:5173/verify-email?token=...`
+- `http://localhost:5173/reset-password?token=...`
+
+Local HTTP uses `REFRESH_COOKIE_SECURE=false`. Production refuses to start with
+that setting or the development signing secret. Set `REFRESH_COOKIE_SECURE=true`
+in production and choose `REFRESH_COOKIE_SAMESITE` for the deployed frontend/API
+topology. Enable `TRUST_PROXY_HEADERS` only when a trusted reverse proxy replaces
+client-supplied forwarding headers.
 
 ## Start PostgreSQL
 
@@ -66,6 +80,9 @@ Endpoints:
 - Service metadata: <http://127.0.0.1:8000/>
 - Health status: <http://127.0.0.1:8000/api/v1/health>
 - Database health: <http://127.0.0.1:8000/api/v1/health/database>
+- Authentication: `/api/v1/auth/register`, `/verify-email`,
+  `/resend-verification`, `/login`, `/refresh`, `/logout`, `/logout-all`, `/me`,
+  `/forgot-password`, `/reset-password`, and `/change-password`
 
 ```json
 {
@@ -83,9 +100,8 @@ $env:TEST_POSTGRESQL_DATABASE_URL = "postgresql+psycopg://sou2ai:sou2ai_local@12
 python -m pytest
 ```
 
-The integration suite exercises connectivity, migration upgrade and
-downgrade/upgrade, constraints and triggers, schedules, retention, and both
-database-health outcomes.
+The integration suite also mocks the email-service boundary and exercises the
+complete authentication and session lifecycle without contacting Resend.
 
 ## Formatting and linting
 
@@ -110,5 +126,5 @@ scheduler will call the existing retention operation.
 
 ## Next milestone
 
-The next milestone may add local Ollama connectivity through a replaceable model
-provider boundary. Database code remains provider-independent.
+Business management and onboarding remain a separate milestone. Authentication
+identifies a user and does not grant access to or create a business.

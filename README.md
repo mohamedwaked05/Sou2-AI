@@ -4,10 +4,10 @@ Sou2AI is planned as a local AI assistant for small businesses, supporting Engli
 
 ## Status
 
-Milestone 2 is complete: the backend has its FastAPI foundation, Dockerized
-PostgreSQL development/test databases, SQLAlchemy models and sessions, Alembic
-migrations, business profile/schedule safeguards, minimal tool-call audit
-infrastructure, and database integration tests. AI, RAG, tool execution,
+Milestone 3 is implemented: the backend now includes secure user registration,
+email verification through a replaceable Resend adapter, password login,
+rotating refresh sessions, logout, account recovery, and current-user support.
+Authentication does not create or authorize a business. AI, RAG, tool execution,
 operational integrations, document ingestion, and frontend functionality remain
 future work.
 

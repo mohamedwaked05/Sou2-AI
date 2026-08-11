@@ -72,7 +72,7 @@ Testing and quality:
 
 ## Current status
 
-Milestone 2, the PostgreSQL platform foundation, is complete. The repository now contains Docker-based development and test databases, SQLAlchemy sessions, Alembic migrations, foundational platform models, weekly schedules, guarded business activation, a minimal tool-call audit table, and database/API tests.
+Milestone 3, user authentication, is implemented on the PostgreSQL platform foundation. The repository contains registration, email verification, password login and recovery, rotating refresh sessions, logout, current-user authentication, persistent abuse controls, and mocked email-boundary integration tests.
 
 The current repository does not yet contain:
 
@@ -85,7 +85,7 @@ The current repository does not yet contain:
 * React functionality
 * WhatsApp integration
 
-The next milestone is Milestone 3: user authentication.
+The next milestone is Milestone 4: business management and onboarding.
 
 ## Development roadmap
 
@@ -108,7 +108,7 @@ The next milestone is Milestone 3: user authentication.
 
 This milestone does not add authentication or business-creation endpoints, pgvector, RAG, AI tools/adapters, operational business data, inventory, billing, or a platform-admin dashboard.
 
-### Milestone 3: User authentication
+### Milestone 3: User authentication — Complete
 
 * Add email-and-password registration with normalized, unique email addresses.
 * Hash passwords securely and never store or log plain-text credentials.

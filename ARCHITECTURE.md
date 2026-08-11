@@ -192,6 +192,26 @@ traces. Retention defaults to 90 days and is configurable; a reusable deletion
 operation is intended for a future external scheduler. No internal scheduler or
 `pg_cron` is used.
 
+## 13.1 User authentication
+
+Authentication identifies a platform user and is deliberately independent from
+business membership or tenant authorization. Passwords use Argon2 hashes. Email
+verification and password-reset links carry single-use opaque tokens whose
+SHA-256 digests, expiration, and consumption state are stored in PostgreSQL.
+
+Access tokens are signed, short-lived JWTs with minimal identity claims. Each
+login creates an independent refresh-session family. Opaque refresh tokens are
+delivered only through an environment-configured HttpOnly cookie, stored only as
+digests, and rotated under a row lock. Reuse revokes the remaining family. Logout
+can revoke one family or every active session for a user.
+
+Login failures, verification resends, and password-reset requests use persistent
+PostgreSQL event counters scoped by normalized email and trusted client address.
+Forwarded addresses are ignored unless trusted-proxy handling is explicitly
+enabled. Transaction advisory locks serialize each rate-limit scope across API
+processes. Transactional email is isolated behind a provider boundary implemented
+with Resend.
+
 A future centralized tool-execution service—not the model and not individual
 adapters—will write exactly one audit row after business-scope and permission
 checks for every success, error, or denial. That executor and its adapters remain
@@ -230,7 +250,7 @@ WhatsApp is a future input channel, not the core system.
 
 ## 16. Current implementation boundary
 
-The repository contains the FastAPI and PostgreSQL platform foundations described
-above. Authentication/business APIs, model connectivity, pgvector, RAG, tool
-execution, adapters, operational data, memory, document ingestion, billing, and
-frontend functionality remain future work.
+The repository contains the FastAPI/PostgreSQL platform foundation and user
+authentication described above. Business onboarding and authorization, model
+connectivity, pgvector, RAG, tool execution, adapters, operational data, memory,
+document ingestion, billing, and frontend functionality remain future work.
