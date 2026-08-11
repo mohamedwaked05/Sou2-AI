@@ -72,10 +72,7 @@ Testing and quality:
 
 ## Current status
 
-Milestone 2, the PostgreSQL platform foundation, is complete. The repository now
-contains Docker-based development and test databases, SQLAlchemy sessions,
-Alembic migrations, foundational platform models, weekly schedules, guarded
-business activation, a minimal tool-call audit table, and database/API tests.
+Milestone 2, the PostgreSQL platform foundation, is complete. The repository now contains Docker-based development and test databases, SQLAlchemy sessions, Alembic migrations, foundational platform models, weekly schedules, guarded business activation, a minimal tool-call audit table, and database/API tests.
 
 The current repository does not yet contain:
 
@@ -88,7 +85,7 @@ The current repository does not yet contain:
 * React functionality
 * WhatsApp integration
 
-The next milestone is Milestone 3: local Ollama connectivity.
+The next milestone is Milestone 3: user authentication.
 
 ## Development roadmap
 
@@ -104,106 +101,205 @@ The next milestone is Milestone 3: local Ollama connectivity.
 
 * Docker Compose creates separate `sou2ai_dev` and `sou2ai_test` databases.
 * SQLAlchemy and Psycopg provide scoped synchronous database sessions.
-* Alembic owns native enums, foundational platform tables, constraints, indexes,
-  and database triggers.
-* Users, business profiles, single-owner MVP memberships, weekly opening hours,
-  and privacy-minimal tool-call audit metadata are represented.
-* Profile completion is derived from current data; activation is guarded in
-  PostgreSQL so direct SQL cannot activate an incomplete business.
-* Database health, schedule normalization, retention, migration, model, and API
-  behavior are covered by automated tests using `sou2ai_test`.
+* Alembic owns native enums, foundational platform tables, constraints, indexes, and database triggers.
+* Users, business profiles, single-owner MVP memberships, weekly opening hours, and privacy-minimal tool-call audit metadata are represented.
+* Profile completion is derived from current data; activation is guarded in PostgreSQL so direct SQL cannot activate an incomplete business.
+* Database health, schedule normalization, retention, migration, model, and API behavior are covered by automated tests using `sou2ai_test`.
 
-This milestone does not add authentication or business-creation endpoints,
-pgvector, RAG, AI tools/adapters, operational business data, inventory, billing,
-or a platform-admin dashboard.
+This milestone does not add authentication or business-creation endpoints, pgvector, RAG, AI tools/adapters, operational business data, inventory, billing, or a platform-admin dashboard.
 
-### Milestone 3: Local Ollama connectivity
+### Milestone 3: User authentication
 
-* Connect the FastAPI backend to the local Ollama HTTP API
-* Verify that Qwen2.5 7B is installed and reachable
-* Add a minimal model status check
-* Add a simple generation endpoint
-* Mock Ollama in automated tests
+* Add email-and-password registration with normalized, unique email addresses.
+* Hash passwords securely and never store or log plain-text credentials.
+* Add login, short-lived access tokens, refresh-token rotation or revocation, logout, and a current-user endpoint.
+* Protect authenticated endpoints and return consistent authentication errors.
+* Test duplicate registration, invalid credentials, malformed or expired tokens, refresh behavior, logout, and protected routes.
+
+Authentication identifies the user; it does not by itself grant access to a business.
+
+### Milestone 4: Business management and onboarding
+
+* Allow an authenticated user to create and own multiple businesses.
+* Create the business and its full-access owner membership in one transaction.
+* Keep new businesses pending and inactive.
+* Add endpoints to create, list, view, and update businesses.
+* Collect the required profile, Lebanese location, category, language, and all seven working days.
+* Support closed days and up to three valid, non-overlapping shifts per open day.
+* Return derived profile-completion status and enforce the agreed exact-duplicate business-name rule.
+* Test the complete onboarding flow.
+
+### Milestone 5: Tenant authorization and data isolation
+
+* Require authentication for every business-scoped endpoint.
+* Check membership before accessing a business or any of its resources.
+* Scope every query by the authorized `business_id`; never trust a client-supplied business ID by itself.
+* Apply the single full-access owner role for the MVP.
+* Use consistent `401`, `403`, and privacy-preserving `404` responses.
+* Add cross-tenant tests for profiles, schedules, documents, conversations, integrations, AI usage, tools, and audit metadata.
+
+### Milestone 6: Business lifecycle and manual activation
+
+* Define pending, active, and disabled business states.
+* Preserve the PostgreSQL rule that incomplete businesses cannot be activated.
+* Add a protected platform-admin API or command for manual activation after offline payment, disabling, and re-enabling.
+* Activate and enforce access independently for each business a user owns.
+* Block inactive or disabled businesses from paid AI functionality.
+* Record who changed a lifecycle state, when, and why.
+
+A graphical admin dashboard and online payments are not required for the MVP.
+
+### Milestone 7: API security foundation
+
+* Standardize request validation and API error responses.
+* Configure CORS, trusted hosts, proxy behavior, and request limits by environment.
+* Add rate limiting to authentication, generation, and upload endpoints.
+* Add correlation IDs and safe structured logging.
+* Prevent passwords, tokens, connection strings, credentials, and sensitive tool arguments from entering logs.
+* Test malformed requests, unauthorized access, rate limits, and safe errors.
+
+### Milestone 8: Local Ollama connectivity
+
+* Connect FastAPI to the configurable local Ollama HTTP API.
+* Verify Qwen2.5 7B availability and add a minimal model-status service.
+* Add an authenticated test-generation endpoint behind an application service.
+* Handle provider unavailability, missing models, timeouts, and invalid responses.
+* Mock Ollama in automated tests.
 
 This milestone does not add RAG, memory, agent tools, or business-answering logic.
 
-### Milestone 4: Arabic and Franco-Arabic model evaluation
+### Milestone 9: Arabic and Franco-Arabic model evaluation
 
-* Define a small repeatable evaluation dataset
-* Test English, Arabic, Lebanese Arabic, Franco-Arabic, and mixed-language prompts
-* Record response quality and limitations
-* Decide whether Qwen2.5 7B remains the default local model
+* Create a version-controlled, repeatable evaluation dataset.
+* Test English, Arabic, Lebanese Arabic, Franco-Arabic, and mixed-language store scenarios.
+* Evaluate intent, relevance, hallucination, clarification, tone, and instruction following.
+* Record limitations and decide whether Qwen2.5 7B remains the local model.
 
-### Milestone 5: pgvector and knowledge storage
+### Milestone 10: Model-provider abstraction
 
-* Enable the pgvector PostgreSQL extension
-* Add document and chunk database models
-* Create migrations for knowledge storage
-* Keep structured business facts separate from vectorized knowledge
+* Define a provider-neutral interface for chat, responses, timeouts, errors, and usage metadata.
+* Implement Ollama as the local provider and select providers by environment.
+* Keep RAG, agent, database, and domain logic independent of provider formats.
+* Add provider-contract tests with mocked implementations.
 
-### Milestone 6: Document ingestion and chunking
+Production will use an approved cloud model through this boundary while local development remains supported by Ollama.
 
-* Accept supported documents
-* Extract and normalize text
-* Split text into traceable chunks
-* Store document and chunk metadata
-* Preserve source information for citations
+### Milestone 11: pgvector and knowledge storage
 
-### Milestone 7: Embeddings and vector retrieval
+* Enable pgvector and add tenant-scoped document and chunk models.
+* Store safe file references, processing state, traceable source metadata, chunk order, and embedding metadata.
+* Add migrations, constraints, and indexes for tenant-safe retrieval.
+* Keep stable unstructured knowledge separate from structured and live operational data.
 
-* Connect BGE-M3 locally
-* Generate and store embeddings
-* Implement similarity search
-* Test retrieval independently from the language model
+### Milestone 12: Secure document ingestion and chunking
 
-### Milestone 8: Complete RAG question-answering flow
+* Add authenticated and authorized upload endpoints for approved file types.
+* Validate content, MIME type, size, page count, filename, and extraction result.
+* Extract, normalize, and split text into traceable chunks with page or section information.
+* Track pending, processing, ready, and failed states.
+* Add safe replacement and deletion behavior that also removes chunks and embeddings.
+* Test supported, corrupted, unsupported, and cross-tenant files.
 
-* Retrieve relevant chunks before generating an answer
-* Build prompts from retrieved context
-* Return answers with sources
-* Refuse or ask for clarification when the available knowledge is insufficient
-* Evaluate retrieval and answer quality
+### Milestone 13: Embeddings and vector retrieval
 
-### Milestone 9: React interface
+* Connect BGE-M3 locally behind an embedding-provider interface.
+* Generate and store chunk embeddings in pgvector.
+* Implement similarity search that always filters by authorized `business_id`.
+* Configure result count, similarity threshold, and embedding model.
+* Support re-embedding and evaluate retrieval independently from generation.
 
-* Add chat functionality
-* Add document upload
-* Display answer sources
-* Show clear loading and error states
+### Milestone 14: Complete RAG question-answering flow
 
-### Milestone 10: Controlled operational integrations
+* Authenticate the user and authorize the selected business.
+* Retrieve relevant chunks and combine them with trusted business-profile facts.
+* Return grounded answers with traceable source references.
+* Clarify ambiguous questions and refuse to invent unsupported answers.
+* Defend against document prompt injection and cross-tenant retrieval.
+* Evaluate correct, missing, and conflicting knowledge in all supported languages.
 
-* Connect to each business's source system through a controlled API, read-only
-  database integration, or Sou2AI-managed operational system.
-* Add scoped read operations without copying live products, inventory, orders,
-  customers, appointments, or sales into the platform database unnecessarily.
-* Keep operational integrations separate from unstructured RAG knowledge.
+RAG covers relatively stable knowledge such as policies, delivery information, FAQs, warranties, and documents. It is not the source of truth for current stock, today's sales, orders, or other changing facts.
 
-### Milestone 11: Agent tool calling
+### Milestone 15: React business interface
 
-* Introduce a controlled agent loop
-* Expose approved business operations as explicit tools
-* Validate tool inputs and outputs
-* Require confirmation for destructive or sensitive actions
+* Add registration, login, session handling, and multi-business selection.
+* Add business creation, profile editing, onboarding, and working-hours setup.
+* Display profile completion and business activation state.
+* Add document upload, processing status, chat, and answer sources.
+* Show accessible loading, empty, success, and error states.
+* Prevent inactive businesses from using paid AI features.
 
-### Milestone 12: Memory and conversation history
+### Milestone 16: Controlled operational integrations
 
-* Store conversation history
-* Define short-term and long-term memory boundaries
-* Prevent memory from overriding trusted business data
+* Define stable Sou2AI operational contracts for products, inventory, sales, best-seller rankings, and restocking recommendations.
+* Build a separate fake PostgreSQL store database with realistic Lebanese minimarket products, stock, sales, and restocking rules.
+* Treat the fake database as an external source system, not part of `sou2ai_dev`.
+* Connect with a dedicated read-only database user through a PostgreSQL adapter.
+* Implement predefined, parameterized read operations; never let the model inspect schemas, generate arbitrary SQL, or receive database credentials.
+* Normalize the fake store's schema into the standard Sou2AI operational contracts so agent tools do not depend on its table or column names.
+* Support future adapters for prebuilt POS/ERP connectors, business APIs, custom database mappings, and controlled CSV or Excel imports.
+* Include mapping semantics such as completed-sale status, returns, reservations, branches, warehouses, currencies, and timezones—not only column names.
+* Validate connections and mappings before activation and expose integration health.
+* Apply tenant authorization, query timeouts, row limits, and safe error handling.
+* Avoid copying live operational records into the Sou2AI platform database; retain only required configuration and privacy-minimal audit metadata.
+* Clearly report when a source lacks the data needed for an answer or recommendation.
 
-### Milestone 13: External messaging integrations
+The first integration proves the contract and adapter design. Sou2AI will add connectors based on real customer demand rather than promise compatibility with every store system in the initial MVP.
 
-* Add integrations such as WhatsApp only after the core assistant is reliable
-* Apply authentication, authorization, and rate limiting
-* Preserve source and action traceability
+### Milestone 17: Agent tool calling
 
-### Milestone 14: Production and cloud deployment options
+* Add a controlled agent loop with an explicit registry of approved tools.
+* Start with read-only tools for current inventory, sales summaries, best sellers, and restocking recommendations.
+* Validate strict input and output schemas outside the model.
+* Authenticate the user, authorize the business and operation, and require an active business before execution.
+* Apply timeouts and result-size limits; forbid arbitrary SQL, URLs, code, and tool names.
+* Write exactly one privacy-minimal audit record per success, error, denial, or timeout through the centralized executor.
+* Require explicit user confirmation before any future sensitive or destructive write action.
 
-* Define deployment configurations
-* Protect secrets and business data
-* Add monitoring, backups, and recovery procedures
-* Keep local development supported
+### Milestone 18: Conversation history and memory
+
+* Store tenant-scoped conversations and messages with user or channel identity.
+* Define retention, short-term context, and limited approved long-term memory.
+* Prevent cross-business conversation access.
+* Never allow memory or a previous AI answer to override current structured data, retrieved sources, or live tool results.
+
+### Milestone 19: External customer messaging integrations
+
+* Add channels such as WhatsApp only after the core assistant is reliable.
+* Verify webhooks and map each channel connection and conversation to one business.
+* Separate external-customer permissions from owner-only tools and information.
+* Add rate limits, deduplication, retry handling, human handoff, and privacy rules.
+* Preserve message source, answer sources, and safe tool traceability.
+
+### Milestone 20: Production readiness and cloud deployment
+
+* Define reproducible development, test, staging, and production environments.
+* Use managed PostgreSQL and an approved cloud model behind provider abstractions.
+* Protect secrets, HTTPS, domains, proxies, CORS, and controlled migrations.
+* Add safe centralized logging, monitoring, alerts, backups, restore tests, disaster recovery, rollback procedures, and security scanning.
+* Add per-business usage limits and cloud-model cost controls.
+* Run tenant-isolation, security, load, and reliability reviews before release.
+* Preserve manual offline payment for the MVP and local Ollama development.
+
+## Main user use case
+
+A business owner creates an account, creates and completes one or more business profiles, and waits for manual activation after offline payment. For an active business, the owner can upload stable knowledge such as policies and FAQs, ask questions in supported languages, receive source-grounded answers, and query live operational facts through approved read-only tools.
+
+Sou2AI authenticates the user, isolates the selected business, chooses RAG or a controlled operational adapter, and never guesses when trusted data is unavailable.
+
+## UML-style use-case view
+
+```mermaid
+flowchart LR
+    OWNER[Business owner]
+    ADMIN[Platform administrator]
+    CUSTOMER[External customer]
+    SYSTEM((Sou2AI))
+
+    OWNER -->|Register and manage businesses| SYSTEM
+    OWNER -->|Upload knowledge and ask questions| SYSTEM
+    OWNER -->|Query live operations| SYSTEM
+    ADMIN -->|Activate or disable businesses| SYSTEM
+    CUSTOMER -.->|Use an approved future channel| SYSTEM
 
 ## Milestone rules
 
