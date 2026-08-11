@@ -12,8 +12,16 @@ from app.core.exceptions import ApplicationError
 from app.core.security import decode_access_token
 from app.database.models import AccountStatus, User
 from app.database.session import get_db_session
+from app.services.auth_event_retention import cleanup_authentication_events_best_effort
 
 bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def run_authentication_event_cleanup(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> None:
+    """Opportunistically run isolated, best-effort authentication maintenance."""
+    cleanup_authentication_events_best_effort(settings)
 
 
 def get_client_ip(request: Request, settings: Settings) -> str:

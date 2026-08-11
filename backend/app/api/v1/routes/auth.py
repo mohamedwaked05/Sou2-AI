@@ -6,7 +6,11 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Request, Response, status
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import get_client_ip, get_current_user
+from app.api.dependencies import (
+    get_client_ip,
+    get_current_user,
+    run_authentication_event_cleanup,
+)
 from app.core.config import Settings, get_settings
 from app.core.exceptions import ApplicationError
 from app.database.models import User
@@ -105,7 +109,11 @@ def verify(body: TokenRequest, session: DatabaseSession) -> MessageResponse:
     return MessageResponse(message=VERIFIED_MESSAGE)
 
 
-@router.post("/resend-verification", response_model=MessageResponse)
+@router.post(
+    "/resend-verification",
+    response_model=MessageResponse,
+    dependencies=[Depends(run_authentication_event_cleanup)],
+)
 def resend(
     body: EmailRequest,
     request: Request,
@@ -122,7 +130,11 @@ def resend(
     return MessageResponse(message=CHECK_EMAIL_MESSAGE)
 
 
-@router.post("/login", response_model=AccessTokenResponse)
+@router.post(
+    "/login",
+    response_model=AccessTokenResponse,
+    dependencies=[Depends(run_authentication_event_cleanup)],
+)
 def sign_in(
     body: LoginRequest,
     request: Request,
@@ -193,7 +205,11 @@ def current_user(user: AuthenticatedUser) -> User:
     return user
 
 
-@router.post("/forgot-password", response_model=MessageResponse)
+@router.post(
+    "/forgot-password",
+    response_model=MessageResponse,
+    dependencies=[Depends(run_authentication_event_cleanup)],
+)
 def request_password_reset(
     body: EmailRequest,
     request: Request,

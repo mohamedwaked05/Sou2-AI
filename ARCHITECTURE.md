@@ -212,6 +212,16 @@ enabled. Transaction advisory locks serialize each rate-limit scope across API
 processes. Transactional email is isolated behind a provider boundary implemented
 with Resend.
 
+Authentication events contain a normalized email address, client IP address,
+event type, and timestamp only for temporary abuse-control decisions. The longest
+current decision window is one hour, so retention defaults to 24 hours and is
+enforced at a minimum of two hours. Login, verification-resend, and password-reset
+requests opportunistically remove one bounded batch of expired rows. A nonblocking
+PostgreSQL transaction advisory lock coordinates cleanup across API processes;
+maintenance failure does not change the authentication response or its counters.
+An external database maintenance job may replace or supplement this mechanism if
+future volume requires it.
+
 A future centralized tool-execution service—not the model and not individual
 adapters—will write exactly one audit row after business-scope and permission
 checks for every success, error, or denial. That executor and its adapters remain

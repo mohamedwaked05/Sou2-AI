@@ -6,6 +6,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+AUTH_EVENT_MINIMUM_RETENTION_HOURS = 2
+
 
 class Settings(BaseSettings):
     """Runtime configuration for the Sou2AI API."""
@@ -44,6 +46,10 @@ class Settings(BaseSettings):
     postgresql_connect_timeout_seconds: int = Field(default=5, ge=1)
     tool_call_audit_retention_days: int = Field(default=90, ge=1)
     tool_call_audit_hmac_secret: SecretStr | None = None
+    auth_event_retention_hours: int = Field(
+        default=24,
+        ge=AUTH_EVENT_MINIMUM_RETENTION_HOURS,
+    )
     access_token_secret: SecretStr = Field(
         default=SecretStr("development-only-change-this-access-token-secret"),
         min_length=32,

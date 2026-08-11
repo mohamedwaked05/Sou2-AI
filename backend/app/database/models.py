@@ -243,6 +243,19 @@ class AuthenticationEvent(Base):
             "client_ip",
             "created_at",
         ),
+        Index(
+            "ix_auth_events_type_email_created",
+            "event_type",
+            "normalized_email",
+            "created_at",
+        ),
+        Index(
+            "ix_auth_events_type_ip_created",
+            "event_type",
+            "client_ip",
+            "created_at",
+        ),
+        Index("ix_auth_events_created", "created_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

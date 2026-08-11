@@ -103,6 +103,19 @@ python -m pytest
 The integration suite also mocks the email-service boundary and exercises the
 complete authentication and session lifecycle without contacting Resend.
 
+Authentication abuse controls store temporary event rows containing the event
+type, normalized email address, trusted client IP address, and timestamp. The
+longest current rate-limit window is one hour. `AUTH_EVENT_RETENTION_HOURS`
+therefore defaults to 24 and rejects values below 2 hours, keeping cleanup safely
+beyond every active decision window.
+
+Login, verification-resend, and forgot-password requests opportunistically check
+for expired rows. Cleanup deletes at most 1,000 rows per invocation, uses a
+nonblocking PostgreSQL transaction advisory lock to coordinate API processes, and
+is best-effort so a maintenance failure cannot change a valid authentication
+response or bypass its rate-limit transaction. An external database maintenance
+job may replace or supplement this mechanism later if event volume requires it.
+
 ## Formatting and linting
 
 ```powershell
