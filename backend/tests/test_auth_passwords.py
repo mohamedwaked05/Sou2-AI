@@ -16,6 +16,8 @@ from app.database.models import (
     RefreshSession,
 )
 from app.services.email import EmailDeliveryError, get_email_service
+from argon2 import PasswordHasher as Argon2PasswordHasher
+from argon2 import Type
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -45,12 +47,65 @@ def test_verify_password_returns_false_for_incorrect_password() -> None:
 @pytest.mark.parametrize(
     "encoded_hash",
     [
-        "not-a-supported-password-hash",
-        "$argon2id$v=19$m=65536,t=3,p=4$bad$bad",
+        # pwdlib raises routine UnknownHashError when no hasher recognizes the text.
+        pytest.param("not-a-supported-password-hash", id="unrecognized"),
+        # A bare Argon2 prefix is unidentified and produces routine UnknownHashError.
+        pytest.param("$argon2id$", id="missing-parameters"),
+        # argon2 raises VerificationError; pwdlib's Argon2 adapter converts it to False.
+        pytest.param(
+            "$argon2id$v=19$m=65536,t=3,p=4",
+            id="missing-salt-and-digest",
+        ),
+        # Invalid ASCII base64 reaches routine argon2 VerificationError inside pwdlib.
+        pytest.param(
+            "$argon2id$v=19$m=65536,t=3,p=4$***$***",
+            id="invalid-ascii-base64",
+        ),
+        # Non-ASCII fields would leak UnicodeEncodeError without the ASCII guard.
+        pytest.param(
+            "$argon2id$v=19$m=65536,t=3,p=4$é$é",
+            id="invalid-unicode-encoding",
+        ),
+        # A truncated digest uses valid characters but yields routine VerificationError.
+        pytest.param(
+            "$argon2id$v=19$m=65536,t=3,p=4$MDEyMzQ1Njc4OWFiY2RlZg$YWJj",
+            id="truncated-digest",
+        ),
+        # Zero memory cost is rejected with routine argon2 VerificationError.
+        pytest.param(
+            "$argon2id$v=19$m=0,t=3,p=4$MDEyMzQ1Njc4OWFiY2RlZg$YWJj",
+            id="zero-memory-cost",
+        ),
+        # Zero parallelism is parsed by argon2 and rejected with VerificationError.
+        pytest.param(
+            "$argon2id$v=19$m=65536,t=3,p=0$MDEyMzQ1Njc4OWFiY2RlZg$YWJj",
+            id="zero-parallelism",
+        ),
+        # Empty hash text is unidentified and produces routine UnknownHashError.
+        pytest.param("", id="empty"),
+        # Whitespace-only hash text is unidentified and produces UnknownHashError.
+        pytest.param("   ", id="whitespace"),
+        # Unregistered Bcrypt is rejected with routine UnknownHashError.
+        pytest.param(
+            "$2b$12$abcdefghijklmnopqrstuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu",
+            id="unregistered-bcrypt",
+        ),
     ],
 )
 def test_verify_password_returns_false_for_invalid_hash(encoded_hash: str) -> None:
     assert verify_password("Candidate1!Password", encoded_hash) is False
+
+
+def test_verify_password_supports_registered_argon2i_variant() -> None:
+    encoded_hash = Argon2PasswordHasher(type=Type.I).hash("Correct1!Password")
+
+    assert verify_password("Correct1!Password", encoded_hash) is True
+    assert verify_password("Incorrect2@Password", encoded_hash) is False
+
+
+def test_verify_password_preserves_none_type_error() -> None:
+    with pytest.raises(TypeError, match="hash must be str or bytes"):
+        verify_password("Candidate1!Password", None)  # type: ignore[arg-type]
 
 
 def test_verify_password_does_not_swallow_unexpected_exception(

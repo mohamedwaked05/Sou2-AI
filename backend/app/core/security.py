@@ -30,6 +30,8 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, encoded_hash: str) -> bool:
+    if isinstance(encoded_hash, str) and not encoded_hash.isascii():
+        return False
     try:
         return password_hash.verify(password, encoded_hash)
     except UnknownHashError:
