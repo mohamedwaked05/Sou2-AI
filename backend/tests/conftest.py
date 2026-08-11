@@ -7,7 +7,10 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from app.core.config import Settings, get_settings
-from app.database.session import ensure_test_database_url
+from app.database.session import ensure_test_database_url, get_db_session
+from app.main import app
+from app.services.email import get_email_service
+from fastapi.testclient import TestClient
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -47,7 +50,40 @@ def db_session(database_engine: Engine) -> Generator[Session]:
     with database_engine.begin() as connection:
         connection.execute(
             text(
-                "TRUNCATE tool_call_logs, business_opening_shifts, "
+                "TRUNCATE authentication_events, password_reset_tokens, "
+                "email_verification_tokens, refresh_sessions, tool_call_logs, "
+                "business_opening_shifts, "
                 "business_opening_days, business_memberships, businesses, users CASCADE"
             )
         )
+
+
+class MockEmailService:
+    def __init__(self) -> None:
+        self.verification_messages: list[tuple[str, str]] = []
+        self.password_reset_messages: list[tuple[str, str]] = []
+
+    def send_verification_email(self, recipient: str, token: str) -> None:
+        self.verification_messages.append((recipient, token))
+
+    def send_password_reset_email(self, recipient: str, token: str) -> None:
+        self.password_reset_messages.append((recipient, token))
+
+
+@pytest.fixture
+def email_service() -> MockEmailService:
+    return MockEmailService()
+
+
+@pytest.fixture
+def api_client(
+    db_session: Session, email_service: MockEmailService
+) -> Generator[TestClient]:
+    def override_session() -> Generator[Session]:
+        yield db_session
+
+    app.dependency_overrides[get_db_session] = override_session
+    app.dependency_overrides[get_email_service] = lambda: email_service
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        yield client
+    app.dependency_overrides.clear()
