@@ -4,10 +4,12 @@ from datetime import time
 
 import pytest
 from app.database.models import (
-    AccountStatus,
     Business,
+    BusinessCategory,
     BusinessOpeningDay,
     BusinessOpeningShift,
+    BusinessStatus,
+    User,
 )
 from app.services.business_profiles import is_business_profile_complete
 from app.services.opening_hours import (
@@ -22,11 +24,19 @@ from sqlalchemy.orm import Session, selectinload
 
 
 def complete_business(name: str = "Complete Shop") -> Business:
+    owner = User(
+        email=f"{name.lower().replace(' ', '-')}@example.com",
+        first_name="Owner",
+        last_name="Example",
+        password_hash="hash",
+    )
     return Business(
+        owner=owner,
         name=name,
-        description="A neighborhood shop",
-        industry="Retail",
+        description="A neighborhood grocery shop",
+        category=BusinessCategory.GROCERY_SUPERMARKET,
         governorate="Beirut",
+        district="Beirut",
         city="Beirut",
         address_line="Hamra Street, ground floor",
     )
@@ -35,7 +45,7 @@ def complete_business(name: str = "Complete Shop") -> Business:
 def valid_week() -> tuple[DayInput, ...]:
     return (
         DayInput(0, True, (ShiftInput(time(9), time(18)),)),
-        DayInput(1, True, (ShiftInput(time(20), time(2)),)),
+        DayInput(1, True, (ShiftInput(time(10), time(16)),)),
     ) + tuple(DayInput(day, False) for day in range(2, 7))
 
 
@@ -50,23 +60,30 @@ def load_business(db_session: Session, business_id: object) -> Business:
 
 
 def test_incomplete_business_is_allowed_while_disabled(db_session: Session) -> None:
-    business = Business(name="Draft")
+    owner = User(
+        email="draft@example.com",
+        first_name="Draft",
+        last_name="Owner",
+        password_hash="hash",
+    )
+    business = Business(owner=owner, name="Draft")
     db_session.add(business)
     db_session.commit()
 
-    assert business.status is AccountStatus.DISABLED
+    assert business.status is BusinessStatus.PENDING
+    assert not business.is_active
     assert not is_business_profile_complete(load_business(db_session, business.id))
 
 
 @pytest.mark.parametrize(
     "missing_field",
-    ["description", "industry", "governorate", "city", "address_line"],
+    ["description", "category", "governorate", "district", "city", "address_line"],
 )
 def test_each_missing_profile_field_is_detected(
     db_session: Session, missing_field: str
 ) -> None:
     business = complete_business(missing_field)
-    setattr(business, missing_field, "   ")
+    setattr(business, missing_field, None)
     db_session.add(business)
     db_session.commit()
     replace_weekly_schedule(db_session, business.id, valid_week())
@@ -112,24 +129,30 @@ def test_complete_profile_and_activation_succeed(db_session: Session) -> None:
     assert len(loaded.opening_days) == 7
     assert all(not day.shifts for day in loaded.opening_days if not day.is_open)
     db_session.execute(
-        text("UPDATE businesses SET status = 'active' WHERE id = :id"),
+        text("UPDATE businesses SET is_active = true WHERE id = :id"),
         {"id": business.id},
     )
     db_session.commit()
     db_session.refresh(loaded)
-    assert loaded.status is AccountStatus.ACTIVE
+    assert loaded.is_active
 
 
 def test_direct_activation_of_incomplete_business_is_rejected(
     db_session: Session,
 ) -> None:
-    business = Business(name="Incomplete")
+    owner = User(
+        email="incomplete@example.com",
+        first_name="Incomplete",
+        last_name="Owner",
+        password_hash="hash",
+    )
+    business = Business(owner=owner, name="Incomplete")
     db_session.add(business)
     db_session.commit()
 
     with pytest.raises(IntegrityError, match="complete before activation"):
         db_session.execute(
-            text("UPDATE businesses SET status = 'active' WHERE id = :id"),
+            text("UPDATE businesses SET is_active = true WHERE id = :id"),
             {"id": business.id},
         )
         db_session.commit()
@@ -163,7 +186,7 @@ def test_active_business_rejects_invalid_direct_schedule_edit(
     db_session.commit()
     replace_weekly_schedule(db_session, business.id, valid_week())
     business = load_business(db_session, business.id)
-    business.status = AccountStatus.ACTIVE
+    business.is_active = True
     db_session.commit()
 
     with pytest.raises(IntegrityError, match="retain a valid profile"):

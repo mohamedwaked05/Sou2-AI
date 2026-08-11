@@ -1,6 +1,9 @@
 """Authoritative business-profile completion calculation."""
 
-from app.database.models import Business, DefaultLanguage
+from dataclasses import dataclass
+
+from app.database.models import Business, BusinessCategory
+from app.services.lebanese_locations import is_valid_location
 from app.services.opening_hours import (
     DayInput,
     ScheduleValidationError,
@@ -9,23 +12,100 @@ from app.services.opening_hours import (
 )
 
 
-def _has_text(value: str | None) -> bool:
-    return bool(value and value.strip())
+@dataclass(frozen=True)
+class ProfileIssue:
+    field: str
+    message: str
+    section: str
 
 
-def is_business_profile_complete(business: Business) -> bool:
-    """Calculate completion solely from current profile and schedule data."""
-    required_text = (
-        business.description,
-        business.industry,
-        business.governorate,
-        business.city,
-        business.address_line,
+def _text_issue(
+    value: str | None,
+    *,
+    field: str,
+    section: str,
+    minimum: int,
+    maximum: int,
+) -> ProfileIssue | None:
+    if value is None or not value.strip():
+        return ProfileIssue(field, "This field is required.", section)
+    length = len(value.strip())
+    if length < minimum or length > maximum:
+        return ProfileIssue(
+            field,
+            f"Must contain between {minimum} and {maximum} characters.",
+            section,
+        )
+    return None
+
+
+def business_profile_issues(business: Business) -> list[ProfileIssue]:
+    """Return safe whole-profile validation issues in onboarding order."""
+    issues: list[ProfileIssue] = []
+    for value, field, minimum, maximum in (
+        (business.name, "name", 2, 120),
+        (business.description, "description", 20, 2000),
+    ):
+        issue = _text_issue(
+            value,
+            field=field,
+            section="business_details",
+            minimum=minimum,
+            maximum=maximum,
+        )
+        if issue:
+            issues.append(issue)
+
+    if business.category is None:
+        issues.append(
+            ProfileIssue("category", "This field is required.", "business_details")
+        )
+    elif business.category is BusinessCategory.OTHER:
+        issue = _text_issue(
+            business.custom_category,
+            field="custom_category",
+            section="business_details",
+            minimum=2,
+            maximum=100,
+        )
+        if issue:
+            issues.append(issue)
+    elif business.custom_category is not None:
+        issues.append(
+            ProfileIssue(
+                "custom_category",
+                "Only the OTHER category may have a custom category.",
+                "business_details",
+            )
+        )
+
+    location_values = (
+        (business.governorate, "governorate"),
+        (business.district, "district"),
+        (business.city, "city"),
     )
-    if not all(_has_text(value) for value in required_text):
-        return False
-    if business.default_language not in (DefaultLanguage.AR, DefaultLanguage.EN):
-        return False
+    for value, field in location_values:
+        if value is None:
+            issues.append(ProfileIssue(field, "This field is required.", "location"))
+    if all(value is not None for value, _ in location_values) and not is_valid_location(
+        business.governorate, business.district, business.city
+    ):
+        issues.append(
+            ProfileIssue(
+                "city",
+                "The governorate, district, and city/area selection is invalid.",
+                "location",
+            )
+        )
+    address_issue = _text_issue(
+        business.address_line,
+        field="address_line",
+        section="location",
+        minimum=5,
+        maximum=255,
+    )
+    if address_issue:
+        issues.append(address_issue)
 
     days = tuple(
         DayInput(
@@ -40,6 +120,17 @@ def is_business_profile_complete(business: Business) -> bool:
     )
     try:
         validate_weekly_schedule(days)
-    except ScheduleValidationError:
-        return False
-    return True
+    except ScheduleValidationError as exc:
+        issues.append(ProfileIssue("working_hours", str(exc), "working_hours"))
+    return issues
+
+
+def is_business_profile_complete(business: Business) -> bool:
+    """Calculate completion solely from current persisted profile data."""
+    return not business_profile_issues(business)
+
+
+def first_incomplete_section(business: Business) -> str | None:
+    """Identify where a resumable onboarding client should continue."""
+    issues = business_profile_issues(business)
+    return issues[0].section if issues else None

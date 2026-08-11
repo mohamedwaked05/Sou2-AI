@@ -36,6 +36,28 @@ class DefaultLanguage(StrEnum):
     EN = "en"
 
 
+class BusinessStatus(StrEnum):
+    PENDING = "PENDING"
+
+
+class MembershipPermission(StrEnum):
+    FULL_ACCESS = "FULL_ACCESS"
+
+
+class BusinessCategory(StrEnum):
+    GROCERY_SUPERMARKET = "GROCERY_SUPERMARKET"
+    BAKERY = "BAKERY"
+    RESTAURANT = "RESTAURANT"
+    CAFE = "CAFE"
+    CLOTHING = "CLOTHING"
+    ELECTRONICS = "ELECTRONICS"
+    PHARMACY = "PHARMACY"
+    BEAUTY_COSMETICS = "BEAUTY_COSMETICS"
+    HOME_FURNITURE = "HOME_FURNITURE"
+    SERVICES = "SERVICES"
+    OTHER = "OTHER"
+
+
 class ToolCallStatus(StrEnum):
     SUCCESS = "success"
     ERROR = "error"
@@ -55,6 +77,21 @@ default_language_enum = ENUM(
 tool_call_status_enum = ENUM(
     ToolCallStatus,
     name="tool_call_status",
+    values_callable=lambda items: [item.value for item in items],
+)
+business_status_enum = ENUM(
+    BusinessStatus,
+    name="business_status",
+    values_callable=lambda items: [item.value for item in items],
+)
+membership_permission_enum = ENUM(
+    MembershipPermission,
+    name="membership_permission",
+    values_callable=lambda items: [item.value for item in items],
+)
+business_category_enum = ENUM(
+    BusinessCategory,
+    name="business_category",
     values_callable=lambda items: [item.value for item in items],
 )
 
@@ -102,6 +139,9 @@ class User(Base):
     email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     memberships: Mapped[list[BusinessMembership]] = relationship(back_populates="user")
+    owned_businesses: Mapped[list[Business]] = relationship(
+        back_populates="owner", foreign_keys="Business.owner_user_id"
+    )
     tool_call_logs: Mapped[list[ToolCallLog]] = relationship(
         back_populates="user", passive_deletes=True
     )
@@ -289,8 +329,57 @@ class AuthenticationMaintenanceTask(Base):
     )
 
 
+BUSINESS_GOVERNORATE_CHECK = """
+governorate IS NULL OR governorate IN
+('Beirut','Mount Lebanon','North','Akkar','Bekaa','Baalbek-Hermel','South','Nabatieh')
+"""
+BUSINESS_DISTRICT_CHECK = """
+district IS NULL OR district IN
+('Beirut','Baabda','Aley','Metn','Keserwan','Chouf','Tripoli','Zgharta','Koura',
+ 'Akkar','Zahle','West Bekaa','Baalbek','Hermel','Saida','Jezzine','Nabatieh',
+ 'Bint Jbeil','Marjayoun')
+"""
+BUSINESS_CITY_CHECK = """
+city IS NULL OR city IN
+('Beirut','Baabda','Hazmieh','Aley','Choueifat','Antelias','Jdeideh','Sin El Fil',
+ 'Dekwaneh','Baouchrieh','Jounieh','Zouk Mikael','Kaslik','Beiteddine','Damour',
+ 'Deir El Qamar','Tripoli','Mina','Zgharta','Ehden','Amioun','Halba','Zahle',
+ 'Chtaura','Jeb Jennine','Qab Elias','Baalbek','Hermel','Saida','Abra','Ghaziyeh',
+ 'Jezzine','Nabatieh','Kfar Roummane','Bint Jbeil','Marjayoun','Khiam')
+"""
+BUSINESS_LOCATION_HIERARCHY_CHECK = """
+(governorate IS NULL OR district IS NULL OR city IS NULL) OR
+(governorate='Beirut' AND district='Beirut' AND city='Beirut') OR
+(governorate='Mount Lebanon' AND (
+ (district='Baabda' AND city IN ('Baabda','Hazmieh')) OR
+ (district='Aley' AND city IN ('Aley','Choueifat')) OR
+ (district='Metn' AND city IN
+  ('Antelias','Jdeideh','Sin El Fil','Dekwaneh','Baouchrieh')) OR
+ (district='Keserwan' AND city IN ('Jounieh','Zouk Mikael','Kaslik')) OR
+ (district='Chouf' AND city IN ('Beiteddine','Damour','Deir El Qamar')))) OR
+(governorate='North' AND (
+ (district='Tripoli' AND city IN ('Tripoli','Mina')) OR
+ (district='Zgharta' AND city IN ('Zgharta','Ehden')) OR
+ (district='Koura' AND city='Amioun'))) OR
+(governorate='Akkar' AND district='Akkar' AND city='Halba') OR
+(governorate='Bekaa' AND (
+ (district='Zahle' AND city IN ('Zahle','Chtaura')) OR
+ (district='West Bekaa' AND city IN ('Jeb Jennine','Qab Elias')))) OR
+(governorate='Baalbek-Hermel' AND (
+ (district='Baalbek' AND city='Baalbek') OR
+ (district='Hermel' AND city='Hermel'))) OR
+(governorate='South' AND (
+ (district='Saida' AND city IN ('Saida','Abra','Ghaziyeh')) OR
+ (district='Jezzine' AND city='Jezzine'))) OR
+(governorate='Nabatieh' AND (
+ (district='Nabatieh' AND city IN ('Nabatieh','Kfar Roummane')) OR
+ (district='Bint Jbeil' AND city='Bint Jbeil') OR
+ (district='Marjayoun' AND city IN ('Marjayoun','Khiam'))))
+"""
+
+
 class Business(Base):
-    """A lightweight business profile owned through one MVP membership."""
+    """An independently onboarded tenant business."""
 
     __tablename__ = "businesses"
     __table_args__ = (
@@ -300,6 +389,49 @@ class Business(Base):
             name="ck_businesses_normalized_name_not_blank",
         ),
         CheckConstraint(
+            "char_length(name) BETWEEN 2 AND 120",
+            name="ck_businesses_name_length",
+        ),
+        CheckConstraint(
+            "description IS NULL OR "
+            "char_length(btrim(description)) BETWEEN 20 AND 2000",
+            name="ck_businesses_description_length",
+        ),
+        CheckConstraint(
+            "custom_category IS NULL OR "
+            "char_length(btrim(custom_category)) BETWEEN 2 AND 100",
+            name="ck_businesses_custom_category_length",
+        ),
+        CheckConstraint(
+            "address_line IS NULL OR "
+            "char_length(btrim(address_line)) BETWEEN 5 AND 255",
+            name="ck_businesses_address_length",
+        ),
+        CheckConstraint(
+            "(category = 'OTHER' AND custom_category IS NOT NULL) OR "
+            "(category IS DISTINCT FROM 'OTHER' AND custom_category IS NULL)",
+            name="ck_businesses_custom_category_rule",
+        ),
+        CheckConstraint(
+            BUSINESS_GOVERNORATE_CHECK,
+            name="ck_businesses_governorate",
+        ),
+        CheckConstraint(
+            BUSINESS_DISTRICT_CHECK,
+            name="ck_businesses_district",
+        ),
+        CheckConstraint(
+            BUSINESS_CITY_CHECK,
+            name="ck_businesses_city",
+        ),
+        CheckConstraint(
+            BUSINESS_LOCATION_HIERARCHY_CHECK,
+            name="ck_businesses_location_hierarchy",
+        ),
+        UniqueConstraint(
+            "owner_user_id", "normalized_name", name="uq_businesses_owner_name"
+        ),
+        CheckConstraint(
             "char_length(country) = 2", name="ck_businesses_country_length"
         ),
     )
@@ -307,30 +439,35 @@ class Business(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    name: Mapped[str] = mapped_column(String(200), nullable=False)
-    normalized_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    normalized_name: Mapped[str] = mapped_column(String(120), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
-    industry: Mapped[str | None] = mapped_column(String(150))
+    category: Mapped[BusinessCategory | None] = mapped_column(business_category_enum)
+    custom_category: Mapped[str | None] = mapped_column(String(100))
     country: Mapped[str] = mapped_column(
         String(2), nullable=False, default="LB", server_default="LB"
     )
     timezone: Mapped[str] = mapped_column(
         String(100), nullable=False, default="Asia/Beirut", server_default="Asia/Beirut"
     )
-    default_language: Mapped[DefaultLanguage] = mapped_column(
-        default_language_enum,
-        nullable=False,
-        default=DefaultLanguage.AR,
-        server_default=text("'ar'::default_language"),
-    )
     governorate: Mapped[str | None] = mapped_column(String(100))
+    district: Mapped[str | None] = mapped_column(String(100))
     city: Mapped[str | None] = mapped_column(String(150))
-    address_line: Mapped[str | None] = mapped_column(Text)
-    status: Mapped[AccountStatus] = mapped_column(
-        account_status_enum,
+    address_line: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[BusinessStatus] = mapped_column(
+        business_status_enum,
         nullable=False,
-        default=AccountStatus.DISABLED,
-        server_default=text("'disabled'::account_status"),
+        default=BusinessStatus.PENDING,
+        server_default=text("'PENDING'::business_status"),
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    onboarding_submitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -342,8 +479,11 @@ class Business(Base):
         onupdate=func.now(),
     )
 
-    membership: Mapped[BusinessMembership | None] = relationship(
-        back_populates="business", uselist=False
+    memberships: Mapped[list[BusinessMembership]] = relationship(
+        back_populates="business"
+    )
+    owner: Mapped[User] = relationship(
+        back_populates="owned_businesses", foreign_keys=[owner_user_id]
     )
     opening_days: Mapped[list[BusinessOpeningDay]] = relationship(
         back_populates="business", cascade="all, delete-orphan", passive_deletes=True
@@ -367,12 +507,12 @@ class Business(Base):
 
 
 class BusinessMembership(Base):
-    """The single MVP owner connection, ready for later role expansion."""
+    """A user's access relationship to one tenant business."""
 
     __tablename__ = "business_memberships"
     __table_args__ = (
         UniqueConstraint("user_id", "business_id", name="uq_memberships_user_business"),
-        UniqueConstraint("business_id", name="uq_memberships_business"),
+        Index("ix_memberships_business", "business_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -384,18 +524,18 @@ class BusinessMembership(Base):
     business_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("businesses.id", ondelete="RESTRICT"), nullable=False
     )
-    status: Mapped[AccountStatus] = mapped_column(
-        account_status_enum,
+    permission: Mapped[MembershipPermission] = mapped_column(
+        membership_permission_enum,
         nullable=False,
-        default=AccountStatus.ACTIVE,
-        server_default=text("'active'::account_status"),
+        default=MembershipPermission.FULL_ACCESS,
+        server_default=text("'FULL_ACCESS'::membership_permission"),
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
     user: Mapped[User] = relationship(back_populates="memberships")
-    business: Mapped[Business] = relationship(back_populates="membership")
+    business: Mapped[Business] = relationship(back_populates="memberships")
 
 
 class BusinessOpeningDay(Base):
@@ -428,12 +568,16 @@ class BusinessOpeningDay(Base):
 
 
 class BusinessOpeningShift(Base):
-    """A local wall-clock interval, optionally crossing midnight."""
+    """A same-day local wall-clock interval."""
 
     __tablename__ = "business_opening_shifts"
     __table_args__ = (
-        CheckConstraint(
-            "opens_at <> closes_at", name="ck_opening_shifts_distinct_times"
+        CheckConstraint("opens_at < closes_at", name="ck_opening_shifts_ordered_times"),
+        UniqueConstraint(
+            "opening_day_id",
+            "opens_at",
+            "closes_at",
+            name="uq_opening_shifts_day_interval",
         ),
     )
 

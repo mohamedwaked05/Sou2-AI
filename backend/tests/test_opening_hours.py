@@ -39,12 +39,13 @@ def test_closed_day_rejects_shifts() -> None:
 
 
 def test_equal_times_are_rejected() -> None:
-    with pytest.raises(ScheduleValidationError, match="differ"):
+    with pytest.raises(ScheduleValidationError, match="strictly before"):
         normalize_shifts((shift((9, 0), (9, 0)),))
 
 
-def test_overnight_shift_is_accepted() -> None:
-    assert normalize_shifts((shift((20, 0), (2, 0)),)) == (shift((20, 0), (2, 0)),)
+def test_overnight_shift_is_rejected() -> None:
+    with pytest.raises(ScheduleValidationError, match="strictly before"):
+        normalize_shifts((shift((20, 0), (2, 0)),))
 
 
 def test_overlapping_shifts_are_rejected() -> None:
@@ -52,25 +53,30 @@ def test_overlapping_shifts_are_rejected() -> None:
         normalize_shifts((shift((9, 0), (14, 0)), shift((13, 0), (18, 0))))
 
 
-def test_touching_shifts_merge() -> None:
+def test_touching_shifts_remain_adjacent() -> None:
     assert normalize_shifts((shift((9, 0), (13, 0)), shift((13, 0), (18, 0)))) == (
-        shift((9, 0), (18, 0)),
+        shift((9, 0), (13, 0)),
+        shift((13, 0), (18, 0)),
     )
 
 
-def test_touching_chain_merges() -> None:
+def test_unordered_touching_chain_is_sorted() -> None:
     assert normalize_shifts(
         (
             shift((13, 0), (18, 0)),
             shift((9, 0), (11, 0)),
             shift((11, 0), (13, 0)),
         )
-    ) == (shift((9, 0), (18, 0)),)
+    ) == (
+        shift((9, 0), (11, 0)),
+        shift((11, 0), (13, 0)),
+        shift((13, 0), (18, 0)),
+    )
 
 
-def test_overnight_overlap_is_rejected() -> None:
+def test_duplicate_shift_is_rejected() -> None:
     with pytest.raises(ScheduleValidationError, match="overlap"):
-        normalize_shifts((shift((20, 0), (2, 0)), shift((1, 0), (3, 0))))
+        normalize_shifts((shift((9, 0), (12, 0)), shift((9, 0), (12, 0))))
 
 
 def test_more_than_three_final_shifts_is_rejected() -> None:

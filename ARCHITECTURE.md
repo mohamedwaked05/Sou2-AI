@@ -151,36 +151,41 @@ Sou2AI is planned to support English, Arabic, Lebanese Arabic, Franco-Arabic, an
 * Log tool calls and errors.
 * Do not expose internal exception details in production.
 
-## 12. PostgreSQL platform foundation
+## 12. PostgreSQL business platform
 
 The Milestone 2 tables are:
 
 * `users`: platform accounts with normalized, case-insensitively unique email.
-* `businesses`: lightweight profiles, Lebanese defaults, and disabled-by-default
-  activation state.
-* `business_memberships`: the one-owner MVP association. Its relational shape can
-  later support roles and multiple members without duplicating ownership.
+* `businesses`: independently onboarded profiles with immutable creator ownership,
+  pending state, inactive-by-default activation, and the first successful
+  onboarding-confirmation timestamp.
+* `business_memberships`: the tenant access relationship. Creation atomically adds
+  the creator with the only MVP permission, `FULL_ACCESS`.
 * `business_opening_days`: one row per business weekday, with Monday `0` through
   Sunday `6`.
-* `business_opening_shifts`: one to three local wall-clock intervals per open day.
-  A closing time before opening crosses midnight. Touching proposed intervals are
-  merged; overlaps are rejected.
+* `business_opening_shifts`: one to three chronological same-day local wall-clock
+  intervals per open day. Adjacent intervals remain separate; overnight,
+  duplicate, and overlapping intervals are rejected.
 * `tool_call_logs`: business-scoped audit metadata only.
 
-Profile completion is calculated, never stored. It requires all profile text, a
-valid default language, seven days, no shifts on closed days, and one to three
-valid normalized shifts on open days. PostgreSQL rejects a disabled-to-active
-transition when these rules are not met. The platform owner may activate a
-complete business directly only after confirming offline payment; the database
-can validate completeness but cannot infer payment.
+Profile completion is calculated, never accepted from a client or stored. It
+requires a 2-120 character name, 20-2,000 character description, approved category
+(`OTHER` requires a 2-100 character custom value), an approved Lebanese
+governorate/district/city combination, a 5-255 character address, and exactly seven
+valid opening-day records. A closed day has no shifts; an open day has one to three.
+Completion and confirmation never activate a business.
 
-Owner-scoped business-name uniqueness is serialized with a transaction advisory
-lock and enforced by triggers on memberships and business renames. This prevents
-query-then-insert races without duplicating owner data on `businesses`.
+Business names trim outer whitespace, collapse internal whitespace, and compare
+case-insensitively while preserving punctuation. Immutable `owner_user_id` supports
+the database unique key `(owner_user_id, normalized_name)`; memberships remain the
+only access-control relationship. Different owners may use the same name.
 
 Schedule replacement validates the complete proposal first and writes all seven
-days in one transaction. Deferred database triggers prevent an active business
-from ending a transaction with an invalid schedule.
+days in one transaction. Business creation and creator membership also commit as
+one transaction. Business PATCH and confirmation lock the business row, giving
+simple last-write-wins semantics for simultaneous valid edits. Constraints and
+transactions, rather than process-local state, keep these operations safe when the
+one-replica MVP is scaled to multiple replicas.
 
 ## 13. Minimal tool-call auditing
 
@@ -263,7 +268,8 @@ WhatsApp is a future input channel, not the core system.
 
 ## 16. Current implementation boundary
 
-The repository contains the FastAPI/PostgreSQL platform foundation and user
-authentication described above. Business onboarding and authorization, model
-connectivity, pgvector, RAG, tool execution, adapters, operational data, memory,
-document ingestion, billing, and frontend functionality remain future work.
+The repository contains the FastAPI/PostgreSQL platform foundation, user
+authentication, multi-business management, tenant-scoped business authorization,
+and resumable onboarding described above. Model connectivity, pgvector, RAG, tool
+execution, adapters, operational data, memory, document ingestion, billing,
+activation APIs, and frontend functionality remain future work.

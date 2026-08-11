@@ -4,13 +4,14 @@ Sou2AI is a local AI assistant planned for small businesses, with future support
 
 ## Current milestone
 
-Milestone 3 adds user registration, required email verification, password login,
-rotating refresh sessions, logout, account recovery, and authenticated password
-changes to the existing PostgreSQL platform foundation.
+Milestone 4 adds authenticated multi-business creation, full-access creator
+memberships, tenant-scoped list/detail/update operations, resumable onboarding,
+controlled Lebanese locations and categories, seven-day working hours, and final
+profile confirmation. New businesses remain pending and inactive.
 
-It does **not** include business onboarding or authorization, pgvector, Ollama
-connections, RAG, tool execution/adapters, operational business data, inventory,
-billing, memory, or a React frontend.
+It does **not** include activation/admin APIs, invitations or extra roles, pgvector,
+Ollama connections, RAG, tool execution/adapters, operational business data,
+inventory, billing, memory, uploads, or a React frontend.
 
 ## Requirements
 
@@ -83,6 +84,9 @@ Endpoints:
 - Authentication: `/api/v1/auth/register`, `/verify-email`,
   `/resend-verification`, `/login`, `/refresh`, `/logout`, `/logout-all`, `/me`,
   `/forgot-password`, `/reset-password`, and `/change-password`
+- Businesses: `POST/GET /api/v1/businesses`,
+  `GET/PATCH /api/v1/businesses/{business_id}`, and
+  `POST /api/v1/businesses/{business_id}/onboarding/confirm`
 
 ```json
 {
@@ -130,10 +134,37 @@ python -m ruff format app tests alembic
 
 ## Activation and audit operations
 
-Business completion is calculated from required profile fields and a complete,
-valid seven-day schedule. PostgreSQL rejects activation while incomplete. Direct
-activation is a manual platform-owner operation and must happen only after
-offline payment confirmation; no billing record exists in this milestone.
+Business completion is derived from the current stored profile and cannot be set
+by a client. Required trimmed lengths are name 2-120, description 20-2,000, custom
+category 2-100 when category is `OTHER`, and address 5-255. Locations must match
+the approved governorate/district/city hierarchy. All seven weekdays are required;
+closed days have no shifts and open days have one to three chronological,
+non-overlapping, non-overnight shifts. Adjacent shifts are allowed.
+
+Drafts are saveable and resumable. Final confirmation validates the whole profile
+and records only the first successful timestamp; neither completion nor
+confirmation activates a business. Owner-scoped duplicate names are normalized by
+trimming, collapsing whitespace, and case-insensitive comparison while preserving
+punctuation. PostgreSQL enforces uniqueness per immutable creator owner.
+
+Every business query joins through current-user membership, and unauthorized or
+unknown business IDs return the same not-found response. Creation commits the
+business and `FULL_ACCESS` creator membership atomically. Schedule replacement is
+transactional, and simultaneous profile changes use row-level serialization with
+intentional last-write-wins behavior. These database guarantees are safe beyond
+the current one-replica MVP and use no process-local locks or onboarding state.
+
+Approved categories are `GROCERY_SUPERMARKET`, `BAKERY`, `RESTAURANT`, `CAFE`,
+`CLOTHING`, `ELECTRONICS`, `PHARMACY`, `BEAUTY_COSMETICS`, `HOME_FURNITURE`,
+`SERVICES`, and `OTHER`. `OTHER` requires custom text; predefined categories reject
+custom text.
+
+The focused location hierarchy is: Beirut/Beirut; Mount Lebanon with Baabda, Aley,
+Metn, Keserwan, and Chouf; North with Tripoli, Zgharta, and Koura; Akkar/Akkar;
+Bekaa with Zahle and West Bekaa; Baalbek-Hermel with Baalbek and Hermel; South with
+Saida and Jezzine; and Nabatieh with Nabatieh, Bint Jbeil, and Marjayoun. Cities and
+areas are accepted only under their configured district and governorate; arbitrary
+location text is rejected.
 
 Future tool arguments must be canonicalized and HMAC-SHA-256 signed with the
 server-only `TOOL_CALL_AUDIT_HMAC_SECRET`. Only the digest is stored. Audit rows
@@ -143,5 +174,5 @@ scheduler will call the existing retention operation.
 
 ## Next milestone
 
-Business management and onboarding remain a separate milestone. Authentication
-identifies a user and does not grant access to or create a business.
+Future tenant authorization work extends isolation to later business resources;
+authentication alone still never grants access to a business without membership.

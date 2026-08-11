@@ -72,7 +72,10 @@ Testing and quality:
 
 ## Current status
 
-Milestone 3, user authentication, is implemented on the PostgreSQL platform foundation. The repository contains registration, email verification, password login and recovery, rotating refresh sessions, logout, current-user authentication, persistent abuse controls, and mocked email-boundary integration tests.
+Milestone 4, business management and onboarding, is implemented on the authenticated
+PostgreSQL platform. An account can create multiple isolated business drafts, save
+and resume their profiles and weekly hours, and confirm a complete onboarding
+profile without activating the business.
 
 The current repository does not yet contain:
 
@@ -118,13 +121,13 @@ This milestone does not add authentication or business-creation endpoints, pgvec
 
 Authentication identifies the user; it does not by itself grant access to a business.
 
-### Milestone 4: Business management and onboarding
+### Milestone 4: Business management and onboarding â€” Complete
 
 * Allow an authenticated user to create and own multiple businesses.
 * Create the business and its full-access owner membership in one transaction.
 * Keep new businesses pending and inactive.
 * Add endpoints to create, list, view, and update businesses.
-* Collect the required profile, Lebanese location, category, language, and all seven working days.
+* Collect the required profile, controlled Lebanese location, category, and all seven working days.
 * Support closed days and up to three valid, non-overlapping shifts per open day.
 * Return derived profile-completion status and enforce the agreed exact-duplicate business-name rule.
 * Test the complete onboarding flow.

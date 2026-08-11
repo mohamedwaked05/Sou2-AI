@@ -14,7 +14,13 @@ VALID_DIGEST = "a" * 64
 
 
 def business() -> Business:
-    return Business(name="Audit Scope")
+    owner = User(
+        email=f"owner-{uuid.uuid4()}@example.com",
+        first_name="Audit",
+        last_name="Owner",
+        password_hash="hash",
+    )
+    return Business(owner=owner, name="Audit Scope")
 
 
 def user() -> User:
