@@ -15,6 +15,7 @@ from app.database.models import (
     BusinessMembership,
     BusinessOpeningDay,
     MembershipPermission,
+    OwnerConversation,
     User,
 )
 from app.schemas.business import (
@@ -115,7 +116,8 @@ def create_business(session: Session, user: User, name: str) -> BusinessResponse
         business=business,
         permission=MembershipPermission.FULL_ACCESS,
     )
-    session.add_all([business, membership])
+    conversation = OwnerConversation(business=business)
+    session.add_all([business, membership, conversation])
     try:
         session.flush()
         session.commit()
@@ -149,6 +151,23 @@ def _load_for_update(session: Session, user: User, business_id: uuid.UUID) -> Bu
         .where(Business.id == business_id)
         .with_for_update(of=Business)
     )
+    if business is None:
+        raise _not_found()
+    return business
+
+
+def load_full_access_business(
+    session: Session,
+    user: User,
+    business_id: uuid.UUID,
+    *,
+    for_update: bool = False,
+) -> Business:
+    """Resolve a tenant only through its full-access membership."""
+    query = _business_query(user.id, full_access=True).where(Business.id == business_id)
+    if for_update:
+        query = query.with_for_update(of=Business)
+    business = session.scalar(query)
     if business is None:
         raise _not_found()
     return business
@@ -224,6 +243,12 @@ def update_business(
     except (ScheduleValidationError, IntegrityError) as exc:
         session.rollback()
         if isinstance(exc, IntegrityError):
+            if "active business must retain a valid profile" in str(exc).casefold():
+                raise ApplicationError(
+                    "An active business must retain a complete profile.",
+                    status_code=422,
+                    error_code="business_profile_incomplete",
+                ) from None
             raise _conflict() from None
         raise ApplicationError(
             str(exc), status_code=422, error_code="invalid_working_hours"

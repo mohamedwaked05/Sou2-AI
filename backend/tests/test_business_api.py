@@ -542,3 +542,35 @@ def test_duplicate_name_update_is_conflict_and_atomic(
     ).json()
     assert detail["name"] == "Second Market"
     assert detail["description"] is None
+
+
+def test_active_business_profile_edits_preserve_completion(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user = create_user(db_session, "active-edit@example.com")
+    business = create_draft(api_client, user, "Active Edit Market")
+    completed = complete_profile(api_client, user, str(business["id"]))
+    assert completed.status_code == 200
+    db_session.execute(
+        text("UPDATE businesses SET is_active = true WHERE id = :id"),
+        {"id": business["id"]},
+    )
+    db_session.commit()
+    path = f"/api/v1/businesses/{business['id']}"
+
+    invalid = api_client.patch(
+        path,
+        headers=headers(user),
+        json={"description": None},
+    )
+    assert invalid.status_code == 422
+    assert invalid.json()["error"]["code"] == "business_profile_incomplete"
+
+    valid = api_client.patch(
+        path,
+        headers=headers(user),
+        json={"description": "An updated complete description for this active market."},
+    )
+    assert valid.status_code == 200
+    assert valid.json()["is_active"] is True
+    assert valid.json()["profile_complete"] is True

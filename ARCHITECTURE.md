@@ -44,8 +44,9 @@ During early milestones, the agent layer may not be active and the API can call 
 
 * React frontend provides the future browser interface.
 * FastAPI backend exposes HTTP APIs and coordinates application services.
-* PostgreSQL holds platform-owned identity, business-profile, schedule, and audit
-  metadata. It does not mirror live operational business data.
+* PostgreSQL holds platform-owned identity, business-profile, schedule, owner-chat,
+  learned-knowledge, and audit metadata. It does not mirror live operational
+  business data.
 * pgvector will support vector similarity search in PostgreSQL.
 * Ollama will run local models.
 * Qwen2.5 7B will provide chat generation.
@@ -109,7 +110,8 @@ The system must state that information is unavailable when retrieval does not pr
 ## 8. Platform data versus operational business data
 
 Sou2AI PostgreSQL stores data the platform owns: users, business profiles,
-memberships, weekly opening hours, and minimal tool-call audit metadata. Products,
+memberships, weekly opening hours, owner chat, learned stable facts, and minimal
+tool-call audit metadata. Products,
 inventory, orders, sales, revenue, customers, appointments, and billing remain in
 the business's source system. Future controlled tools will access those systems
 through an API, a read-only database integration, or a Sou2AI-managed operational
@@ -139,7 +141,10 @@ Write and destructive tools must require validation and, when appropriate, expli
 
 ## 10. Language handling
 
-Sou2AI is planned to support English, Arabic, Lebanese Arabic, Franco-Arabic, and mixed-language input. Qwen2.5 generates and understands responses, while BGE-M3 handles multilingual semantic retrieval. A Franco-Arabic normalization layer may be added only if testing shows it improves retrieval. The system should respond in the user's language style when practical.
+Milestone 5 owner chat accepts English, Arabic, Lebanese Arabic, Franco-Arabic,
+and mixed-language input while producing English owner-facing responses. Its
+deterministic mock does not claim production language quality. Future provider
+evaluation will determine whether normalization is useful.
 
 ## 11. Reliability rules
 
@@ -230,6 +235,46 @@ maintenance failure does not change the authentication response or its counters.
 An external database maintenance job may replace or supplement this mechanism if
 future volume requires it.
 
+## 13.2 Owner chat and learned business knowledge
+
+Every business is created with exactly one `owner_conversations` row. Owner turns
+reserve odd logical sequence numbers and assistant replies use the following even
+number. History returns the newest 50 messages per stable cursor page, while the
+provider receives only the newest 12 messages up to the processed turn.
+
+Idempotency keys are unique per conversation in PostgreSQL. Identical replays
+reuse the owner message and stored reply; a changed payload conflicts. A failed
+generation leaves the owner message retryable and never creates a fake reply.
+
+Replica-safe ordering uses persisted generation state and expiring claim tokens.
+A short transaction locks the conversation, claims only its earliest unfinished
+turn, and commits. Context is read and the connection is released before the
+provider call. Another replica waits or reclaims an expired/failed claim; it cannot
+advance past an unfinished earlier turn. Assistant persistence, accepted knowledge
+upserts, and completion commit atomically. Different conversations do not block
+one another. Redis, queues, workers, sticky sessions, and process-local locks are
+not used.
+
+The provider boundary accepts a provider-neutral business profile, bounded active
+knowledge, ordered messages, and request time. It returns an English reply and
+structured proposed facts. Milestone 5 supplies only a deterministic offline mock
+and safe timeout, unavailable, and invalid-response errors. Cloud and Ollama
+providers remain future implementations behind the same boundary.
+
+`business_knowledge` stores a tenant-unique normalized subject, content, allowed
+category, owner-chat provenance, lifecycle, expiry, and timestamps. Permanent
+facts have no expiry; temporary facts require one. PostgreSQL filters expired facts
+before context selection, which is bounded by
+`OWNER_CHAT_KNOWLEDGE_CONTEXT_LIMIT`. Expired rows remain owner-manageable.
+Duplicate subjects update without changing `created_at`.
+
+Learned knowledge is separate from conversation history and future RAG documents.
+Application allowlists reject current stock, revenue, orders, sales totals, best
+sellers, restocking quantities, appointment availability, and other changing
+operational data. Future concepts such as `get_revenue_trend`,
+`get_top_selling_items`, and `compare_sales` will use controlled tenant-scoped live
+adapters; they are not implemented and the model must not guess their results.
+
 A future centralized tool-execution service—not the model and not individual
 adapters—will write exactly one audit row after business-scope and permission
 checks for every success, error, or denial. That executor and its adapters remain
@@ -269,7 +314,9 @@ WhatsApp is a future input channel, not the core system.
 ## 16. Current implementation boundary
 
 The repository contains the FastAPI/PostgreSQL platform foundation, user
-authentication, multi-business management, tenant-scoped business authorization,
-and resumable onboarding described above. Model connectivity, pgvector, RAG, tool
-execution, adapters, operational data, memory, document ingestion, billing,
-activation APIs, and frontend functionality remain future work.
+authentication, multi-business management, tenant-scoped authorization, resumable
+onboarding, one owner conversation per business, ordered persistent owner chat, a
+deterministic mock provider, and managed permanent/temporary learned knowledge.
+Cloud or Ollama connectivity, pgvector, RAG, live tools and analytics, customer
+chat, documents, billing, activation APIs, and frontend functionality remain
+future work.

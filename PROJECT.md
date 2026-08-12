@@ -72,10 +72,11 @@ Testing and quality:
 
 ## Current status
 
-Milestone 4, business management and onboarding, is implemented on the authenticated
-PostgreSQL platform. An account can create multiple isolated business drafts, save
-and resume their profiles and weekly hours, and confirm a complete onboarding
-profile without activating the business.
+Milestone 5, owner chat and learned business knowledge, is implemented on the
+authenticated PostgreSQL platform. Each isolated business has one private owner
+conversation, persistent messages, idempotent ordered generation through an
+offline deterministic provider, and owner-reviewable permanent or expiring facts.
+Chat requires a complete, manually active business and `FULL_ACCESS` membership.
 
 The current repository does not yet contain:
 
@@ -84,11 +85,10 @@ The current repository does not yet contain:
 * Embeddings
 * RAG
 * Agent tools
-* Memory
 * React functionality
 * WhatsApp integration
 
-The next milestone is Milestone 4: business management and onboarding.
+Later roadmap milestones remain planned, not implemented.
 
 ## Development roadmap
 
@@ -121,7 +121,7 @@ This milestone does not add authentication or business-creation endpoints, pgvec
 
 Authentication identifies the user; it does not by itself grant access to a business.
 
-### Milestone 4: Business management and onboarding â€” Complete
+### Milestone 4: Business management and onboarding — Complete
 
 * Allow an authenticated user to create and own multiple businesses.
 * Create the business and its full-access owner membership in one transaction.
@@ -132,14 +132,23 @@ Authentication identifies the user; it does not by itself grant access to a busi
 * Return derived profile-completion status and enforce the agreed exact-duplicate business-name rule.
 * Test the complete onboarding flow.
 
-### Milestone 5: Tenant authorization and data isolation
+### Milestone 5: Owner chat and learned business knowledge — Complete
 
-* Require authentication for every business-scoped endpoint.
-* Check membership before accessing a business or any of its resources.
-* Scope every query by the authorized `business_id`; never trust a client-supplied business ID by itself.
-* Apply the single full-access owner role for the MVP.
-* Use consistent `401`, `403`, and privacy-preserving `404` responses.
-* Add cross-tenant tests for profiles, schedules, documents, conversations, integrations, AI usage, tools, and audit metadata.
+* Provide exactly one private main owner conversation for every business.
+* Persist owner and assistant messages and return stable 50-message cursor pages.
+* Send only the newest 12 messages through a replaceable provider contract,
+  implemented here by a deterministic offline mock.
+* Require authentication, `FULL_ACCESS`, profile completion, and existing manual
+  activation before chat.
+* Enforce database idempotency and PostgreSQL-backed ordered generation across API
+  replicas without holding a transaction during provider work.
+* Learn only allowed stable permanent or clearly expiring temporary facts, update
+  duplicate subjects, exclude expired facts from context, and provide owner review,
+  edit, and deletion APIs.
+* Reject live operational values such as stock, revenue, orders, sales, restocking,
+  and appointment availability; future controlled integrations remain their source.
+* Prevent active businesses from becoming profile-incomplete through profile or
+  schedule edits.
 
 ### Milestone 6: Business lifecycle and manual activation
 

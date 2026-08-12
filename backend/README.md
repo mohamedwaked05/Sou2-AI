@@ -4,14 +4,16 @@ Sou2AI is a local AI assistant planned for small businesses, with future support
 
 ## Current milestone
 
-Milestone 4 adds authenticated multi-business creation, full-access creator
-memberships, tenant-scoped list/detail/update operations, resumable onboarding,
-controlled Lebanese locations and categories, seven-day working hours, and final
-profile confirmation. New businesses remain pending and inactive.
+Milestone 5 adds one private owner conversation per business, persistent ordered
+messages, a replaceable generation-provider contract, and a deterministic offline
+mock provider. Chat requires an authenticated `FULL_ACCESS` membership plus a
+currently complete and manually active business. It also adds permanent and
+expiring learned business knowledge with owner list, edit, and delete operations.
 
-It does **not** include activation/admin APIs, invitations or extra roles, pgvector,
-Ollama connections, RAG, tool execution/adapters, operational business data,
-inventory, billing, memory, uploads, or a React frontend.
+It does **not** include customer chat, activation/admin APIs, cloud or paid model
+providers, Ollama connectivity, RAG, embeddings, pgvector, documents, operational
+integrations or analytics, tool execution, payments, frontend code, invitations,
+or additional roles.
 
 ## Requirements
 
@@ -87,6 +89,10 @@ Endpoints:
 - Businesses: `POST/GET /api/v1/businesses`,
   `GET/PATCH /api/v1/businesses/{business_id}`, and
   `POST /api/v1/businesses/{business_id}/onboarding/confirm`
+- Owner chat: `POST/GET
+  /api/v1/businesses/{business_id}/owner-chat/messages`
+- Learned knowledge: `GET /api/v1/businesses/{business_id}/knowledge` and
+  `PATCH/DELETE /api/v1/businesses/{business_id}/knowledge/{knowledge_id}`
 
 ```json
 {
@@ -106,6 +112,11 @@ python -m pytest
 
 The integration suite also mocks the email-service boundary and exercises the
 complete authentication and session lifecycle without contacting Resend.
+
+Owner-chat tests use the provider contract without network access and exercise
+PostgreSQL constraints, idempotency races, independent-session concurrency,
+tenant isolation, cursor history, provider/persistence failures, and learned-fact
+lifecycle behavior.
 
 Authentication abuse controls store temporary event rows containing the event
 type, normalized email address, trusted client IP address, and timestamp. The
@@ -149,10 +160,43 @@ punctuation. PostgreSQL enforces uniqueness per immutable creator owner.
 
 Every business query joins through current-user membership, and unauthorized or
 unknown business IDs return the same not-found response. Creation commits the
-business and `FULL_ACCESS` creator membership atomically. Schedule replacement is
-transactional, and simultaneous profile changes use row-level serialization with
-intentional last-write-wins behavior. These database guarantees are safe beyond
-the current one-replica MVP and use no process-local locks or onboarding state.
+business, `FULL_ACCESS` creator membership, and its single owner conversation
+atomically. Schedule replacement is transactional, and simultaneous profile
+changes use row-level serialization with intentional last-write-wins behavior.
+PostgreSQL also prevents an active business from ending a transaction with an
+incomplete profile after either profile-field or schedule edits.
+
+## Owner chat and learned knowledge
+
+`POST .../owner-chat/messages` requires a 1-200 character client idempotency key
+and a nonblank owner message of at most 14,000 characters after trimming. Original
+message text is preserved. The key is database-unique within the business's one
+conversation. Replays with identical content reuse the stored result; different
+content returns a safe conflict. Provider failure retains the owner message and
+returns a retryable `503` without inventing an assistant response.
+
+History stores every message and returns the newest 50 per page through an opaque
+stable cursor. Pages are deterministic by logical sequence and UUID even when
+timestamps match. Only the newest 12 messages enter provider context. Active,
+non-expired knowledge candidates are PostgreSQL-filtered, bounded by
+`OWNER_CHAT_KNOWLEDGE_CONTEXT_LIMIT` (100 by default), and deterministically ranked
+for the current message.
+
+Generation uses short database transactions and persisted per-turn claims. A
+conversation row lock selects only the earliest unfinished turn, then commits
+before the provider runs. `OWNER_CHAT_GENERATION_LEASE_SECONDS` allows recovery
+after a crashed claimant, while `OWNER_CHAT_GENERATION_WAIT_SECONDS` bounds inline
+waiting. This coordinates independent replicas without Redis, workers,
+process-local locks, or holding a pooled connection during provider work.
+
+Learned facts have a normalized tenant-unique subject, allowed stable category,
+owner-chat provenance, and permanent or temporary lifecycle. Temporary facts need
+a future timezone-aware expiry; explicit “today” uses the business timezone.
+Expired facts stay visible for owner management but never enter model context.
+Repeated subjects update in place and preserve `created_at`. Live stock, revenue,
+orders, sales, best sellers, restocking, appointment availability, and similar
+changing values are rejected by application allowlists and remain the concern of
+future controlled tenant-scoped tools.
 
 Approved categories are `GROCERY_SUPERMARKET`, `BAKERY`, `RESTAURANT`, `CAFE`,
 `CLOTHING`, `ELECTRONICS`, `PHARMACY`, `BEAUTY_COSMETICS`, `HOME_FURNITURE`,
@@ -172,7 +216,8 @@ retain no raw arguments, results, prompts, conversations, customer PII, or raw
 errors. `TOOL_CALL_AUDIT_RETENTION_DAYS` defaults to 90; a future external
 scheduler will call the existing retention operation.
 
-## Next milestone
+## Implementation boundary
 
-Future tenant authorization work extends isolation to later business resources;
-authentication alone still never grants access to a business without membership.
+Milestone 5 is complete. Later RAG, documents, model connectivity, controlled live
+tools and analytics, customer channels, and frontend work remain planned only.
+Authentication alone never grants business access without membership.

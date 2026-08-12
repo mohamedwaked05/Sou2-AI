@@ -53,6 +53,7 @@ def db_session(database_engine: Engine) -> Generator[Session]:
                 "TRUNCATE authentication_maintenance_tasks, authentication_events, "
                 "password_reset_tokens, "
                 "email_verification_tokens, refresh_sessions, tool_call_logs, "
+                "business_knowledge, owner_chat_messages, owner_conversations, "
                 "business_opening_shifts, "
                 "business_opening_days, business_memberships, businesses, users CASCADE"
             )

@@ -198,3 +198,28 @@ def test_active_business_rejects_invalid_direct_schedule_edit(
             {"business_id": business.id},
         )
         db_session.commit()
+
+
+@pytest.mark.parametrize(
+    "column",
+    ["description", "category", "governorate", "district", "city", "address_line"],
+)
+def test_active_business_rejects_incomplete_direct_profile_edit(
+    db_session: Session, column: str
+) -> None:
+    business = complete_business(f"Guard {column}")
+    db_session.add(business)
+    db_session.commit()
+    replace_weekly_schedule(db_session, business.id, valid_week())
+    db_session.execute(
+        text("UPDATE businesses SET is_active = true WHERE id = :id"),
+        {"id": business.id},
+    )
+    db_session.commit()
+
+    with pytest.raises(IntegrityError, match="retain a valid profile"):
+        db_session.execute(
+            text(f"UPDATE businesses SET {column} = NULL WHERE id = :id"),
+            {"id": business.id},
+        )
+        db_session.commit()

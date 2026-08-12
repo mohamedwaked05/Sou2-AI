@@ -7,10 +7,12 @@ from datetime import datetime, time
 from enum import StrEnum
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -62,6 +64,33 @@ class ToolCallStatus(StrEnum):
     SUCCESS = "success"
     ERROR = "error"
     DENIED = "denied"
+
+
+class ChatMessageRole(StrEnum):
+    OWNER = "owner"
+    ASSISTANT = "assistant"
+
+
+class ChatGenerationState(StrEnum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class KnowledgeKind(StrEnum):
+    PERMANENT = "permanent"
+    TEMPORARY = "temporary"
+
+
+class KnowledgeCategory(StrEnum):
+    DELIVERY = "delivery"
+    RETURNS = "returns"
+    WARRANTY = "warranty"
+    SERVICE = "service"
+    POLICY = "policy"
+    TEMPORARY_NOTICE = "temporary_notice"
+    PROMOTION = "promotion"
 
 
 account_status_enum = ENUM(
@@ -491,6 +520,12 @@ class Business(Base):
     tool_call_logs: Mapped[list[ToolCallLog]] = relationship(
         back_populates="business", passive_deletes=True
     )
+    owner_conversation: Mapped[OwnerConversation | None] = relationship(
+        back_populates="business", cascade="all, delete-orphan", passive_deletes=True
+    )
+    knowledge: Mapped[list[BusinessKnowledge]] = relationship(
+        back_populates="business", cascade="all, delete-orphan", passive_deletes=True
+    )
 
     def __init__(self, **kwargs: object) -> None:
         if "name" in kwargs and "normalized_name" not in kwargs:
@@ -594,6 +629,215 @@ class BusinessOpeningShift(Base):
     )
 
     opening_day: Mapped[BusinessOpeningDay] = relationship(back_populates="shifts")
+
+
+class OwnerConversation(Base):
+    """The single private owner conversation for one business."""
+
+    __tablename__ = "owner_conversations"
+    __table_args__ = (
+        CheckConstraint(
+            "next_turn_number > 0", name="ck_owner_conversations_next_turn_positive"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    next_turn_number: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=1, server_default=text("1")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    business: Mapped[Business] = relationship(back_populates="owner_conversation")
+    messages: Mapped[list[OwnerChatMessage]] = relationship(
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        foreign_keys="OwnerChatMessage.conversation_id",
+    )
+
+
+class OwnerChatMessage(Base):
+    """One logically ordered owner or assistant message."""
+
+    __tablename__ = "owner_chat_messages"
+    __table_args__ = (
+        CheckConstraint(
+            "char_length(btrim(content)) BETWEEN 1 AND 14000",
+            name="ck_owner_chat_messages_content_length",
+        ),
+        CheckConstraint(
+            "role IN ('owner', 'assistant')",
+            name="ck_owner_chat_messages_role",
+        ),
+        CheckConstraint(
+            "generation_state IS NULL OR generation_state IN "
+            "('pending', 'processing', 'completed', 'failed')",
+            name="ck_owner_chat_messages_generation_state",
+        ),
+        CheckConstraint(
+            "(role = 'owner' AND sequence_number % 2 = 1 AND "
+            "idempotency_key IS NOT NULL AND reply_to_message_id IS NULL AND "
+            "generation_state IS NOT NULL) OR "
+            "(role = 'assistant' AND sequence_number % 2 = 0 AND "
+            "idempotency_key IS NULL AND reply_to_message_id IS NOT NULL AND "
+            "generation_state IS NULL)",
+            name="ck_owner_chat_messages_role_fields",
+        ),
+        CheckConstraint(
+            "btrim(idempotency_key) <> ''",
+            name="ck_owner_chat_messages_idempotency_not_blank",
+        ),
+        CheckConstraint(
+            "(generation_state = 'processing' AND generation_claim_token IS NOT NULL "
+            "AND generation_claim_expires_at IS NOT NULL) OR "
+            "(generation_state IS DISTINCT FROM 'processing' AND "
+            "generation_claim_token IS NULL AND generation_claim_expires_at IS NULL)",
+            name="ck_owner_chat_messages_claim_state",
+        ),
+        CheckConstraint(
+            "generation_attempts >= 0",
+            name="ck_owner_chat_messages_attempts_nonnegative",
+        ),
+        UniqueConstraint(
+            "conversation_id", "sequence_number", name="uq_owner_chat_message_order"
+        ),
+        UniqueConstraint(
+            "conversation_id", "idempotency_key", name="uq_owner_chat_idempotency"
+        ),
+        UniqueConstraint(
+            "conversation_id", "id", name="uq_owner_chat_message_conversation_id"
+        ),
+        UniqueConstraint("reply_to_message_id", name="uq_owner_chat_reply"),
+        ForeignKeyConstraint(
+            ["conversation_id", "reply_to_message_id"],
+            ["owner_chat_messages.conversation_id", "owner_chat_messages.id"],
+            name="fk_owner_chat_reply_same_conversation",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "ix_owner_chat_messages_history",
+            "conversation_id",
+            text("sequence_number DESC"),
+            "id",
+        ),
+        Index(
+            "ix_owner_chat_messages_generation",
+            "conversation_id",
+            "generation_state",
+            "sequence_number",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("owner_conversations.id", ondelete="CASCADE"), nullable=False
+    )
+    sequence_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    role: Mapped[ChatMessageRole] = mapped_column(String(20), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(200))
+    reply_to_message_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    generation_state: Mapped[ChatGenerationState | None] = mapped_column(String(20))
+    generation_claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    generation_claim_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    generation_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    conversation: Mapped[OwnerConversation] = relationship(
+        back_populates="messages", foreign_keys=[conversation_id]
+    )
+    reply_to_message: Mapped[OwnerChatMessage | None] = relationship(
+        remote_side=[id], foreign_keys=[reply_to_message_id]
+    )
+
+
+class BusinessKnowledge(Base):
+    """Owner-reviewable durable knowledge learned from owner chat."""
+
+    __tablename__ = "business_knowledge"
+    __table_args__ = (
+        CheckConstraint(
+            "subject_key ~ '^[a-z0-9]+(_[a-z0-9]+)*$'",
+            name="ck_business_knowledge_subject_key",
+        ),
+        CheckConstraint(
+            "char_length(btrim(content)) BETWEEN 1 AND 4000",
+            name="ck_business_knowledge_content_length",
+        ),
+        CheckConstraint(
+            "kind IN ('permanent', 'temporary')",
+            name="ck_business_knowledge_kind",
+        ),
+        CheckConstraint(
+            "category IN ('delivery', 'returns', 'warranty', 'service', 'policy', "
+            "'temporary_notice', 'promotion')",
+            name="ck_business_knowledge_category",
+        ),
+        CheckConstraint(
+            "(kind = 'permanent' AND expires_at IS NULL) OR "
+            "(kind = 'temporary' AND expires_at IS NOT NULL)",
+            name="ck_business_knowledge_expiry",
+        ),
+        CheckConstraint(
+            "source = 'owner_chat'",
+            name="ck_business_knowledge_source",
+        ),
+        UniqueConstraint(
+            "business_id", "subject_key", name="uq_business_knowledge_subject"
+        ),
+        Index("ix_business_knowledge_context", "business_id", "expires_at"),
+        Index("ix_business_knowledge_management", "business_id", "updated_at", "id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    subject_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[KnowledgeKind] = mapped_column(String(20), nullable=False)
+    category: Mapped[KnowledgeCategory] = mapped_column(String(30), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="owner_chat", server_default="owner_chat"
+    )
+    source_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("owner_chat_messages.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    business: Mapped[Business] = relationship(back_populates="knowledge")
 
 
 class ToolCallLog(Base):

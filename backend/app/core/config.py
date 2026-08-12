@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     frontend_base_url: str = "http://localhost:5173"
     verification_link_path: str = "/verify-email"
     password_reset_link_path: str = "/reset-password"
+    owner_chat_knowledge_context_limit: int = Field(default=100, ge=1, le=200)
+    owner_chat_generation_lease_seconds: int = Field(default=30, ge=5, le=300)
+    owner_chat_generation_wait_seconds: int = Field(default=30, ge=1, le=300)
 
     @field_validator("allowed_cors_origins", mode="before")
     @classmethod
