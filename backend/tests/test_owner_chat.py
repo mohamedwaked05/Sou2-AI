@@ -27,6 +27,7 @@ from app.schemas.owner_chat import OwnerMessageRequest
 from app.services.owner_chat import submit_owner_message
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from tests.test_business_api import (
@@ -142,7 +143,7 @@ def test_message_persists_in_logical_order_and_is_idempotent(
 
 @pytest.mark.parametrize(
     ("content", "expected"),
-    [(" ", 422), ("x", 200), ("x" * 14_000, 200), ("x" * 14_001, 422)],
+    [(" ", 422), ("x", 200), ("x" * 4_000, 200), ("x" * 4_001, 422)],
 )
 def test_owner_message_length_boundaries(
     api_client: TestClient,
@@ -158,6 +159,133 @@ def test_owner_message_length_boundaries(
     )
     response = submit(api_client, user, business["id"], content)
     assert response.status_code == expected
+    if expected == 422:
+        assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_owner_message_preserves_outer_whitespace_at_trimmed_limit(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email="trimmed-owner-limit@example.com",
+        name="Trimmed Owner Limit",
+    )
+    original = f"  {'x' * 4_000}  "
+
+    response = submit(api_client, user, business["id"], original)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["owner_message"]["content"] == original
+
+
+def test_database_rejects_owner_message_above_4000_characters(
+    api_client: TestClient, db_session: Session
+) -> None:
+    _, business = active_business(
+        api_client,
+        db_session,
+        email="database-owner-limit@example.com",
+        name="Database Owner Limit",
+    )
+    conversation = db_session.scalar(
+        select(OwnerConversation).where(
+            OwnerConversation.business_id == uuid.UUID(str(business["id"]))
+        )
+    )
+    assert conversation is not None
+    db_session.add(
+        OwnerChatMessage(
+            conversation_id=conversation.id,
+            sequence_number=1,
+            role=ChatMessageRole.OWNER,
+            content="x" * 4_001,
+            idempotency_key="database-owner-limit",
+            generation_state="pending",
+        )
+    )
+
+    with pytest.raises(IntegrityError, match="content_length"):
+        db_session.commit()
+
+
+def test_database_allows_assistant_message_above_4000_characters(
+    api_client: TestClient, db_session: Session
+) -> None:
+    _, business = active_business(
+        api_client,
+        db_session,
+        email="database-assistant-allowed@example.com",
+        name="Database Assistant Allowed",
+    )
+    conversation = db_session.scalar(
+        select(OwnerConversation).where(
+            OwnerConversation.business_id == uuid.UUID(str(business["id"]))
+        )
+    )
+    assert conversation is not None
+    owner = OwnerChatMessage(
+        conversation_id=conversation.id,
+        sequence_number=1,
+        role=ChatMessageRole.OWNER,
+        content="Owner question",
+        idempotency_key="database-assistant-allowed",
+        generation_state="completed",
+    )
+    db_session.add(owner)
+    db_session.flush()
+    assistant = OwnerChatMessage(
+        conversation_id=conversation.id,
+        sequence_number=2,
+        role=ChatMessageRole.ASSISTANT,
+        content="a" * 10_000,
+        reply_to_message_id=owner.id,
+    )
+    db_session.add(assistant)
+
+    db_session.commit()
+
+    assert len(assistant.content) == 10_000
+
+
+def test_database_rejects_assistant_message_above_14000_characters(
+    api_client: TestClient, db_session: Session
+) -> None:
+    _, business = active_business(
+        api_client,
+        db_session,
+        email="database-assistant-limit@example.com",
+        name="Database Assistant Limit",
+    )
+    conversation = db_session.scalar(
+        select(OwnerConversation).where(
+            OwnerConversation.business_id == uuid.UUID(str(business["id"]))
+        )
+    )
+    assert conversation is not None
+    owner = OwnerChatMessage(
+        conversation_id=conversation.id,
+        sequence_number=1,
+        role=ChatMessageRole.OWNER,
+        content="Owner question",
+        idempotency_key="database-assistant-limit",
+        generation_state="completed",
+    )
+    db_session.add(owner)
+    db_session.flush()
+    db_session.add(
+        OwnerChatMessage(
+            conversation_id=conversation.id,
+            sequence_number=2,
+            role=ChatMessageRole.ASSISTANT,
+            content="a" * 14_001,
+            reply_to_message_id=owner.id,
+        )
+    )
+
+    with pytest.raises(IntegrityError, match="content_length"):
+        db_session.commit()
 
 
 def test_provider_failure_keeps_one_owner_message_and_retry_reuses_it(

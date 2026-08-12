@@ -675,7 +675,10 @@ class OwnerChatMessage(Base):
     __tablename__ = "owner_chat_messages"
     __table_args__ = (
         CheckConstraint(
-            "char_length(btrim(content)) BETWEEN 1 AND 14000",
+            "(role = 'owner' AND "
+            "char_length(btrim(content)) BETWEEN 1 AND 4000) OR "
+            "(role = 'assistant' AND "
+            "char_length(btrim(content)) BETWEEN 1 AND 14000)",
             name="ck_owner_chat_messages_content_length",
         ),
         CheckConstraint(

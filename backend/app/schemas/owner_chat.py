@@ -48,8 +48,8 @@ class OwnerMessageRequest(BaseModel):
     @field_validator("content")
     @classmethod
     def validate_content(cls, value: str) -> str:
-        if not 1 <= len(value.strip()) <= 14_000:
-            raise ValueError("Message must contain between 1 and 14000 characters.")
+        if not 1 <= len(value.strip()) <= 4_000:
+            raise ValueError("Message must contain between 1 and 4000 characters.")
         return value
 
 

@@ -169,8 +169,9 @@ incomplete profile after either profile-field or schedule edits.
 ## Owner chat and learned knowledge
 
 `POST .../owner-chat/messages` requires a 1-200 character client idempotency key
-and a nonblank owner message of at most 14,000 characters after trimming. Original
-message text is preserved. The key is database-unique within the business's one
+and a nonblank owner message of at most 4,000 characters after trimming. Original
+message text is preserved. Assistant messages retain an internal 14,000-character
+database allowance. The key is database-unique within the business's one
 conversation. Replays with identical content reuse the stored result; different
 content returns a safe conflict. Provider failure retains the owner message and
 returns a retryable `503` without inventing an assistant response.
