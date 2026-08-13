@@ -40,7 +40,6 @@ from app.database.models import (
     ChatGenerationState,
     ChatMessageRole,
     OwnerChatMessage,
-    OwnerChatRateLimitEvent,
     OwnerConversation,
     User,
 )
@@ -52,11 +51,13 @@ from app.schemas.owner_chat import (
 )
 from app.services.ai_usage import (
     AIUsageReservationClaim,
-    estimate_owner_chat_input_tokens,
     reconcile_ai_usage,
     reserve_owner_chat_usage,
 )
-from app.services.api_limits import admit_owner_chat_generation
+from app.services.api_limits import (
+    admit_owner_chat_generation,
+    undo_owner_chat_generation_admission,
+)
 from app.services.business_knowledge import upsert_proposed_knowledge
 from app.services.business_profiles import is_business_profile_complete
 from app.services.businesses import load_full_access_business
@@ -394,26 +395,22 @@ def _mark_failed(
     session.commit()
 
 
-def _undo_pre_provider_admission(session: Session, claim: _Claim) -> None:
+def _undo_pre_provider_admission(
+    session: Session,
+    business_id: uuid.UUID,
+    claim: _Claim,
+    generation_attempt: int,
+) -> None:
     """Keep budget-blocked idempotent owner turns retryable without event inflation."""
-    message = session.scalar(
-        select(OwnerChatMessage)
-        .where(
-            OwnerChatMessage.id == claim.message_id,
-            OwnerChatMessage.generation_claim_token == claim.token,
-        )
-        .with_for_update()
+    undone = undo_owner_chat_generation_admission(
+        session,
+        business_id=business_id,
+        owner_message_id=claim.message_id,
+        generation_attempt=generation_attempt,
+        generation_claim_token=claim.token,
     )
-    if message is not None:
-        session.query(OwnerChatRateLimitEvent).filter(
-            OwnerChatRateLimitEvent.owner_message_id == message.id,
-            OwnerChatRateLimitEvent.generation_attempt == message.generation_attempts,
-        ).delete(synchronize_session=False)
-        message.generation_attempts -= 1
-        message.generation_state = ChatGenerationState.FAILED
-        message.generation_claim_token = None
-        message.generation_claim_expires_at = None
-    session.commit()
+    if not undone:
+        raise RuntimeError("Owner generation admission could not be safely undone.")
 
 
 def _validate_result(result: object) -> OwnerChatResult:
@@ -504,25 +501,28 @@ def _generate_claimed_turn(
         owner_message = session.get(OwnerChatMessage, claim.message_id)
         if owner_message is None:
             raise _provider_unavailable()
+        generation_attempt = owner_message.generation_attempts
         try:
             reservation = reserve_owner_chat_usage(
                 session,
                 business=business,
                 user=user,
                 owner_message_id=claim.message_id,
-                generation_attempt=owner_message.generation_attempts,
-                estimated_input_tokens=estimate_owner_chat_input_tokens(request),
+                generation_attempt=generation_attempt,
+                estimated_input_tokens=provider.estimate_input_tokens(request),
                 max_output_tokens=request.max_output_tokens,
                 lease_seconds=settings.owner_chat_generation_lease_seconds,
             )
         except ApplicationError as exc:
             if exc.error_code == "daily_ai_token_limit_reached":
-                _undo_pre_provider_admission(session, claim)
+                _undo_pre_provider_admission(
+                    session, business_id, claim, generation_attempt
+                )
             raise
         result = _validate_result(provider.generate(request))
         usage = result.usage
         if usage is None:
-            input_tokens = estimate_owner_chat_input_tokens(request)
+            input_tokens = provider.estimate_input_tokens(request)
             output_tokens = estimate_utf8_tokens(result.reply)
             usage = TokenUsage(
                 input_tokens=input_tokens,

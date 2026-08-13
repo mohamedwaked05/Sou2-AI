@@ -5,8 +5,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import httpx
 import pytest
 from app.agent.owner_chat_provider import (
+    OllamaOwnerChatProvider,
     OwnerChatProviderInvalidResponse,
     OwnerChatProviderUnavailable,
     OwnerChatRequest,
@@ -22,7 +24,7 @@ from app.database.models import (
     OwnerConversation,
 )
 from app.main import app
-from app.services.ai_usage import business_local_day_window
+from app.services.ai_usage import business_local_day_window, reconcile_ai_usage
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, select, text
 from sqlalchemy.exc import DBAPIError, ProgrammingError
@@ -30,6 +32,17 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from tests.test_business_api import headers
 from tests.test_owner_chat import CapturingProvider, active_business, submit
+
+
+def ollama_accounting_provider(
+    transport: httpx.MockTransport,
+) -> OllamaOwnerChatProvider:
+    return OllamaOwnerChatProvider(
+        base_url="http://ollama.invalid",
+        model="qwen2.5:7b",
+        timeout_seconds=120,
+        transport=transport,
+    )
 
 
 def change_allowance(
@@ -160,11 +173,17 @@ def test_insufficient_budget_blocks_before_provider_and_keeps_turn_retryable(
 
 
 class BeforeUseFailureProvider:
+    def estimate_input_tokens(self, request: OwnerChatRequest) -> int:
+        return 100
+
     def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
         raise OwnerChatProviderUnavailable(usage_uncertain=False)
 
 
 class ReportedFailureProvider:
+    def estimate_input_tokens(self, request: OwnerChatRequest) -> int:
+        return 100
+
     def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
         raise OwnerChatProviderInvalidResponse(
             usage=TokenUsage(75, 10, 85, True),
@@ -203,6 +222,234 @@ def test_provider_failures_release_or_charge_reported_usage(
     assert reservation.total_tokens == expected_total
     assert summary.total_tokens_used == expected_total
     assert summary.tokens_reserved == 0
+
+
+@pytest.mark.parametrize(
+    ("transport", "expected_status", "expected_total"),
+    [
+        (
+            httpx.MockTransport(
+                lambda request: (_ for _ in ()).throw(
+                    httpx.ConnectError("refused", request=request)
+                )
+            ),
+            "released",
+            0,
+        ),
+        (
+            httpx.MockTransport(
+                lambda request: httpx.Response(
+                    404, json={"error": "model qwen2.5:7b not found"}
+                )
+            ),
+            "released",
+            0,
+        ),
+        (
+            httpx.MockTransport(lambda request: httpx.Response(500, text="failure")),
+            "charged",
+            None,
+        ),
+        (
+            httpx.MockTransport(
+                lambda request: (_ for _ in ()).throw(
+                    httpx.ReadError("connection reset", request=request)
+                )
+            ),
+            "charged",
+            None,
+        ),
+        (
+            httpx.MockTransport(
+                lambda request: (_ for _ in ()).throw(
+                    httpx.ReadTimeout("timeout", request=request)
+                )
+            ),
+            "charged",
+            None,
+        ),
+        (
+            httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    json={"message": {"role": "assistant", "content": "bad"}},
+                )
+            ),
+            "charged",
+            None,
+        ),
+        (
+            httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    json={
+                        "message": {"role": "assistant", "content": "bad"},
+                        "prompt_eval_count": 44,
+                        "eval_count": 9,
+                    },
+                )
+            ),
+            "charged",
+            53,
+        ),
+    ],
+)
+def test_ollama_failure_reservation_accounting(
+    api_client: TestClient,
+    db_session: Session,
+    migration_engine: Engine,
+    transport: httpx.MockTransport,
+    expected_status: str,
+    expected_total: int | None,
+) -> None:
+    user, business = active_business(api_client, db_session)
+    provider = ollama_accounting_provider(transport)
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+    response = submit(api_client, user, business["id"], "provider accounting")
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "assistant_unavailable"
+    assert "failure" not in response.text
+    with migration_engine.connect() as connection:
+        reservation = connection.execute(
+            text("SELECT * FROM ai_usage_reservations")
+        ).one()
+        summary = connection.execute(
+            text("SELECT * FROM business_ai_usage_daily")
+        ).one()
+    charged_total = (
+        reservation.reserved_tokens if expected_total is None else expected_total
+    )
+    assert reservation.status == expected_status
+    assert reservation.total_tokens == charged_total
+    assert summary.total_tokens_used == charged_total
+    assert summary.tokens_reserved == 0
+
+
+def test_reported_failure_reconciles_once_and_retry_preserves_first_charge(
+    api_client: TestClient,
+    db_session: Session,
+    database_engine: Engine,
+    migration_engine: Engine,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "message": {"role": "assistant", "content": "bad"},
+                    "prompt_eval_count": 10,
+                    "eval_count": 2,
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "role": "assistant",
+                    "content": '{"reply":"Recovered.","proposed_knowledge":[]}',
+                },
+                "prompt_eval_count": 20,
+                "eval_count": 3,
+            },
+        )
+
+    user, business = active_business(api_client, db_session)
+    provider = ollama_accounting_provider(httpx.MockTransport(handler))
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+    first = submit(api_client, user, business["id"], "retry me", key="retry-usage")
+    assert first.status_code == 503
+    with migration_engine.connect() as connection:
+        first_reservation = connection.execute(
+            text("SELECT * FROM ai_usage_reservations")
+        ).one()
+    with sessionmaker(bind=database_engine)() as runtime_session:
+        assert (
+            reconcile_ai_usage(
+                runtime_session,
+                first_reservation.id,
+                usage=TokenUsage(10, 2, 12, True),
+                outcome="reported_failure",
+            )
+            is False
+        )
+    retry = submit(api_client, user, business["id"], "retry me", key="retry-usage")
+    assert retry.status_code == 200
+    with migration_engine.connect() as connection:
+        reservations = connection.execute(
+            text(
+                "SELECT generation_attempt,total_tokens,status "
+                "FROM ai_usage_reservations ORDER BY generation_attempt"
+            )
+        ).all()
+        summary = connection.execute(
+            text("SELECT * FROM business_ai_usage_daily")
+        ).one()
+    assert reservations == [(1, 12, "charged"), (2, 23, "completed")]
+    assert summary.total_tokens_used == 35
+    assert summary.tokens_reserved == 0
+    assert calls == 2
+
+
+def test_complete_provider_estimate_blocks_before_invocation(
+    api_client: TestClient,
+    db_session: Session,
+    operator_engine: Engine,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    user, business = active_business(api_client, db_session)
+    change_allowance(operator_engine, business["id"], 100)
+    provider = ollama_accounting_provider(httpx.MockTransport(handler))
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+    blocked = submit(api_client, user, business["id"], "estimate all input")
+    assert blocked.status_code == 429
+    assert blocked.json()["error"]["code"] == "daily_ai_token_limit_reached"
+    assert calls == 0
+
+
+def test_authoritative_overage_reconciles_without_negative_reservations(
+    api_client: TestClient,
+    db_session: Session,
+    operator_engine: Engine,
+    migration_engine: Engine,
+) -> None:
+    user, business = active_business(api_client, db_session)
+    change_allowance(operator_engine, business["id"], 1_000)
+    provider = CapturingProvider(
+        OwnerChatResult(
+            reply="Over allowance after authoritative reconciliation.",
+            usage=TokenUsage(1_000, 200, 1_200, True),
+        ),
+        input_estimate=1,
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+    response = submit(api_client, user, business["id"], "authoritative overage")
+    assert response.status_code == 200
+    summary = api_client.get(
+        f"/api/v1/businesses/{business['id']}/ai-usage/current",
+        headers=headers(user),
+    ).json()
+    assert summary["total_tokens_used"] == 1_200
+    assert summary["tokens_currently_reserved"] == 0
+    assert summary["tokens_remaining"] == 0
+    assert summary["usage_percentage"] == 120.0
+    assert summary["status"] == "exhausted"
+    with migration_engine.connect() as connection:
+        assert (
+            connection.scalar(
+                text("SELECT tokens_reserved FROM business_ai_usage_daily")
+            )
+            == 0
+        )
 
 
 def test_allowance_operator_audit_and_direct_mutations_are_restricted(
@@ -343,6 +590,48 @@ def test_budget_function_owners_search_paths_and_execution_acls(
             )
             is False
         )
+
+
+def test_runtime_cannot_delete_or_reset_daily_usage(
+    api_client: TestClient,
+    db_session: Session,
+    database_engine: Engine,
+    migration_engine: Engine,
+) -> None:
+    _user, business = active_business(api_client, db_session)
+    stored_business = db_session.get(Business, uuid.UUID(str(business["id"])))
+    window_start, window_end = business_local_day_window(stored_business)
+    with migration_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO business_ai_usage_daily "
+                "(id,business_id,window_start,window_end,input_tokens_used,"
+                "output_tokens_used,total_tokens_used,tokens_reserved) "
+                "VALUES (gen_random_uuid(),:business_id,:start,:end,10,5,15,7)"
+            ),
+            {
+                "business_id": business["id"],
+                "start": window_start,
+                "end": window_end,
+            },
+        )
+    for statement in (
+        "DELETE FROM business_ai_usage_daily WHERE business_id=:business_id",
+        "UPDATE business_ai_usage_daily SET input_tokens_used=0,"
+        "output_tokens_used=0,total_tokens_used=0,tokens_reserved=0 "
+        "WHERE business_id=:business_id",
+    ):
+        with database_engine.connect() as connection, pytest.raises(ProgrammingError):
+            connection.execute(text(statement), {"business_id": business["id"]})
+    with migration_engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT total_tokens_used,tokens_reserved "
+                "FROM business_ai_usage_daily WHERE business_id=:business_id"
+            ),
+            {"business_id": business["id"]},
+        ).one()
+    assert tuple(row) == (15, 7)
 
 
 def test_business_local_windows_preserve_midnight_across_dst() -> None:
@@ -502,6 +791,59 @@ def test_usage_endpoint_tenant_isolation_and_thresholds(
     assert visible.json()["status"] == "approaching_limit"
 
 
+@pytest.mark.parametrize(
+    ("completed", "reserved", "percentage", "usage_status"),
+    [
+        (0, 20_000, 100.0, "exhausted"),
+        (5_000, 10_000, 75.0, "approaching_limit"),
+        (10_000, 8_000, 90.0, "nearly_exhausted"),
+        (15_000, 5_000, 100.0, "exhausted"),
+        (21_000, 1_000, 110.0, "exhausted"),
+        (10_000, 0, 50.0, "normal"),
+    ],
+)
+def test_usage_availability_includes_completed_and_reserved_tokens(
+    api_client: TestClient,
+    db_session: Session,
+    migration_engine: Engine,
+    completed: int,
+    reserved: int,
+    percentage: float,
+    usage_status: str,
+) -> None:
+    owner, business = active_business(api_client, db_session)
+    stored_business = db_session.get(Business, uuid.UUID(str(business["id"])))
+    window_start, window_end = business_local_day_window(stored_business)
+    with migration_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO business_ai_usage_daily "
+                "(id,business_id,window_start,window_end,input_tokens_used,"
+                "output_tokens_used,total_tokens_used,tokens_reserved) "
+                "VALUES (gen_random_uuid(),:business_id,:window_start,:window_end,"
+                ":completed,0,:completed,:reserved)"
+            ),
+            {
+                "business_id": business["id"],
+                "window_start": window_start,
+                "window_end": window_end,
+                "completed": completed,
+                "reserved": reserved,
+            },
+        )
+    response = api_client.get(
+        f"/api/v1/businesses/{business['id']}/ai-usage/current",
+        headers=headers(owner),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_tokens_used"] == completed
+    assert body["tokens_currently_reserved"] == reserved
+    assert body["tokens_remaining"] == max(0, 20_000 - completed - reserved)
+    assert body["usage_percentage"] == percentage
+    assert body["status"] == usage_status
+
+
 def test_security_retention_uses_24h_48h_90d_and_12_month_cutoffs(
     api_client: TestClient,
     db_session: Session,
@@ -526,6 +868,8 @@ def test_security_retention_uses_24h_48h_90d_and_12_month_cutoffs(
     db_session.commit()
     old_start = datetime.now(UTC) - timedelta(days=500)
     old_end = old_start + timedelta(days=1)
+    current_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    current_end = current_start + timedelta(days=1)
     with migration_engine.begin() as connection:
         connection.execute(
             text(
@@ -556,6 +900,18 @@ def test_security_retention_uses_24h_48h_90d_and_12_month_cutoffs(
             ),
             {"business_id": business_id, "start": old_start, "end": old_end},
         )
+        current_summary_id = connection.scalar(
+            text(
+                "INSERT INTO business_ai_usage_daily "
+                "(id,business_id,window_start,window_end) "
+                "VALUES (gen_random_uuid(),:business_id,:start,:end) RETURNING id"
+            ),
+            {
+                "business_id": business_id,
+                "start": current_start,
+                "end": current_end,
+            },
+        )
         connection.execute(
             text(
                 "INSERT INTO ai_usage_reservations "
@@ -569,8 +925,30 @@ def test_security_retention_uses_24h_48h_90d_and_12_month_cutoffs(
             ),
             {"business_id": business_id, "start": old_start, "end": old_end},
         )
+        current_reservation_id = connection.scalar(
+            text(
+                "INSERT INTO ai_usage_reservations "
+                "(id,business_id,generation_attempt,channel,capability,"
+                "estimated_input_tokens,max_output_tokens,reserved_tokens,"
+                "input_tokens,output_tokens,total_tokens,counts_authoritative,status,"
+                "window_start,window_end,lease_expires_at,created_at,reconciled_at) "
+                "VALUES (gen_random_uuid(),:business_id,2,'owner','owner_chat',"
+                "0,1,1,0,0,0,false,'released',:start,:end,"
+                "now()+interval '150 seconds',now(),now()) RETURNING id"
+            ),
+            {
+                "business_id": business_id,
+                "start": current_start,
+                "end": current_end,
+            },
+        )
+    with pytest.raises(DBAPIError):
+        db_session.execute(
+            text("SELECT * FROM public.sou2ai_cleanup_security_records(1001)")
+        ).one()
+    db_session.rollback()
     result = db_session.execute(
-        text("SELECT * FROM public.sou2ai_cleanup_security_records(now(),1000)")
+        text("SELECT * FROM public.sou2ai_cleanup_security_records(1000)")
     ).one()
     db_session.commit()
     assert tuple(result) == (1, 1, 1, 1)
@@ -586,7 +964,14 @@ def test_security_retention_uses_24h_48h_90d_and_12_month_cutoffs(
             == 1
         )
         assert (
-            connection.scalar(text("SELECT count(*) FROM ai_usage_reservations")) == 0
+            connection.scalar(text("SELECT count(*) FROM ai_usage_reservations")) == 1
+        )
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM ai_usage_reservations WHERE id=:id"),
+                {"id": current_reservation_id},
+            )
+            == 1
         )
         assert (
             connection.scalar(
@@ -594,4 +979,11 @@ def test_security_retention_uses_24h_48h_90d_and_12_month_cutoffs(
                 {"id": summary_id},
             )
             == 0
+        )
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM business_ai_usage_daily WHERE id=:id"),
+                {"id": current_summary_id},
+            )
+            == 1
         )

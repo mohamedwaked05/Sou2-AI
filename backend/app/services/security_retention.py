@@ -54,10 +54,9 @@ def cleanup_security_records_best_effort(settings: Settings) -> None:
             session.commit()
             session.execute(
                 text(
-                    "SELECT * FROM public.sou2ai_cleanup_security_records("
-                    ":now, :batch_size)"
+                    "SELECT * FROM public.sou2ai_cleanup_security_records(:batch_size)"
                 ),
-                {"now": utc_now(), "batch_size": SECURITY_RETENTION_BATCH_SIZE},
+                {"batch_size": SECURITY_RETENTION_BATCH_SIZE},
             )
             session.commit()
     except SQLAlchemyError:

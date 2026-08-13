@@ -16,10 +16,16 @@ covered by the integration suite.
 
 Registration and owner-generation abuse controls, per-business local-day AI
 token allowances, leased usage reconciliation, and the owner usage-summary API
-are PostgreSQL-backed and safe across API replicas. The HTTP boundary now uses
-server request IDs, explicit trusted hosts/CORS, CIDR-based proxy trust, streamed
-body limits, safe errors, security headers, environment-controlled documentation,
-and redacted environment-aware logging.
+are PostgreSQL-backed and safe across API replicas. Narrow database functions own
+rate admission and database-clock retention; the runtime cannot directly mutate
+rate or usage records. Provider reservations use the complete canonical serialized
+model input, ambiguous post-dispatch failures are conservatively charged, and the
+usage percentage includes both completed and reserved tokens. The HTTP boundary
+now uses server request IDs, explicit trusted hosts/CORS, CIDR-based proxy trust,
+streamed body limits, safe errors, security headers, environment-controlled
+documentation, and redacted environment-aware logging. Production host and CORS
+checks normalize case, DNS trailing dots, and IPv4/IPv6 loopback representations
+before rejecting local or malformed values.
 
 Customer chat, cloud providers, RAG, embeddings, pgvector,
 documents, live operational integrations and analytics, frontend functionality,

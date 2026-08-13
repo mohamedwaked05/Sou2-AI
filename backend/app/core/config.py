@@ -1,13 +1,92 @@
 """Application settings loaded from environment variables."""
 
 import ipaddress
+import re
 from functools import lru_cache
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 AUTH_EVENT_MINIMUM_RETENTION_HOURS = 2
+DNS_LABEL_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def normalize_trusted_host(value: str) -> str:
+    """Return one canonical configured hostname without a port."""
+    host = value.strip().casefold()
+    wildcard = host.startswith("*.")
+    if wildcard:
+        host = host[2:]
+    elif host == "*":
+        return host
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    if host.endswith(".") and ":" not in host:
+        host = host[:-1]
+    try:
+        normalized = str(ipaddress.ip_address(host))
+    except ValueError:
+        if (
+            not host
+            or len(host) > 253
+            or ":" in host
+            or any(
+                DNS_LABEL_PATTERN.fullmatch(label) is None for label in host.split(".")
+            )
+        ):
+            raise ValueError("TRUSTED_HOSTS contains an invalid host value.") from None
+        normalized = host
+    if wildcard:
+        return f"*.{normalized}"
+    return normalized
+
+
+def _is_loopback_host(host: str) -> bool:
+    plain_host = host[2:] if host.startswith("*.") else host
+    if plain_host == "localhost" or plain_host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(plain_host).is_loopback
+    except ValueError:
+        return False
+
+
+def normalize_cors_origin(value: str) -> tuple[str, str]:
+    """Validate and canonicalize one explicit HTTP(S) origin."""
+    raw_origin = value.strip()
+    try:
+        parsed = urlsplit(raw_origin)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("ALLOWED_CORS_ORIGINS contains an invalid origin.") from None
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or raw_origin == "*"
+    ):
+        raise ValueError("ALLOWED_CORS_ORIGINS must contain explicit HTTP(S) origins.")
+    try:
+        host = normalize_trusted_host(parsed.hostname)
+    except ValueError:
+        raise ValueError("ALLOWED_CORS_ORIGINS contains an invalid origin.") from None
+    if host == "*" or host.startswith("*."):
+        raise ValueError("Wildcard CORS origins are forbidden.")
+    scheme = parsed.scheme.casefold()
+    default_port = (scheme == "http" and port == 80) or (
+        scheme == "https" and port == 443
+    )
+    host_for_url = f"[{host}]" if ":" in host else host
+    normalized = f"{scheme}://{host_for_url}"
+    if port is not None and not default_port:
+        normalized = f"{normalized}:{port}"
+    return normalized, host
 
 
 class Settings(BaseSettings):
@@ -119,37 +198,36 @@ class Settings(BaseSettings):
     ) -> list[str]:
         if not value:
             raise ValueError("TRUSTED_HOSTS must contain at least one host.")
-        if any(
-            not host or "://" in host or "/" in host or " " in host for host in value
-        ):
-            raise ValueError("TRUSTED_HOSTS contains an invalid host value.")
+        normalized = list(dict.fromkeys(normalize_trusted_host(host) for host in value))
         if info.data.get("environment", "development").lower() == "production" and any(
-            host == "*" or host.startswith("*.") for host in value
+            host == "*" or host.startswith("*.") for host in normalized
         ):
             raise ValueError("Wildcard TRUSTED_HOSTS are forbidden in production.")
-        return value
+        return normalized
 
     @field_validator("allowed_cors_origins")
     @classmethod
     def protect_production_cors(
         cls, value: list[str], info: ValidationInfo
     ) -> list[str]:
-        """Disallow wildcard origins when the application runs in production."""
+        """Validate explicit origins and reject production loopback endpoints."""
         environment = info.data.get("environment", "development")
+        normalized_origins: list[str] = []
+        origin_hosts: list[str] = []
+        for origin in value:
+            normalized, host = normalize_cors_origin(origin)
+            normalized_origins.append(normalized)
+            origin_hosts.append(host)
         if environment.lower() == "production":
-            if not value or "*" in value:
+            if not normalized_origins:
                 raise ValueError(
                     "ALLOWED_CORS_ORIGINS must contain explicit production origins."
                 )
-            if any(
-                origin.startswith("http://localhost")
-                or origin.startswith("http://127.0.0.1")
-                for origin in value
-            ):
+            if any(_is_loopback_host(host) for host in origin_hosts):
                 raise ValueError(
                     "Development CORS origins are forbidden in production."
                 )
-        return value
+        return list(dict.fromkeys(normalized_origins))
 
     @model_validator(mode="after")
     def protect_production_authentication(self) -> Settings:
@@ -169,9 +247,7 @@ class Settings(BaseSettings):
             if self.hsts_enabled:
                 raise ValueError("HSTS is enabled only in production.")
             return self
-        if all(
-            host in {"localhost", "127.0.0.1", "::1"} for host in self.trusted_hosts
-        ):
+        if all(_is_loopback_host(host) for host in self.trusted_hosts):
             raise ValueError("TRUSTED_HOSTS must include the production API domain.")
         if self.access_token_secret.get_secret_value().startswith("development-only"):
             raise ValueError("ACCESS_TOKEN_SECRET must be changed in production.")

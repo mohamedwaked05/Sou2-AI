@@ -8,7 +8,7 @@ import uuid
 from starlette.requests import Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.core.config import Settings
+from app.core.config import Settings, normalize_trusted_host
 from app.core.logging import request_id_context
 from app.core.network import resolve_client_ip
 
@@ -131,27 +131,38 @@ class RequestSecurityMiddleware:
     def _host_is_allowed(self, raw_host: str) -> bool:
         if not raw_host:
             return False
-        host = raw_host.strip().lower()
-        if host.startswith("["):
-            closing = host.find("]")
+        host_value = raw_host.strip()
+        if host_value.startswith("["):
+            closing = host_value.find("]")
             if closing < 0:
                 return False
-            hostname = host[1:closing]
-            suffix = host[closing + 1 :]
-            if suffix and (not suffix.startswith(":") or not suffix[1:].isdigit()):
-                return False
+            hostname = host_value[1:closing]
+            suffix = host_value[closing + 1 :]
+            if suffix:
+                if not suffix.startswith(":") or not suffix[1:].isdigit():
+                    return False
+                if not 1 <= int(suffix[1:]) <= 65_535:
+                    return False
         else:
-            hostname, separator, port = host.rpartition(":")
-            if separator and port.isdigit():
-                host = hostname
-            elif separator and ":" in host:
-                return False
-            hostname = host
+            hostname = host_value
+            if host_value.count(":") == 1:
+                candidate, separator, port = host_value.rpartition(":")
+                if separator and port.isdigit():
+                    if not 1 <= int(port) <= 65_535:
+                        return False
+                    hostname = candidate
+                elif separator:
+                    return False
+        try:
+            hostname = normalize_trusted_host(hostname)
+        except ValueError:
+            return False
+        if hostname == "*" or hostname.startswith("*."):
+            return False
         for pattern in self.settings.trusted_hosts:
-            candidate = pattern.casefold()
-            if candidate == "*" or hostname == candidate:
+            if pattern == "*" or hostname == pattern:
                 return True
-            if candidate.startswith("*.") and hostname.endswith(candidate[1:]):
+            if pattern.startswith("*.") and hostname.endswith(pattern[1:]):
                 return True
         return False
 

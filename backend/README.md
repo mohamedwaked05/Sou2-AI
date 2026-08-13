@@ -61,6 +61,10 @@ explicit non-local CORS origins, disables `/docs`, `/redoc`, and `/openapi.json`
 unless `API_DOCS_ENABLED=true`, and rejects wildcard hosts/origins. Enable HSTS
 only with both `HSTS_ENABLED=true` and `TRUSTED_HTTPS_TERMINATION=true` after
 confirming production HTTPS termination. Local HTTP must leave HSTS disabled.
+Host validation trims and case-normalizes names, removes a final DNS dot, and
+recognizes IPv4/IPv6 loopback forms consistently. CORS origins are parsed as
+explicit HTTP(S) origins; user information, non-root paths, queries, fragments,
+wildcards, and malformed origins are rejected.
 
 The global current-endpoint request-body limit is 65,536 streamed bytes. CORS
 allows only `GET`, `POST`, `PATCH`, `DELETE`, and `OPTIONS`, the
@@ -250,20 +254,35 @@ local day. Twenty-five percent is reserved for owner traffic; current owner chat
 can use the full allowance, while future customer channels can use only the shared
 portion. Before generation the database reserves conservative estimated input plus
 `OWNER_CHAT_MAX_OUTPUT_TOKENS` (512 by default) for the 150-second generation
-lease. Ollama maps the cap to `options.num_predict`. Authoritative provider counts
-replace the reservation; otherwise Sou2AI estimates about one token per three
-UTF-8 bytes. This intentionally errs conservatively and is only approximate for
-Arabic, Franco-Arabic, and mixed-language text. Known failures before model use
-release reservations; reported usage is charged; uncertain/expired work charges
-the full reservation.
+lease. Each provider estimates its complete canonical serialized input before
+admission. For Ollama this includes system instructions, JSON/schema structure,
+the full profile and schedule, knowledge categories/expiries, message roles,
+request time, and JSON escaping. Ollama maps the output cap to
+`options.num_predict`. Its non-authoritative fallback uses the same canonical
+serialization and estimates about one token per three UTF-8 bytes. This
+intentionally errs conservatively and is only approximate for Arabic,
+Franco-Arabic, and mixed-language text. The serialized input is never persisted or
+logged. A missing model or connection refusal known to occur before dispatch can
+release a reservation. Timeouts, read/write/protocol/reset failures, generic HTTP
+5xx responses, invalid responses, and other ambiguous failures charge the full
+reservation unless authoritative reported usage is available, in which case that
+usage is charged exactly once.
 
 Usage records contain identifiers, channel/capability, counters, safe
 provider/model identifiers, statuses, windows, and timestamps only. They never
 store messages, prompts, answers, bodies, raw payloads, reasoning, authorization
 data, or costs. Owner burst events retain for 24 hours, registration events for 48
 hours, detailed usage for 90 days, and daily summaries for 12 months. The existing
-PostgreSQL-coordinated best-effort maintenance pattern performs bounded cleanup;
-there is no internal scheduler.
+PostgreSQL-coordinated best-effort maintenance function uses the database clock
+and caps batches at 1,000; callers cannot provide a cutoff timestamp. The runtime
+cannot directly mutate rate-event or usage tables, and invokes only controlled
+admission, exact current-attempt undo, reservation/reconciliation, summary, and
+cleanup functions. There is no internal scheduler.
+
+The current usage endpoint keeps completed input/output/total counters separate,
+but calculates availability percentage and status from completed plus currently
+reserved tokens. Remaining tokens never go below zero; authoritative usage can
+legitimately make the percentage exceed 100%.
 
 ## Formatting and linting
 

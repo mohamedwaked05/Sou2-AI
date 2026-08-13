@@ -11,11 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
-from app.agent.owner_chat_provider import (
-    OwnerChatRequest,
-    TokenUsage,
-    estimate_utf8_tokens,
-)
+from app.agent.owner_chat_provider import TokenUsage
 from app.core.exceptions import ApplicationError
 from app.core.security import utc_now
 from app.database.models import Business, User
@@ -27,26 +23,6 @@ from app.services.businesses import load_full_access_business
 class AIUsageReservationClaim:
     id: uuid.UUID
     reset_at: datetime
-
-
-def estimate_owner_chat_input_tokens(request: OwnerChatRequest) -> int:
-    """Estimate all provider-neutral text plus structured-prompt overhead."""
-    values = [
-        request.profile.name,
-        request.profile.description,
-        request.profile.category,
-        request.profile.governorate,
-        request.profile.district,
-        request.profile.city,
-        request.profile.address_line,
-        request.profile.timezone,
-        *(message.content for message in request.messages),
-        *(fact.subject_key for fact in request.knowledge),
-        *(fact.content for fact in request.knowledge),
-    ]
-    # Covers provider instructions, JSON field names, timestamps, and schedule
-    # structure without persisting any request content.
-    return estimate_utf8_tokens("".join(values)) + 700
 
 
 def business_local_day_window(
@@ -166,7 +142,8 @@ def get_current_ai_usage(
     allowance = row.daily_token_allowance
     reserved_for_owner = allowance * row.owner_reserve_percent // 100
     remaining = max(0, allowance - row.total_tokens_used - row.tokens_reserved)
-    percentage = round((row.total_tokens_used / allowance) * 100, 2)
+    availability_used = row.total_tokens_used + row.tokens_reserved
+    percentage = round((availability_used / allowance) * 100, 2)
     timezone = ZoneInfo(business.timezone)
     local_window_start = row.usage_window_start.astimezone(timezone)
     local_window_end = row.usage_window_end.astimezone(timezone)

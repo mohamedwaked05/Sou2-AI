@@ -147,6 +147,8 @@ class OwnerChatResult:
 class OwnerChatProvider(Protocol):
     """Replaceable provider boundary used by owner-chat orchestration."""
 
+    def estimate_input_tokens(self, request: OwnerChatRequest) -> int: ...
+
     def generate(self, request: OwnerChatRequest) -> OwnerChatResult: ...
 
 
@@ -158,6 +160,9 @@ class DeterministicMockOwnerChatProvider:
         behavior: Literal["success", "timeout", "unavailable", "invalid"] = "success",
     ) -> None:
         self.behavior = behavior
+
+    def estimate_input_tokens(self, request: OwnerChatRequest) -> int:
+        return _estimate_serialized_tokens(_provider_neutral_request_input(request))
 
     def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
         if self.behavior == "timeout":
@@ -178,13 +183,12 @@ class DeterministicMockOwnerChatProvider:
             reply = "I saved the reusable business information from your message."
         else:
             reply = "I received your message and kept it in this owner conversation."
-        input_text = "".join(message.content for message in request.messages)
+        input_tokens = self.estimate_input_tokens(request)
+        output_tokens = estimate_utf8_tokens(reply)
         usage = TokenUsage(
-            input_tokens=estimate_utf8_tokens(input_text),
-            output_tokens=estimate_utf8_tokens(reply),
-            total_tokens=(
-                estimate_utf8_tokens(input_text) + estimate_utf8_tokens(reply)
-            ),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
             authoritative=False,
         )
         return OwnerChatResult(
@@ -387,6 +391,32 @@ def _knowledge_context(
     ]
 
 
+def _provider_neutral_request_input(request: OwnerChatRequest) -> dict[str, Any]:
+    return {
+        "profile": _profile_context(request.profile),
+        "knowledge": _knowledge_context(request.knowledge),
+        "messages": [
+            {"role": message.role, "content": message.content}
+            for message in request.messages
+        ],
+        "requested_at": request.requested_at.isoformat(),
+        "max_output_tokens": request.max_output_tokens,
+    }
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _estimate_serialized_tokens(value: object) -> int:
+    return estimate_utf8_tokens(_canonical_json(value))
+
+
 class OllamaOwnerChatProvider:
     """Non-streaming local Ollama implementation of the owner-chat contract."""
 
@@ -403,8 +433,14 @@ class OllamaOwnerChatProvider:
         self.timeout_seconds = timeout_seconds
         self.transport = transport
 
+    def estimate_input_tokens(self, request: OwnerChatRequest) -> int:
+        """Estimate the complete canonical request sent to Ollama."""
+        return _estimate_serialized_tokens(self._request_payload(request))
+
     def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
         payload = self._request_payload(request)
+        response_payload: object | None = None
+        usage: TokenUsage | None = None
         try:
             with httpx.Client(
                 base_url=self.base_url,
@@ -412,23 +448,41 @@ class OllamaOwnerChatProvider:
                 transport=self.transport,
             ) as client:
                 response = client.post("/api/chat", json=payload)
+            response_payload = self._safe_response_payload(response)
+            usage = self._authoritative_usage(response_payload)
             if response.status_code >= 400:
-                reason = self._http_error_reason(response)
+                reason = self._http_error_reason(response_payload)
                 logger.warning("Owner chat provider failed: reason=%s", reason)
                 raise OwnerChatProviderUnavailable(
+                    usage=usage,
                     provider_identifier="ollama",
                     model_identifier=self.model,
-                    usage_uncertain=False,
+                    usage_uncertain=reason != "model_missing",
                 )
-            envelope = _OllamaChatResponse.model_validate(response.json())
-            structured = _OllamaStructuredResult.model_validate_json(
-                envelope.message.content
-            )
+            try:
+                envelope = _OllamaChatResponse.model_validate(response_payload)
+                structured = _OllamaStructuredResult.model_validate_json(
+                    envelope.message.content
+                )
+            except ValueError:
+                raise OwnerChatProviderInvalidResponse(
+                    usage=usage,
+                    provider_identifier="ollama",
+                    model_identifier=self.model,
+                    usage_uncertain=True,
+                ) from None
             if any(
                 fact.expires_at is not None and fact.expires_at <= request.requested_at
                 for fact in structured.proposed_knowledge
             ):
-                raise ValueError("Temporary fact expiry must be in the future.")
+                raise OwnerChatProviderInvalidResponse(
+                    usage=usage,
+                    provider_identifier="ollama",
+                    model_identifier=self.model,
+                    usage_uncertain=True,
+                )
+        except OwnerChatProviderError:
+            raise
         except httpx.TimeoutException:
             logger.warning("Owner chat provider failed: reason=timeout")
             raise OwnerChatProviderTimeout(
@@ -436,30 +490,23 @@ class OllamaOwnerChatProvider:
                 model_identifier=self.model,
                 usage_uncertain=True,
             ) from None
-        except httpx.RequestError:
-            logger.warning("Owner chat provider failed: reason=unavailable")
+        except httpx.ConnectError:
+            logger.warning("Owner chat provider failed: reason=connect_failed")
             raise OwnerChatProviderUnavailable(
                 provider_identifier="ollama",
                 model_identifier=self.model,
                 usage_uncertain=False,
             ) from None
-        except ValueError:
-            logger.warning("Owner chat provider failed: reason=invalid_response")
-            raise OwnerChatProviderInvalidResponse from None
+        except httpx.RequestError:
+            logger.warning("Owner chat provider failed: reason=transport_uncertain")
+            raise OwnerChatProviderUnavailable(
+                provider_identifier="ollama",
+                model_identifier=self.model,
+                usage_uncertain=True,
+            ) from None
 
-        if envelope.prompt_eval_count is not None and envelope.eval_count is not None:
-            usage = TokenUsage(
-                input_tokens=envelope.prompt_eval_count,
-                output_tokens=envelope.eval_count,
-                total_tokens=envelope.prompt_eval_count + envelope.eval_count,
-                authoritative=True,
-            )
-        else:
-            input_tokens = estimate_utf8_tokens(
-                json.dumps(
-                    payload["messages"], ensure_ascii=False, separators=(",", ":")
-                )
-            )
+        if usage is None:
+            input_tokens = self.estimate_input_tokens(request)
             output_tokens = estimate_utf8_tokens(envelope.message.content)
             usage = TokenUsage(
                 input_tokens=input_tokens,
@@ -538,14 +585,40 @@ class OllamaOwnerChatProvider:
         }
 
     @staticmethod
-    def _http_error_reason(response: httpx.Response) -> str:
-        if response.status_code == 404:
-            return "model_missing"
+    def _safe_response_payload(response: httpx.Response) -> object | None:
         try:
-            error = response.json().get("error", "")
+            return response.json()
         except ValueError:
+            return None
+
+    @staticmethod
+    def _authoritative_usage(payload: object | None) -> TokenUsage | None:
+        if not isinstance(payload, dict):
+            return None
+        input_tokens = payload.get("prompt_eval_count")
+        output_tokens = payload.get("eval_count")
+        if (
+            not isinstance(input_tokens, int)
+            or isinstance(input_tokens, bool)
+            or input_tokens < 0
+            or not isinstance(output_tokens, int)
+            or isinstance(output_tokens, bool)
+            or output_tokens < 0
+        ):
+            return None
+        return TokenUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+            authoritative=True,
+        )
+
+    @staticmethod
+    def _http_error_reason(payload: object | None) -> str:
+        if not isinstance(payload, dict):
             return "http_error"
-        if "model" in str(error).casefold() and "not found" in str(error).casefold():
+        error = str(payload.get("error", "")).casefold()
+        if "model" in error and ("not found" in error or "does not exist" in error):
             return "model_missing"
         return "http_error"
 

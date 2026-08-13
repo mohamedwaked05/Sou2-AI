@@ -4,6 +4,7 @@ import json
 import logging
 import uuid
 
+import pytest
 from app.core.config import Settings
 from app.core.logging import (
     PrivacySafeConsoleFormatter,
@@ -21,6 +22,21 @@ from sqlalchemy.orm import Session
 
 from tests.test_business_api import create_draft, create_user, headers
 from tests.test_owner_chat import active_business, submit
+
+
+def production_settings(**overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "_env_file": None,
+        "environment": "production",
+        "debug": False,
+        "trusted_hosts": ["api.example.com"],
+        "allowed_cors_origins": ["https://app.example.com"],
+        "access_token_secret": SecretStr("a-production-secret-that-is-long-enough"),
+        "refresh_cookie_secure": True,
+        "resend_api_key": SecretStr("production-placeholder-key"),
+    }
+    values.update(overrides)
+    return Settings(**values)
 
 
 def test_server_request_id_ignores_client_value_and_all_errors_include_it(
@@ -156,15 +172,7 @@ def test_cors_security_headers_and_production_docs_hsts_configuration() -> None:
     assert response.headers["cache-control"] == "no-store"
     assert "strict-transport-security" not in response.headers
 
-    production = Settings(
-        _env_file=None,
-        environment="production",
-        debug=False,
-        trusted_hosts=["api.example.com"],
-        allowed_cors_origins=["https://app.example.com"],
-        access_token_secret=SecretStr("a-production-secret-that-is-long-enough"),
-        refresh_cookie_secure=True,
-        resend_api_key=SecretStr("production-placeholder-key"),
+    production = production_settings(
         hsts_enabled=True,
         trusted_https_termination=True,
     )
@@ -188,6 +196,74 @@ def test_cors_security_headers_and_production_docs_hsts_configuration() -> None:
         pass
     else:  # pragma: no cover - protects a production startup invariant
         raise AssertionError("Production wildcard host was accepted.")
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["LOCALHOST", "localhost.", "127.0.0.1", "::1", "[::1]"],
+)
+def test_production_rejects_normalized_loopback_only_hosts(host: str) -> None:
+    with pytest.raises(ValidationError):
+        production_settings(trusted_hosts=[host])
+
+
+def test_trusted_hosts_normalize_dns_case_and_trailing_dot() -> None:
+    settings = production_settings(trusted_hosts=[" API.Example.COM. "])
+    assert settings.trusted_hosts == ["api.example.com"]
+    client = TestClient(create_app(settings), base_url="https://api.example.com")
+    assert (
+        client.get(
+            "/api/v1/health", headers={"Host": "API.EXAMPLE.COM.:443"}
+        ).status_code
+        == 200
+    )
+    with pytest.raises(ValidationError):
+        production_settings(trusted_hosts=["api.example.com:443"])
+    assert (
+        client.get(
+            "/api/v1/health", headers={"Host": "api.example.com:65536"}
+        ).status_code
+        == 400
+    )
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "HTTP://LOCALHOST:5173",
+        "http://localhost.:5173",
+        "http://127.0.0.1:5173",
+        "http://[::1]:5173",
+        "http://[0:0:0:0:0:0:0:1]:5173",
+        "https://user:pass@app.example.com",
+        "https://app.example.com/path",
+        "https://app.example.com/?query=value",
+        "https://app.example.com/#fragment",
+        "ftp://app.example.com",
+        "https://exa mple.com",
+        "*",
+    ],
+)
+def test_production_rejects_local_or_malformed_cors_origins(origin: str) -> None:
+    with pytest.raises(ValidationError):
+        production_settings(allowed_cors_origins=[origin])
+
+
+def test_cors_origins_normalize_valid_domains_and_allow_development_loopback() -> None:
+    production = production_settings(
+        allowed_cors_origins=["HTTPS://App.Example.COM.:443/"]
+    )
+    assert production.allowed_cors_origins == ["https://app.example.com"]
+    development = Settings(
+        _env_file=None,
+        trusted_hosts=["LOCALHOST."],
+        allowed_cors_origins=["HTTP://LOCALHOST:5173/", "http://[::1]:5173"],
+    )
+    assert development.trusted_hosts == ["localhost"]
+    assert development.allowed_cors_origins == [
+        "http://localhost:5173",
+        "http://[::1]:5173",
+    ]
 
 
 def test_unexpected_errors_are_generic_even_with_debug_enabled() -> None:

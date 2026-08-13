@@ -44,9 +44,15 @@ from tests.test_business_api import (
 
 
 class CapturingProvider:
-    def __init__(self, result: OwnerChatResult | None = None) -> None:
+    def __init__(
+        self, result: OwnerChatResult | None = None, *, input_estimate: int = 100
+    ) -> None:
         self.requests: list[OwnerChatRequest] = []
         self.result = result or OwnerChatResult(reply="A deterministic test reply.")
+        self.input_estimate = input_estimate
+
+    def estimate_input_tokens(self, request: OwnerChatRequest) -> int:
+        return self.input_estimate
 
     def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
         self.requests.append(request)
@@ -54,6 +60,9 @@ class CapturingProvider:
 
 
 class TimeoutProvider:
+    def estimate_input_tokens(self, request: OwnerChatRequest) -> int:
+        return 100
+
     def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
         raise OwnerChatProviderTimeout
 
@@ -721,6 +730,9 @@ class OrderedBlockingProvider:
         self.lock = Lock()
         self.requests: list[OwnerChatRequest] = []
 
+    def estimate_input_tokens(self, request: OwnerChatRequest) -> int:
+        return 100
+
     def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
         with self.lock:
             self.requests.append(request)
@@ -782,6 +794,9 @@ def test_simultaneous_same_conversation_turns_generate_in_order(
 class ParallelBusinessProvider:
     def __init__(self) -> None:
         self.barrier = Barrier(2)
+
+    def estimate_input_tokens(self, request: OwnerChatRequest) -> int:
+        return 100
 
     def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
         self.barrier.wait(timeout=5)

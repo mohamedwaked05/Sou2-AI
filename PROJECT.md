@@ -83,7 +83,9 @@ allowances with leased reservations, a protected 25% owner reserve, permanent
 allowance-change audit, and privacy-minimal retained accounting. The API also has
 server request IDs, CIDR-aware proxy trust, trusted hosts, streamed body limits,
 restricted CORS/docs, safe errors, security headers, and environment-aware
-redacted logging.
+redacted logging. Rate admission and retention are exposed to the restricted
+runtime only through narrow PostgreSQL functions; cleanup uses the database clock
+and cannot be redirected at current records by caller-supplied time.
 
 Milestone 8 Ollama owner-chat connectivity was completed early. Much of the
 Milestone 10 provider abstraction, and the usage/cost-control portion of
@@ -188,15 +190,20 @@ and are not exposed through owner-facing APIs.
 * Enforce explicit CORS, trusted hosts, CIDR-based proxy trust, streamed 65,536-byte
   request bodies, security headers, and environment-controlled API documentation.
 * Apply PostgreSQL-backed concurrent registration and owner-generation limits with
-  stable `429` errors, reset metadata, and `Retry-After`.
+  stable `429` errors, reset metadata, and `Retry-After`; runtime access is limited
+  to controlled admission and exact owner-admission undo functions rather than
+  direct rate-event mutation.
 * Give every business a protected 20,000-token local-day allowance, 25% owner
   reserve, leased pre-generation reservations, atomic reconciliation, and an
-  authenticated tenant-scoped current-usage endpoint.
+  authenticated tenant-scoped current-usage endpoint. Reservation input is
+  estimated from each provider's complete canonical serialized input, and usage
+  percentage/status include both completed and currently reserved tokens.
 * Change allowances only through the restricted database operator function and
   retain permanent append-only audit history.
 * Retain owner burst events for 24 hours, registration events for 48 hours,
   detailed AI usage for 90 days, and daily summaries for 12 months through
-  PostgreSQL-coordinated best-effort maintenance without an internal scheduler.
+  PostgreSQL-clock, capped-batch coordinated maintenance without an internal
+  scheduler or caller-controlled cutoff.
 * Emit readable safe development logs, quiet test logs, and one JSON object per
   production event with central defense-in-depth secret redaction.
 

@@ -1,7 +1,8 @@
 """Provider selection and local Ollama contract tests without network access."""
 
 import json
-from datetime import UTC, datetime, time
+from dataclasses import replace
+from datetime import UTC, datetime, time, timedelta
 
 import httpx
 import pytest
@@ -19,6 +20,7 @@ from app.agent.owner_chat_provider import (
     ProviderWorkingDay,
     ProviderWorkingShift,
     create_owner_chat_provider,
+    estimate_utf8_tokens,
 )
 from app.core.config import Settings
 from pydantic import ValidationError
@@ -106,6 +108,57 @@ def ollama_provider(transport: httpx.MockTransport) -> OllamaOwnerChatProvider:
         model="qwen2.5:7b",
         timeout_seconds=120,
         transport=transport,
+    )
+
+
+def maximal_provider_request() -> OwnerChatRequest:
+    original = provider_request()
+    multilingual = 'English "quote" \\ control\n العربية Franco 3arabi'
+    profile = replace(
+        original.profile,
+        description=multilingual * 20,
+        working_hours=tuple(
+            ProviderWorkingDay(
+                weekday=weekday,
+                is_open=True,
+                shifts=(
+                    ProviderWorkingShift(time(8), time(12)),
+                    ProviderWorkingShift(time(13), time(18)),
+                ),
+            )
+            for weekday in (
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday",
+                "saturday",
+                "sunday",
+            )
+        ),
+    )
+    expiry = original.requested_at + timedelta(days=1)
+    knowledge = tuple(
+        ProviderKnowledge(
+            subject_key=f"policy_{index}",
+            content=f"{multilingual} {index}",
+            category="promotion" if index % 2 else "policy",
+            expires_at=expiry if index % 2 else None,
+        )
+        for index in range(100)
+    )
+    messages = tuple(
+        ProviderMessage(
+            role="owner" if index % 2 == 0 else "assistant",
+            content=f"{multilingual} message {index}",
+        )
+        for index in range(12)
+    )
+    return replace(
+        original,
+        profile=profile,
+        knowledge=knowledge,
+        messages=messages,
     )
 
 
@@ -254,6 +307,47 @@ def test_ollama_authoritative_usage_is_provider_neutral() -> None:
     assert result.usage.authoritative is True
     assert result.provider_identifier == "ollama"
     assert result.model_identifier == "qwen2.5:7b"
+
+
+def test_provider_estimate_and_fallback_share_complete_canonical_input() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {"reply": "Complete response.", "proposed_knowledge": []}
+                    ),
+                }
+            },
+        )
+
+    request = maximal_provider_request()
+    provider = ollama_provider(httpx.MockTransport(handler))
+    estimate = provider.estimate_input_tokens(request)
+    result = provider.generate(request)
+    canonical_payload = json.dumps(
+        captured["payload"],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    assert result.usage is not None
+    assert result.usage.authoritative is False
+    assert result.usage.input_tokens == estimate
+    assert estimate == estimate_utf8_tokens(canonical_payload)
+    assert estimate > estimate_utf8_tokens(
+        "".join(message.content for message in request.messages)
+    )
+
+    mock = DeterministicMockOwnerChatProvider()
+    mock_result = mock.generate(request)
+    assert mock_result.usage is not None
+    assert mock_result.usage.input_tokens == mock.estimate_input_tokens(request)
 
 
 @pytest.mark.parametrize(
@@ -441,6 +535,93 @@ def test_ollama_failures_map_to_safe_provider_errors(
 ) -> None:
     with pytest.raises(error_type):
         ollama_provider(transport).generate(provider_request())
+
+
+@pytest.mark.parametrize(
+    ("transport", "error_type", "usage_uncertain"),
+    [
+        (
+            httpx.MockTransport(
+                lambda request: (_ for _ in ()).throw(
+                    httpx.ConnectError("refused", request=request)
+                )
+            ),
+            OwnerChatProviderUnavailable,
+            False,
+        ),
+        (
+            httpx.MockTransport(
+                lambda request: httpx.Response(
+                    404, json={"error": "model qwen2.5:7b not found"}
+                )
+            ),
+            OwnerChatProviderUnavailable,
+            False,
+        ),
+        (
+            httpx.MockTransport(
+                lambda request: httpx.Response(500, text="private provider failure")
+            ),
+            OwnerChatProviderUnavailable,
+            True,
+        ),
+        (
+            httpx.MockTransport(
+                lambda request: (_ for _ in ()).throw(
+                    httpx.ReadError("connection reset", request=request)
+                )
+            ),
+            OwnerChatProviderUnavailable,
+            True,
+        ),
+        (
+            httpx.MockTransport(
+                lambda request: (_ for _ in ()).throw(
+                    httpx.ReadTimeout("slow", request=request)
+                )
+            ),
+            OwnerChatProviderTimeout,
+            True,
+        ),
+    ],
+)
+def test_ollama_failure_accounting_classification(
+    transport: httpx.MockTransport,
+    error_type: type[OwnerChatProviderUnavailable],
+    usage_uncertain: bool,
+) -> None:
+    with pytest.raises(error_type) as raised:
+        ollama_provider(transport).generate(provider_request())
+    assert raised.value.usage is None
+    assert raised.value.usage_uncertain is usage_uncertain
+
+
+def test_invalid_structured_response_preserves_authoritative_usage() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "message": {"role": "assistant", "content": "not-json"},
+                "prompt_eval_count": 44,
+                "eval_count": 9,
+            },
+        )
+    )
+    with pytest.raises(OwnerChatProviderInvalidResponse) as raised:
+        ollama_provider(transport).generate(provider_request())
+    assert raised.value.usage is not None
+    assert raised.value.usage.total_tokens == 53
+    assert raised.value.usage.authoritative is True
+
+
+def test_invalid_response_without_usage_is_uncertain() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=b"not-json")
+    )
+    with pytest.raises(OwnerChatProviderInvalidResponse) as raised:
+        ollama_provider(transport).generate(provider_request())
+    assert raised.value.usage is None
+    assert raised.value.usage_uncertain is True
 
 
 def test_missing_model_logs_only_safe_machine_reason(

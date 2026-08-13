@@ -303,6 +303,14 @@ timeouts, missing models, unavailability, HTTP failures, and invalid output to t
 same safe provider errors. Routes, orchestration, and persistence remain
 provider-neutral. Backend startup performs no provider probe.
 
+Before admission, each provider deterministically estimates the complete canonical
+serialized input it will send, including instructions, JSON structure/schema,
+profile, all schedule shifts, knowledge metadata, message roles, request time, and
+escaping. Ollama and its non-authoritative post-response fallback use the same
+one-token-per-three-UTF-8-bytes path, so fallback input cannot exceed the amount
+estimated from that request representation. This serialization is neither stored
+nor logged.
+
 Ollama calls use a 120-second default timeout. The persisted generation lease
 defaults to 150 seconds and must exceed the Ollama timeout, so another replica
 cannot reclaim a turn while the first provider call is still within its deadline.
@@ -342,9 +350,11 @@ errors are generic in every environment.
 Forwarded client addresses are ignored unless the direct peer is in
 `TRUSTED_PROXY_CIDRS`. Valid IPv4/IPv6 hops are walked from the nearest proxy
 backward; malformed chains fall back to the direct peer. Trusted hosts and CORS
-origins are explicit. Production rejects wildcard/local defaults, disables API
-documentation by default, and emits HSTS only when trusted HTTPS termination is
-explicitly configured.
+origins are trimmed and structurally normalized. Production rejects wildcard or
+case/representation-independent loopback hosts and origins, and CORS rejects
+userinfo, non-root paths, queries, fragments, and non-HTTP(S) schemes. Production
+disables API documentation by default and emits HSTS only when trusted HTTPS
+termination is explicitly configured.
 
 Registration and owner-generation counters are privacy-minimal PostgreSQL rows.
 Sorted transaction advisory locks serialize registration email/IP scopes; one
@@ -355,6 +365,12 @@ and 20/business/hour. Admission happens before password hashing, email delivery,
 or provider work. Blocked idempotent turns reuse one owner message and create no
 assistant, provider call, duplicate rate event, or token charge.
 
+The restricted runtime cannot directly select or mutate rate-event tables.
+Fixed-search-path, migrator-owned security-definer functions perform admission
+with the PostgreSQL clock. A separate narrowly verified undo can remove only the
+current message attempt when token reservation failed and no reservation exists;
+it cannot delete other or historical events.
+
 `business_ai_allowance_configs` gives every business 20,000 tokens per local day
 and protects 25% for owner traffic. A trigger creates the default for new
 businesses and the migration backfills existing businesses without historical
@@ -364,8 +380,11 @@ reserved usage. `ai_usage_reservations` reserves estimated input plus the
 configured 512-token maximum output before generation for 150 seconds. Completion
 atomically persists the assistant and reconciles authoritative counts or the
 conservative one-token-per-three-UTF-8-bytes estimate. Known pre-use failures
-release; reported usage is charged; uncertain and expired leases charge the full
-reservation. Idempotent completed turns never reserve twice.
+such as a missing model or connection refusal before dispatch release; timeouts,
+read/write/protocol/reset failures, generic HTTP 5xx responses, invalid responses,
+and other ambiguous post-dispatch failures charge the full reservation. Reported
+authoritative usage is captured before response validation and charged instead of
+the reservation. Idempotent completed turns never reserve twice.
 
 Owner traffic may use shared tokens plus the owner reserve. The schema identifies
 channel and applies only the shared portion to future customer and WhatsApp
@@ -373,6 +392,9 @@ channels, but those channels are not implemented. Authenticated
 `GET /api/v1/businesses/{business_id}/ai-usage/current` requires current
 `FULL_ACCESS` membership and returns only counters, local window/reset, allowance,
 reserve, remaining percentage, and threshold status.
+Availability percentage and threshold status use completed plus currently
+reserved tokens, while completed input/output/total counters remain separate;
+remaining tokens are clamped at zero and authoritative overage may exceed 100%.
 
 Allowance changes use only
 `public.sou2ai_change_business_ai_allowance(uuid, integer, integer, text, text)`.
@@ -385,8 +407,10 @@ PostgreSQL superusers remain trusted bootstrap administrators.
 PostgreSQL-coordinated best-effort maintenance retains owner burst events for 24
 hours, registration events for 48 hours, detailed reservations for 90 days, and
 daily summaries for 12 months. It first charges expired uncertain reservations,
-uses a persistent shared maintenance claim, deletes bounded batches, and adds no
-scheduler, Redis, or queue. Accounting records never contain prompts, messages,
+uses a persistent shared maintenance claim, takes its cutoff only from
+`clock_timestamp()`, caps each batch at 1,000, and adds no scheduler, Redis, or
+queue. Runtime can execute the controlled cleanup but cannot mutate the underlying
+tables or supply a timestamp. Accounting records never contain prompts, messages,
 answers, bodies, raw provider payloads, reasoning, authorization data, or costs.
 
 ## 14. Local deployment
