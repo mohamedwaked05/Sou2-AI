@@ -4,12 +4,12 @@ Sou2AI is a local AI assistant planned for small businesses, with future support
 
 ## Current milestone
 
-Milestone 5 adds one private owner conversation per business, persistent ordered
-messages, a replaceable generation-provider contract, a deterministic offline
-mock provider, and opt-in local Ollama generation. Chat requires an authenticated
-`FULL_ACCESS` membership plus a
-currently complete and manually active business. It also adds permanent and
-expiring learned business knowledge with owner list, edit, and delete operations.
+Milestone 6 adds authoritative `PENDING`, `ACTIVE`, and `DISABLED` business
+lifecycle states, controlled manual PostgreSQL transitions, and permanent
+append-only internal history. API `is_active` remains compatible but is derived
+only from `status == ACTIVE`. Owner chat retains its deterministic offline mock and
+opt-in local Ollama provider and requires an authenticated `FULL_ACCESS`
+membership plus a complete, confirmed active business.
 
 It does **not** include customer chat, activation/admin APIs, cloud or paid model
 providers, RAG, embeddings, pgvector, documents, operational
@@ -219,6 +219,27 @@ changes use row-level serialization with intentional last-write-wins behavior.
 PostgreSQL also prevents an active business from ending a transaction with an
 incomplete profile after either profile-field or schedule edits.
 
+Lifecycle status is the only stored activation source of truth. Operators must not
+run direct `UPDATE businesses SET status = ...` statements; a database trigger
+rejects that bypass. Connect with the authorized PostgreSQL operator role and use
+the schema-qualified function with `psql` variables so values remain parameters:
+
+```powershell
+docker compose exec postgres psql -U sou2ai -d sou2ai_dev `
+  -v business_id="00000000-0000-0000-0000-000000000000" `
+  -v admin_identifier="operator@example.com" `
+  -v reason="Offline payment received" `
+  -c "SELECT * FROM public.sou2ai_change_business_status(:'business_id'::uuid, 'ACTIVE'::business_status, :'admin_identifier', :'reason');"
+```
+
+Use `ACTIVE` for initial activation after complete confirmed onboarding. Use the
+same command with `DISABLED` and an appropriate reason to disable an active
+business, or with `ACTIVE` to re-enable an eligible disabled business. Allowed
+transitions are only `PENDING -> ACTIVE`, `ACTIVE -> DISABLED`, and `DISABLED ->
+ACTIVE`. Every successful call atomically writes one internal history record;
+rejected calls write none. History cannot be updated or deleted and reasons are
+never returned by owner APIs. There is no admin HTTP endpoint or dashboard.
+
 ## Owner chat and learned knowledge
 
 `POST .../owner-chat/messages` requires a 1-200 character client idempotency key
@@ -280,7 +301,9 @@ scheduler will call the existing retention operation.
 
 ## Implementation boundary
 
-Milestone 5 and its optional local Ollama provider are complete. Later RAG,
+Milestone 6 and the early optional local Ollama provider are complete. Much of the
+later provider abstraction also arrived early, without completing unrelated
+roadmap work. Later RAG,
 documents, cloud model connectivity, controlled live tools and analytics, customer
 channels, and frontend work remain planned only. Ollama is a local-development
 provider, not the production deployment decision.

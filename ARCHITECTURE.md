@@ -162,8 +162,11 @@ The Milestone 2 tables are:
 
 * `users`: platform accounts with normalized, case-insensitively unique email.
 * `businesses`: independently onboarded profiles with immutable creator ownership,
-  pending state, inactive-by-default activation, and the first successful
-  onboarding-confirmation timestamp.
+  authoritative `PENDING`, `ACTIVE`, or `DISABLED` lifecycle status, and the first
+  successful onboarding-confirmation timestamp. API `is_active` is derived from
+  `status = ACTIVE` and is not stored.
+* `business_lifecycle_history`: permanent internal append-only records of every
+  successful lifecycle transition, operator identifier, written reason, and time.
 * `business_memberships`: the tenant access relationship. Creation atomically adds
   the creator with the only MVP permission, `FULL_ACCESS`.
 * `business_opening_days`: one row per business weekday, with Monday `0` through
@@ -179,6 +182,23 @@ requires a 2-120 character name, 20-2,000 character description, approved catego
 governorate/district/city combination, a 5-255 character address, and exactly seven
 valid opening-day records. A closed day has no shifts; an open day has one to three.
 Completion and confirmation never activate a business.
+
+### 12.1 Business lifecycle
+
+`public.sou2ai_change_business_status(uuid, business_status, text, text)` is the
+only supported lifecycle write path. It locks the business row; trims and bounds
+the required operator identifier and reason; permits only `PENDING -> ACTIVE`,
+`ACTIVE -> DISABLED`, and `DISABLED -> ACTIVE`; and atomically changes status and
+inserts exactly one history row. Activation and re-enabling reuse the authoritative
+database profile-completion function and also require `onboarding_submitted_at`.
+
+Triggers reject direct status changes, non-pending inserts, and ordinary history
+inserts, updates, or deletes. History references businesses with `ON DELETE
+RESTRICT`, matching permanent audit integrity: a business with lifecycle history
+cannot be deleted unless project policy is deliberately changed in a future
+migration. Owner-facing APIs expose status and derived activity only, never audit
+operators or reasons. Pending and disabled businesses cannot use owner chat or
+future paid AI capabilities. No admin HTTP endpoint, role, or dashboard exists.
 
 Business names trim outer whitespace, collapse internal whitespace, and compare
 case-insensitively while preserving punctuation. Immutable `owner_user_id` supports
@@ -324,8 +344,9 @@ WhatsApp is a future input channel, not the core system.
 
 The repository contains the FastAPI/PostgreSQL platform foundation, user
 authentication, multi-business management, tenant-scoped authorization, resumable
-onboarding, one owner conversation per business, ordered persistent owner chat, a
-deterministic mock provider, and managed permanent/temporary learned knowledge.
+onboarding, database-controlled business lifecycle history, one owner conversation
+per business, ordered persistent owner chat, deterministic mock and local Ollama
+providers, and managed permanent/temporary learned knowledge.
 Cloud-provider connectivity, pgvector, RAG, live tools and analytics, customer
 chat, documents, billing, activation APIs, and frontend functionality remain
 future work.

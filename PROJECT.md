@@ -72,11 +72,16 @@ Testing and quality:
 
 ## Current status
 
-Milestone 5, owner chat and learned business knowledge, is implemented on the
-authenticated PostgreSQL platform. Each isolated business has one private owner
-conversation, persistent messages, configurable deterministic-mock or local
-Ollama generation, and owner-reviewable permanent or expiring facts.
-Chat requires a complete, manually active business and `FULL_ACCESS` membership.
+Milestone 6 is implemented on the authenticated PostgreSQL platform. Each
+business has one authoritative `PENDING`, `ACTIVE`, or `DISABLED` status;
+`is_active` is derived only for response compatibility. Controlled direct
+PostgreSQL administration performs manual activation, disabling, and re-enabling
+with permanent append-only internal history. Owner chat requires a complete,
+confirmed `ACTIVE` business and `FULL_ACCESS` membership.
+
+Milestone 8 Ollama owner-chat connectivity was completed early, and much of the
+Milestone 10 provider abstraction is already present. Unrelated later roadmap
+work remains planned rather than complete.
 
 The current repository does not yet contain:
 
@@ -151,16 +156,21 @@ Authentication identifies the user; it does not by itself grant access to a busi
 * Support opt-in local `qwen2.5:7b` owner-chat generation through Ollama while
   retaining the deterministic mock as the default provider.
 
-### Milestone 6: Business lifecycle and manual activation
+### Milestone 6: Business lifecycle and manual activation — Complete
 
-* Define pending, active, and disabled business states.
-* Preserve the PostgreSQL rule that incomplete businesses cannot be activated.
-* Add a protected platform-admin API or command for manual activation after offline payment, disabling, and re-enabling.
-* Activate and enforce access independently for each business a user owns.
-* Block inactive or disabled businesses from paid AI functionality.
-* Record who changed a lifecycle state, when, and why.
+* Use `PENDING`, `ACTIVE`, and `DISABLED` as the authoritative stored states;
+  derive `is_active` only in API responses.
+* Preserve PostgreSQL profile-completion protection and require confirmed
+  onboarding for activation and re-enabling.
+* Perform manual lifecycle changes only through the controlled PostgreSQL
+  function; the MVP has no platform-admin HTTP API or dashboard.
+* Block pending and disabled businesses from paid AI functionality independently
+  for every tenant business.
+* Record every successful change with operator, reason, transition, and timestamp
+  in permanent append-only internal lifecycle history.
 
-A graphical admin dashboard and online payments are not required for the MVP.
+Online payments are not implemented for the MVP. Lifecycle reasons are internal
+and are not exposed through owner-facing APIs.
 
 ### Milestone 7: API security foundation
 

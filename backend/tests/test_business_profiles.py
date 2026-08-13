@@ -3,6 +3,7 @@
 from datetime import time
 
 import pytest
+from app.core.security import utc_now
 from app.database.models import (
     Business,
     BusinessCategory,
@@ -57,6 +58,20 @@ def load_business(db_session: Session, business_id: object) -> Business:
             selectinload(Business.opening_days).selectinload(BusinessOpeningDay.shifts)
         )
     )
+
+
+def activate(db_session: Session, business: Business) -> None:
+    business.onboarding_submitted_at = utc_now()
+    db_session.commit()
+    db_session.execute(
+        text(
+            "SELECT * FROM public.sou2ai_change_business_status("
+            ":id, 'ACTIVE'::business_status, 'test:profiles', "
+            "'Profile guard test activation')"
+        ),
+        {"id": business.id},
+    )
+    db_session.commit()
 
 
 def test_incomplete_business_is_allowed_while_disabled(db_session: Session) -> None:
@@ -118,7 +133,9 @@ def test_invalid_open_and_closed_shift_configurations_are_incomplete(
     assert not is_business_profile_complete(load_business(db_session, business.id))
 
 
-def test_complete_profile_and_activation_succeed(db_session: Session) -> None:
+def test_complete_profile_and_controlled_activation_succeed(
+    db_session: Session,
+) -> None:
     business = complete_business()
     db_session.add(business)
     db_session.commit()
@@ -128,16 +145,12 @@ def test_complete_profile_and_activation_succeed(db_session: Session) -> None:
     assert is_business_profile_complete(loaded)
     assert len(loaded.opening_days) == 7
     assert all(not day.shifts for day in loaded.opening_days if not day.is_open)
-    db_session.execute(
-        text("UPDATE businesses SET is_active = true WHERE id = :id"),
-        {"id": business.id},
-    )
-    db_session.commit()
+    activate(db_session, loaded)
     db_session.refresh(loaded)
     assert loaded.is_active
 
 
-def test_direct_activation_of_incomplete_business_is_rejected(
+def test_controlled_activation_of_incomplete_business_is_rejected(
     db_session: Session,
 ) -> None:
     owner = User(
@@ -150,12 +163,17 @@ def test_direct_activation_of_incomplete_business_is_rejected(
     db_session.add(business)
     db_session.commit()
 
-    with pytest.raises(IntegrityError, match="complete before activation"):
+    business.onboarding_submitted_at = utc_now()
+    db_session.commit()
+    with pytest.raises(IntegrityError, match="complete confirmed profile"):
         db_session.execute(
-            text("UPDATE businesses SET is_active = true WHERE id = :id"),
+            text(
+                "SELECT * FROM public.sou2ai_change_business_status("
+                ":id, 'ACTIVE'::business_status, 'test:profiles', "
+                "'Attempt incomplete activation')"
+            ),
             {"id": business.id},
         )
-        db_session.commit()
 
 
 def test_failed_schedule_replacement_preserves_previous_schedule(
@@ -186,8 +204,7 @@ def test_active_business_rejects_invalid_direct_schedule_edit(
     db_session.commit()
     replace_weekly_schedule(db_session, business.id, valid_week())
     business = load_business(db_session, business.id)
-    business.is_active = True
-    db_session.commit()
+    activate(db_session, business)
 
     with pytest.raises(IntegrityError, match="retain a valid profile"):
         db_session.execute(
@@ -211,11 +228,7 @@ def test_active_business_rejects_incomplete_direct_profile_edit(
     db_session.add(business)
     db_session.commit()
     replace_weekly_schedule(db_session, business.id, valid_week())
-    db_session.execute(
-        text("UPDATE businesses SET is_active = true WHERE id = :id"),
-        {"id": business.id},
-    )
-    db_session.commit()
+    activate(db_session, business)
 
     with pytest.raises(IntegrityError, match="retain a valid profile"):
         db_session.execute(

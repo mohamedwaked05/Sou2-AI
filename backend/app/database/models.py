@@ -40,6 +40,8 @@ class DefaultLanguage(StrEnum):
 
 class BusinessStatus(StrEnum):
     PENDING = "PENDING"
+    ACTIVE = "ACTIVE"
+    DISABLED = "DISABLED"
 
 
 class MembershipPermission(StrEnum):
@@ -492,9 +494,6 @@ class Business(Base):
         default=BusinessStatus.PENDING,
         server_default=text("'PENDING'::business_status"),
     )
-    is_active: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=text("false")
-    )
     onboarding_submitted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
@@ -526,6 +525,14 @@ class Business(Base):
     knowledge: Mapped[list[BusinessKnowledge]] = relationship(
         back_populates="business", cascade="all, delete-orphan", passive_deletes=True
     )
+    lifecycle_history: Mapped[list[BusinessLifecycleHistory]] = relationship(
+        back_populates="business", passive_deletes=True
+    )
+
+    @property
+    def is_active(self) -> bool:
+        """Derive response compatibility from the authoritative lifecycle status."""
+        return self.status is BusinessStatus.ACTIVE
 
     def __init__(self, **kwargs: object) -> None:
         if "name" in kwargs and "normalized_name" not in kwargs:
@@ -571,6 +578,51 @@ class BusinessMembership(Base):
 
     user: Mapped[User] = relationship(back_populates="memberships")
     business: Mapped[Business] = relationship(back_populates="memberships")
+
+
+class BusinessLifecycleHistory(Base):
+    """Permanent internal audit history for database-controlled lifecycle changes."""
+
+    __tablename__ = "business_lifecycle_history"
+    __table_args__ = (
+        CheckConstraint(
+            "previous_status <> new_status",
+            name="ck_business_lifecycle_history_status_changed",
+        ),
+        CheckConstraint(
+            "char_length(btrim(admin_identifier)) BETWEEN 1 AND 320",
+            name="ck_business_lifecycle_history_admin_length",
+        ),
+        CheckConstraint(
+            "char_length(btrim(reason)) BETWEEN 1 AND 2000",
+            name="ck_business_lifecycle_history_reason_length",
+        ),
+        Index(
+            "ix_business_lifecycle_history_business_changed",
+            "business_id",
+            "changed_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="RESTRICT"), nullable=False
+    )
+    previous_status: Mapped[BusinessStatus] = mapped_column(
+        business_status_enum, nullable=False
+    )
+    new_status: Mapped[BusinessStatus] = mapped_column(
+        business_status_enum, nullable=False
+    )
+    admin_identifier: Mapped[str] = mapped_column(String(320), nullable=False)
+    reason: Mapped[str] = mapped_column(String(2000), nullable=False)
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    business: Mapped[Business] = relationship(back_populates="lifecycle_history")
 
 
 class BusinessOpeningDay(Base):

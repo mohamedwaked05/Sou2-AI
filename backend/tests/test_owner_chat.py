@@ -34,6 +34,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from tests.test_business_api import (
+    change_business_status,
     complete_profile,
     create_draft,
     create_user,
@@ -68,11 +69,12 @@ def active_business(
     business = create_draft(client, user, name)
     completed = complete_profile(client, user, str(business["id"]))
     assert completed.status_code == 200
-    session.execute(
-        text("UPDATE businesses SET is_active = true WHERE id = :business_id"),
-        {"business_id": business["id"]},
+    confirmed = client.post(
+        f"/api/v1/businesses/{business['id']}/onboarding/confirm",
+        headers=headers(user),
     )
-    session.commit()
+    assert confirmed.status_code == 200
+    change_business_status(session, business["id"], "ACTIVE")
     return user, business
 
 

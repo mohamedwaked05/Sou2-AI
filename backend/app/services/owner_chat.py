@@ -34,6 +34,7 @@ from app.database.models import (
     Business,
     BusinessKnowledge,
     BusinessOpeningDay,
+    BusinessStatus,
     ChatGenerationState,
     ChatMessageRole,
     OwnerChatMessage,
@@ -81,7 +82,9 @@ def _eligible_business(
     session: Session, user: User, business_id: uuid.UUID
 ) -> Business:
     business = load_full_access_business(session, user, business_id)
-    if not business.is_active or not is_business_profile_complete(business):
+    if business.status is not BusinessStatus.ACTIVE or not is_business_profile_complete(
+        business
+    ):
         raise ApplicationError(
             "This business is not active.",
             status_code=status.HTTP_403_FORBIDDEN,

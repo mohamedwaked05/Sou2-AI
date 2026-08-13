@@ -88,6 +88,31 @@ def complete_profile(client: TestClient, user: User, business_id: str) -> object
     )
 
 
+def change_business_status(
+    session: Session,
+    business_id: object,
+    new_status: str,
+    *,
+    admin_identifier: str = "test:operator",
+    reason: str = "Test lifecycle transition",
+) -> object:
+    result = session.execute(
+        text(
+            "SELECT * FROM public.sou2ai_change_business_status("
+            ":business_id, CAST(:new_status AS business_status), "
+            ":admin_identifier, :reason)"
+        ),
+        {
+            "business_id": business_id,
+            "new_status": new_status,
+            "admin_identifier": admin_identifier,
+            "reason": reason,
+        },
+    ).one()
+    session.commit()
+    return result
+
+
 def test_creation_requires_authentication(api_client: TestClient) -> None:
     response = api_client.post("/api/v1/businesses", json={"name": "Private Shop"})
     assert response.status_code == 401
@@ -551,11 +576,12 @@ def test_active_business_profile_edits_preserve_completion(
     business = create_draft(api_client, user, "Active Edit Market")
     completed = complete_profile(api_client, user, str(business["id"]))
     assert completed.status_code == 200
-    db_session.execute(
-        text("UPDATE businesses SET is_active = true WHERE id = :id"),
-        {"id": business["id"]},
+    confirmed = api_client.post(
+        f"/api/v1/businesses/{business['id']}/onboarding/confirm",
+        headers=headers(user),
     )
-    db_session.commit()
+    assert confirmed.status_code == 200
+    change_business_status(db_session, business["id"], "ACTIVE")
     path = f"/api/v1/businesses/{business['id']}"
 
     invalid = api_client.patch(

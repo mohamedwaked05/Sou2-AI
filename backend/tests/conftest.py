@@ -54,12 +54,25 @@ def db_session(database_engine: Engine) -> Generator[Session]:
     with database_engine.begin() as connection:
         connection.execute(
             text(
+                "ALTER TABLE business_lifecycle_history DISABLE TRIGGER "
+                "trg_business_lifecycle_history_no_truncate"
+            )
+        )
+        connection.execute(
+            text(
                 "TRUNCATE authentication_maintenance_tasks, authentication_events, "
                 "password_reset_tokens, "
                 "email_verification_tokens, refresh_sessions, tool_call_logs, "
-                "business_knowledge, owner_chat_messages, owner_conversations, "
+                "business_lifecycle_history, business_knowledge, owner_chat_messages, "
+                "owner_conversations, "
                 "business_opening_shifts, "
                 "business_opening_days, business_memberships, businesses, users CASCADE"
+            )
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE business_lifecycle_history ENABLE TRIGGER "
+                "trg_business_lifecycle_history_no_truncate"
             )
         )
 

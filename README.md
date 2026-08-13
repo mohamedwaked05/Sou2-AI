@@ -4,9 +4,10 @@ Sou2AI is planned as a local AI assistant for small businesses, supporting Engli
 
 ## Status
 
-Milestone 5 is implemented. The backend includes authentication, isolated
-multi-business onboarding, manual activation state, and one persistent private
-owner conversation per business. Active, complete businesses can use the default
+Milestone 6 is implemented. The backend includes authentication, isolated
+multi-business onboarding, database-controlled lifecycle management, and one
+persistent private owner conversation per business. Complete, confirmed active
+businesses can use the default
 offline deterministic mock or opt into local Ollama with `qwen2.5:7b`, retain full
 chat history, and learn owner-reviewable permanent or expiring business facts.
 Idempotent submissions, PostgreSQL-backed
@@ -15,7 +16,8 @@ covered by the integration suite.
 
 Customer chat, cloud providers, RAG, embeddings, pgvector,
 documents, live operational integrations and analytics, frontend functionality,
-payments, and activation/admin endpoints remain future work.
+payments, and activation/admin HTTP endpoints remain future work. Manual lifecycle
+changes use a controlled PostgreSQL function with permanent append-only history.
 
 The planned architecture is a FastAPI backend, PostgreSQL with pgvector, local Ollama models, and a React frontend. The backend lives in [`backend/`](backend/README.md).
 
