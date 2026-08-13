@@ -1,0 +1,38 @@
+{
+  "fixture_version": "1.0",
+  "requested_at": "2026-08-14T10:00:00Z",
+  "max_output_tokens": 512,
+  "profile": {
+    "name": "Cedar Basket Grocery",
+    "description": "A fictional family-run neighborhood grocery selling packaged food, household essentials, and fresh produce.",
+    "category": "GROCERY_SUPERMARKET",
+    "governorate": "Beirut",
+    "district": "Beirut",
+    "city": "Beirut",
+    "address_line": "14 Cedar Lane, Hamra",
+    "timezone": "Asia/Beirut",
+    "working_hours": [
+      {"weekday": "monday", "is_open": true, "shifts": [{"start": "08:00", "end": "20:00"}]},
+      {"weekday": "tuesday", "is_open": true, "shifts": [{"start": "08:00", "end": "20:00"}]},
+      {"weekday": "wednesday", "is_open": true, "shifts": [{"start": "08:00", "end": "20:00"}]},
+      {"weekday": "thursday", "is_open": true, "shifts": [{"start": "08:00", "end": "20:00"}]},
+      {"weekday": "friday", "is_open": true, "shifts": [{"start": "08:00", "end": "20:00"}]},
+      {"weekday": "saturday", "is_open": true, "shifts": [{"start": "09:00", "end": "14:00"}]},
+      {"weekday": "sunday", "is_open": false, "shifts": []}
+    ]
+  },
+  "knowledge": [
+    {
+      "subject_key": "return_policy",
+      "content": "Unopened non-perishable items may be returned within seven days with the receipt.",
+      "category": "returns",
+      "expires_at": null
+    },
+    {
+      "subject_key": "delivery_policy",
+      "content": "Delivery within Beirut costs USD 4 and is scheduled for the next day.",
+      "category": "delivery",
+      "expires_at": null
+    }
+  ]
+}

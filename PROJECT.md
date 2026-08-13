@@ -92,6 +92,12 @@ Milestone 10 provider abstraction, and the usage/cost-control portion of
 Milestone 20, is also present early. Unrelated later roadmap work remains planned
 rather than complete.
 
+Milestone 9 is in progress. The repository contains its fixed fictional
+business fixture, comparable 50-scenario multilingual dataset, real-provider
+runner, deterministic review warnings, and human-scoring/report workflow. The
+real baseline has not yet been run and manually scored, so no language failure
+rates or final Qwen2.5 7B decision are recorded yet.
+
 The current repository does not yet contain:
 
 * pgvector integration
@@ -219,12 +225,17 @@ endpoint, or a separate generation-demo endpoint.
 
 This milestone does not add RAG, memory, agent tools, or business-answering logic.
 
-### Milestone 9: Arabic and Franco-Arabic model evaluation
+### Milestone 9: Arabic and Franco-Arabic model evaluation — In Progress
 
-* Create a version-controlled, repeatable evaluation dataset.
-* Test English, Arabic, Lebanese Arabic, Franco-Arabic, and mixed-language store scenarios.
-* Evaluate intent, relevance, hallucination, clarification, tone, and instruction following.
-* Record limitations and decide whether Qwen2.5 7B remains the local model.
+* A version-controlled 50-scenario dataset uses the same 10 semantic cases in
+  English, Arabic, Lebanese Arabic, Franco-Arabic, and mixed language.
+* The runner exercises the existing production Ollama provider and prompt
+  directly against one deterministic fictional business fixture.
+* Deterministic warnings support, but do not replace, human scoring of intent,
+  relevance, hallucination, clarification, tone, and instruction following.
+* Completion still requires one real baseline response per scenario, complete
+  manual scores and critical-failure reviews, a generated final report, and the
+  resulting Qwen2.5 7B keep-or-reject decision.
 
 ### Milestone 10: Model-provider abstraction
 
