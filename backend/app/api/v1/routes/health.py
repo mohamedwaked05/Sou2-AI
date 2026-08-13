@@ -2,7 +2,7 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -33,6 +33,7 @@ async def health_check() -> dict[str, str]:
     responses={503: {"description": "PostgreSQL is unavailable"}},
 )
 def database_health_check(
+    request: Request,
     session: Annotated[Session, Depends(get_db_session)],
 ) -> JSONResponse:
     """Run a minimal query and never expose connection or SQL details."""
@@ -41,6 +42,12 @@ def database_health_check(
     except SQLAlchemyError:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"status": "unavailable"},
+            content={
+                "error": {
+                    "code": "database_unavailable",
+                    "message": "The database is unavailable.",
+                    "request_id": request.state.request_id,
+                }
+            },
         )
     return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "healthy"})

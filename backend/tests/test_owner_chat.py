@@ -107,10 +107,9 @@ def test_chat_authorization_activation_and_profile_requirements(
     assert hidden.json()["error"]["code"] == "business_not_found"
     inactive = api_client.post(path, json=body, headers=headers(owner))
     assert inactive.status_code == 403
-    assert inactive.json()["error"] == {
-        "code": "business_not_active",
-        "message": "This business is not active.",
-    }
+    assert inactive.json()["error"]["code"] == "business_not_active"
+    assert inactive.json()["error"]["message"] == "This business is not active."
+    assert inactive.json()["error"]["request_id"] == inactive.headers["x-request-id"]
 
     complete_profile(api_client, owner, str(draft["id"]))
     still_inactive = api_client.post(path, json=body, headers=headers(owner))

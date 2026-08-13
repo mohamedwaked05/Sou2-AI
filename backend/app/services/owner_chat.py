@@ -26,6 +26,8 @@ from app.agent.owner_chat_provider import (
     ProviderMessage,
     ProviderWorkingDay,
     ProviderWorkingShift,
+    TokenUsage,
+    estimate_utf8_tokens,
 )
 from app.core.config import Settings
 from app.core.exceptions import ApplicationError
@@ -38,6 +40,7 @@ from app.database.models import (
     ChatGenerationState,
     ChatMessageRole,
     OwnerChatMessage,
+    OwnerChatRateLimitEvent,
     OwnerConversation,
     User,
 )
@@ -47,6 +50,13 @@ from app.schemas.owner_chat import (
     OwnerMessageRequest,
     OwnerTurnResponse,
 )
+from app.services.ai_usage import (
+    AIUsageReservationClaim,
+    estimate_owner_chat_input_tokens,
+    reconcile_ai_usage,
+    reserve_owner_chat_usage,
+)
+from app.services.api_limits import admit_owner_chat_generation
 from app.services.business_knowledge import upsert_proposed_knowledge
 from app.services.business_profiles import is_business_profile_complete
 from app.services.businesses import load_full_access_business
@@ -198,6 +208,7 @@ def _completed_turn(
 def _claim_oldest_turn(
     session: Session,
     conversation_id: uuid.UUID,
+    business_id: uuid.UUID,
     settings: Settings,
 ) -> _Claim | None:
     session.scalar(
@@ -229,12 +240,19 @@ def _claim_oldest_turn(
         session.commit()
         return None
     token = uuid.uuid4()
+    next_attempt = oldest.generation_attempts + 1
+    admit_owner_chat_generation(
+        session,
+        business_id=business_id,
+        owner_message_id=oldest.id,
+        generation_attempt=next_attempt,
+    )
     oldest.generation_state = ChatGenerationState.PROCESSING
     oldest.generation_claim_token = token
     oldest.generation_claim_expires_at = now + timedelta(
         seconds=settings.owner_chat_generation_lease_seconds
     )
-    oldest.generation_attempts += 1
+    oldest.generation_attempts = next_attempt
     message_id = oldest.id
     session.commit()
     return _Claim(message_id=message_id, token=token)
@@ -267,7 +285,7 @@ def _build_provider_request(
     business_id: uuid.UUID,
     owner_message_id: uuid.UUID,
     settings: Settings,
-) -> OwnerChatRequest:
+) -> tuple[OwnerChatRequest, Business]:
     owner_message = session.get(OwnerChatMessage, owner_message_id)
     business = session.scalar(
         select(Business)
@@ -335,12 +353,22 @@ def _build_provider_request(
             for message in messages
         ),
         requested_at=now,
+        max_output_tokens=settings.owner_chat_max_output_tokens,
     )
     session.commit()
-    return request
+    return request, business
 
 
-def _mark_failed(session: Session, claim: _Claim) -> None:
+def _mark_failed(
+    session: Session,
+    claim: _Claim,
+    *,
+    reservation: AIUsageReservationClaim | None = None,
+    usage: TokenUsage | None = None,
+    outcome: str | None = None,
+    provider_identifier: str | None = None,
+    model_identifier: str | None = None,
+) -> None:
     message = session.scalar(
         select(OwnerChatMessage)
         .where(
@@ -350,6 +378,38 @@ def _mark_failed(session: Session, claim: _Claim) -> None:
         .with_for_update()
     )
     if message is not None:
+        message.generation_state = ChatGenerationState.FAILED
+        message.generation_claim_token = None
+        message.generation_claim_expires_at = None
+    if reservation is not None and outcome is not None:
+        reconcile_ai_usage(
+            session,
+            reservation.id,
+            usage=usage,
+            outcome=outcome,
+            provider_identifier=provider_identifier,
+            model_identifier=model_identifier,
+            commit=False,
+        )
+    session.commit()
+
+
+def _undo_pre_provider_admission(session: Session, claim: _Claim) -> None:
+    """Keep budget-blocked idempotent owner turns retryable without event inflation."""
+    message = session.scalar(
+        select(OwnerChatMessage)
+        .where(
+            OwnerChatMessage.id == claim.message_id,
+            OwnerChatMessage.generation_claim_token == claim.token,
+        )
+        .with_for_update()
+    )
+    if message is not None:
+        session.query(OwnerChatRateLimitEvent).filter(
+            OwnerChatRateLimitEvent.owner_message_id == message.id,
+            OwnerChatRateLimitEvent.generation_attempt == message.generation_attempts,
+        ).delete(synchronize_session=False)
+        message.generation_attempts -= 1
         message.generation_state = ChatGenerationState.FAILED
         message.generation_claim_token = None
         message.generation_claim_expires_at = None
@@ -372,6 +432,8 @@ def _validate_result(result: object) -> OwnerChatResult:
         for item in result.proposed_knowledge
     ):
         raise OwnerChatProviderInvalidResponse
+    if result.usage is not None and result.usage.output_tokens < 0:
+        raise OwnerChatProviderInvalidResponse
     return result
 
 
@@ -380,6 +442,8 @@ def _persist_result(
     business_id: uuid.UUID,
     claim: _Claim,
     result: OwnerChatResult,
+    reservation: AIUsageReservationClaim,
+    usage: TokenUsage,
 ) -> None:
     owner_message = session.scalar(
         select(OwnerChatMessage)
@@ -412,6 +476,15 @@ def _persist_result(
     owner_message.generation_state = ChatGenerationState.COMPLETED
     owner_message.generation_claim_token = None
     owner_message.generation_claim_expires_at = None
+    reconcile_ai_usage(
+        session,
+        reservation.id,
+        usage=usage,
+        outcome="completed",
+        provider_identifier=result.provider_identifier,
+        model_identifier=result.model_identifier,
+        commit=False,
+    )
     session.commit()
 
 
@@ -419,26 +492,92 @@ def _generate_claimed_turn(
     session: Session,
     business_id: uuid.UUID,
     claim: _Claim,
+    user: User,
     provider: OwnerChatProvider,
     settings: Settings,
 ) -> None:
+    reservation: AIUsageReservationClaim | None = None
     try:
-        request = _build_provider_request(
+        request, business = _build_provider_request(
             session, business_id, claim.message_id, settings
         )
+        owner_message = session.get(OwnerChatMessage, claim.message_id)
+        if owner_message is None:
+            raise _provider_unavailable()
+        try:
+            reservation = reserve_owner_chat_usage(
+                session,
+                business=business,
+                user=user,
+                owner_message_id=claim.message_id,
+                generation_attempt=owner_message.generation_attempts,
+                estimated_input_tokens=estimate_owner_chat_input_tokens(request),
+                max_output_tokens=request.max_output_tokens,
+                lease_seconds=settings.owner_chat_generation_lease_seconds,
+            )
+        except ApplicationError as exc:
+            if exc.error_code == "daily_ai_token_limit_reached":
+                _undo_pre_provider_admission(session, claim)
+            raise
         result = _validate_result(provider.generate(request))
-    except OwnerChatProviderError:
-        _mark_failed(session, claim)
+        usage = result.usage
+        if usage is None:
+            input_tokens = estimate_owner_chat_input_tokens(request)
+            output_tokens = estimate_utf8_tokens(result.reply)
+            usage = TokenUsage(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=input_tokens + output_tokens,
+                authoritative=False,
+            )
+        if usage.output_tokens > request.max_output_tokens:
+            raise OwnerChatProviderInvalidResponse(
+                usage=usage,
+                provider_identifier=result.provider_identifier,
+                model_identifier=result.model_identifier,
+            )
+    except OwnerChatProviderError as exc:
+        outcome = (
+            "reported_failure"
+            if exc.usage is not None
+            else "uncertain"
+            if exc.usage_uncertain
+            else "release"
+        )
+        _mark_failed(
+            session,
+            claim,
+            reservation=reservation,
+            usage=exc.usage,
+            outcome=outcome if reservation is not None else None,
+            provider_identifier=exc.provider_identifier,
+            model_identifier=exc.model_identifier,
+        )
         raise _provider_unavailable() from None
+    except ApplicationError:
+        raise
     except Exception:
         session.rollback()
-        _mark_failed(session, claim)
+        _mark_failed(
+            session,
+            claim,
+            reservation=reservation,
+            outcome="uncertain" if reservation is not None else None,
+        )
         raise _provider_unavailable() from None
     try:
-        _persist_result(session, business_id, claim, result)
+        _persist_result(session, business_id, claim, result, reservation, usage)
     except Exception as exc:
         session.rollback()
-        _mark_failed(session, claim)
+        _mark_failed(
+            session,
+            claim,
+            reservation=reservation,
+            usage=usage,
+            outcome="reported_failure",
+            provider_identifier=result.provider_identifier,
+            model_identifier=result.model_identifier,
+        )
         if isinstance(exc, ApplicationError):
             raise
         raise _provider_unavailable() from None
@@ -464,7 +603,7 @@ def submit_owner_message(
 
     deadline = time.monotonic() + settings.owner_chat_generation_wait_seconds
     while time.monotonic() < deadline:
-        claim = _claim_oldest_turn(session, conversation.id, settings)
+        claim = _claim_oldest_turn(session, conversation.id, business_id, settings)
         if claim is None:
             session.expire_all()
             refreshed = session.get(OwnerChatMessage, owner_message.id)
@@ -475,7 +614,7 @@ def submit_owner_message(
             session.rollback()
             time.sleep(0.025)
             continue
-        _generate_claimed_turn(session, business_id, claim, provider, settings)
+        _generate_claimed_turn(session, business_id, claim, user, provider, settings)
         session.expire_all()
         refreshed = session.get(OwnerChatMessage, owner_message.id)
         if refreshed is not None:

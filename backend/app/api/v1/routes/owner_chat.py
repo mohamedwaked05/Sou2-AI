@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.orm import Session
 
 from app.agent.owner_chat_provider import OwnerChatProvider, get_owner_chat_provider
-from app.api.dependencies import get_current_user
+from app.api.dependencies import get_current_user, run_security_record_cleanup
 from app.core.config import Settings, get_settings
 from app.database.models import User
 from app.database.session import get_db_session
@@ -32,7 +32,11 @@ ChatProvider = Annotated[OwnerChatProvider, Depends(get_owner_chat_provider)]
 AppSettings = Annotated[Settings, Depends(get_settings)]
 
 
-@router.post("/owner-chat/messages", response_model=OwnerTurnResponse)
+@router.post(
+    "/owner-chat/messages",
+    response_model=OwnerTurnResponse,
+    dependencies=[Depends(run_security_record_cleanup)],
+)
 def submit_message(
     business_id: uuid.UUID,
     body: OwnerMessageRequest,

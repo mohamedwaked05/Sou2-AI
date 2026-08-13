@@ -130,12 +130,9 @@ def test_invalid_credentials_use_same_public_error(
     create_user(db_session)
     response = login(api_client, email=email, password=password)
     assert response.status_code == 401
-    assert response.json() == {
-        "error": {
-            "code": "invalid_credentials",
-            "message": "Invalid email or password.",
-        }
-    }
+    assert response.json()["error"]["code"] == "invalid_credentials"
+    assert response.json()["error"]["message"] == "Invalid email or password."
+    assert response.json()["error"]["request_id"] == response.headers["x-request-id"]
 
 
 def test_unverified_and_disabled_accounts_are_blocked(

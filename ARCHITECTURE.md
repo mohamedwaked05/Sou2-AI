@@ -327,6 +327,68 @@ adapters—will write exactly one audit row after business-scope and permission
 checks for every success, error, or denial. That executor and its adapters remain
 out of scope.
 
+## 13.3 API security and AI usage control
+
+Every HTTP request receives a server-generated UUID returned as `X-Request-ID`,
+included in every error, and attached to privacy-safe internal logs. The outer
+ASGI security middleware validates the host, consumes the current non-upload
+request stream only up to 65,536 bytes, applies global `no-store` and browser
+hardening headers, and logs only the method, route template, status, duration,
+safe client address, and request ID. Production logging is newline JSON;
+development is readable and testing is quiet. A central filter redacts sensitive
+field names, bearer/JWT shapes, and database URLs as defense in depth. Unexpected
+errors are generic in every environment.
+
+Forwarded client addresses are ignored unless the direct peer is in
+`TRUSTED_PROXY_CIDRS`. Valid IPv4/IPv6 hops are walked from the nearest proxy
+backward; malformed chains fall back to the direct peer. Trusted hosts and CORS
+origins are explicit. Production rejects wildcard/local defaults, disables API
+documentation by default, and emits HSTS only when trusted HTTPS termination is
+explicitly configured.
+
+Registration and owner-generation counters are privacy-minimal PostgreSQL rows.
+Sorted transaction advisory locks serialize registration email/IP scopes; one
+business advisory-lock scope serializes owner burst admission. Registration
+permits five attempts per normalized email/hour, 30 per client IP/15 minutes, and
+100 per client IP/24 hours. Owner generation permits three attempts/business/minute
+and 20/business/hour. Admission happens before password hashing, email delivery,
+or provider work. Blocked idempotent turns reuse one owner message and create no
+assistant, provider call, duplicate rate event, or token charge.
+
+`business_ai_allowance_configs` gives every business 20,000 tokens per local day
+and protects 25% for owner traffic. A trigger creates the default for new
+businesses and the migration backfills existing businesses without historical
+usage. Local windows use the stored IANA timezone and follow Beirut DST.
+`business_ai_usage_daily` is the locked serialization point for completed and
+reserved usage. `ai_usage_reservations` reserves estimated input plus the
+configured 512-token maximum output before generation for 150 seconds. Completion
+atomically persists the assistant and reconciles authoritative counts or the
+conservative one-token-per-three-UTF-8-bytes estimate. Known pre-use failures
+release; reported usage is charged; uncertain and expired leases charge the full
+reservation. Idempotent completed turns never reserve twice.
+
+Owner traffic may use shared tokens plus the owner reserve. The schema identifies
+channel and applies only the shared portion to future customer and WhatsApp
+channels, but those channels are not implemented. Authenticated
+`GET /api/v1/businesses/{business_id}/ai-usage/current` requires current
+`FULL_ACCESS` membership and returns only counters, local window/reset, allowance,
+reserve, remaining percentage, and threshold status.
+
+Allowance changes use only
+`public.sou2ai_change_business_ai_allowance(uuid, integer, integer, text, text)`.
+The `sou2ai_migrator` owner executes fully qualified writes through a fixed
+`pg_catalog` search path; `PUBLIC` and FastAPI cannot execute it; only the existing
+restricted lifecycle operator can. Runtime and operator roles cannot directly
+change configurations or mutate permanent append-only allowance audit history.
+PostgreSQL superusers remain trusted bootstrap administrators.
+
+PostgreSQL-coordinated best-effort maintenance retains owner burst events for 24
+hours, registration events for 48 hours, detailed reservations for 90 days, and
+daily summaries for 12 months. It first charges expired uncertain reservations,
+uses a persistent shared maintenance claim, deletes bounded batches, and adds no
+scheduler, Redis, or queue. Accounting records never contain prompts, messages,
+answers, bodies, raw provider payloads, reasoning, authorization data, or costs.
+
 ## 14. Local deployment
 
 ```text
@@ -350,7 +412,8 @@ Docker Compose persists `sou2ai_dev` in a named volume and creates isolated
 runtime and lifecycle-operator logins backed by `NOLOGIN` privilege roles. Alembic
 uses a separate bootstrap URL; FastAPI uses only the restricted runtime URL. Tests
 reject any database name other than `sou2ai_test` and exercise lifecycle attacks
-through the real non-superuser logins. `GET /api/v1/health/database` performs
+and budget controls through the real non-superuser logins. `GET
+/api/v1/health/database` performs
 `SELECT 1` and returns only `healthy` or `unavailable` without connection details.
 
 ## 15. Model-provider boundary and future deployment
@@ -367,7 +430,8 @@ The repository contains the FastAPI/PostgreSQL platform foundation, user
 authentication, multi-business management, tenant-scoped authorization, resumable
 onboarding, database-controlled business lifecycle history, one owner conversation
 per business, ordered persistent owner chat, deterministic mock and local Ollama
-providers, and managed permanent/temporary learned knowledge.
+providers, managed permanent/temporary learned knowledge, PostgreSQL-backed API
+limits and AI budgets, and the Milestone 7 HTTP/logging security boundary.
 Cloud-provider connectivity, pgvector, RAG, live tools and analytics, customer
 chat, documents, billing, activation APIs, and frontend functionality remain
 future work.

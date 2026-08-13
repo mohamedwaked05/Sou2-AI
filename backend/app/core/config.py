@@ -1,5 +1,6 @@
 """Application settings loaded from environment variables."""
 
+import ipaddress
 from functools import lru_cache
 from typing import Literal
 
@@ -33,6 +34,12 @@ class Settings(BaseSettings):
             "http://127.0.0.1:5173",
         ]
     )
+    trusted_proxy_cidrs: list[str] = Field(default_factory=list)
+    trusted_hosts: list[str] = Field(default_factory=lambda: ["localhost", "127.0.0.1"])
+    max_request_body_bytes: int = Field(default=65_536, ge=1)
+    api_docs_enabled: bool | None = None
+    hsts_enabled: bool = False
+    trusted_https_termination: bool = False
     log_level: str = "INFO"
     owner_chat_provider: Literal["mock", "ollama"] = "mock"
     ollama_base_url: str = "http://127.0.0.1:11434"
@@ -70,7 +77,6 @@ class Settings(BaseSettings):
     refresh_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
     refresh_cookie_domain: str | None = None
     refresh_cookie_path: str = "/api/v1/auth"
-    trust_proxy_headers: bool = False
     resend_api_key: SecretStr | None = None
     resend_sender_email: str = "onboarding@resend.dev"
     frontend_base_url: str = "http://localhost:5173"
@@ -79,13 +85,48 @@ class Settings(BaseSettings):
     owner_chat_knowledge_context_limit: int = Field(default=100, ge=1, le=200)
     owner_chat_generation_lease_seconds: int = Field(default=150, ge=5, le=300)
     owner_chat_generation_wait_seconds: int = Field(default=30, ge=1, le=300)
+    owner_chat_max_output_tokens: int = Field(default=512, ge=1, le=4096)
+    security_event_cleanup_interval_minutes: int = Field(default=60, ge=1)
 
-    @field_validator("allowed_cors_origins", mode="before")
+    @field_validator(
+        "allowed_cors_origins",
+        "trusted_proxy_cidrs",
+        "trusted_hosts",
+        mode="before",
+    )
     @classmethod
-    def parse_cors_origins(cls, value: str | list[str]) -> list[str]:
+    def parse_list_setting(cls, value: str | list[str]) -> list[str]:
         """Accept either JSON or a comma-separated environment variable."""
         if isinstance(value, str):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
+        return value
+
+    @field_validator("trusted_proxy_cidrs")
+    @classmethod
+    def validate_proxy_cidrs(cls, value: list[str]) -> list[str]:
+        validated: list[str] = []
+        for item in value:
+            try:
+                validated.append(str(ipaddress.ip_network(item, strict=False)))
+            except ValueError as exc:
+                raise ValueError(f"Invalid trusted proxy CIDR: {item}") from exc
+        return validated
+
+    @field_validator("trusted_hosts")
+    @classmethod
+    def validate_trusted_hosts(
+        cls, value: list[str], info: ValidationInfo
+    ) -> list[str]:
+        if not value:
+            raise ValueError("TRUSTED_HOSTS must contain at least one host.")
+        if any(
+            not host or "://" in host or "/" in host or " " in host for host in value
+        ):
+            raise ValueError("TRUSTED_HOSTS contains an invalid host value.")
+        if info.data.get("environment", "development").lower() == "production" and any(
+            host == "*" or host.startswith("*.") for host in value
+        ):
+            raise ValueError("Wildcard TRUSTED_HOSTS are forbidden in production.")
         return value
 
     @field_validator("allowed_cors_origins")
@@ -95,8 +136,19 @@ class Settings(BaseSettings):
     ) -> list[str]:
         """Disallow wildcard origins when the application runs in production."""
         environment = info.data.get("environment", "development")
-        if environment.lower() == "production" and "*" in value:
-            raise ValueError("ALLOWED_CORS_ORIGINS cannot contain '*' in production.")
+        if environment.lower() == "production":
+            if not value or "*" in value:
+                raise ValueError(
+                    "ALLOWED_CORS_ORIGINS must contain explicit production origins."
+                )
+            if any(
+                origin.startswith("http://localhost")
+                or origin.startswith("http://127.0.0.1")
+                for origin in value
+            ):
+                raise ValueError(
+                    "Development CORS origins are forbidden in production."
+                )
         return value
 
     @model_validator(mode="after")
@@ -114,7 +166,13 @@ class Settings(BaseSettings):
                 "OLLAMA_REQUEST_TIMEOUT_SECONDS when using Ollama."
             )
         if self.environment.lower() != "production":
+            if self.hsts_enabled:
+                raise ValueError("HSTS is enabled only in production.")
             return self
+        if all(
+            host in {"localhost", "127.0.0.1", "::1"} for host in self.trusted_hosts
+        ):
+            raise ValueError("TRUSTED_HOSTS must include the production API domain.")
         if self.access_token_secret.get_secret_value().startswith("development-only"):
             raise ValueError("ACCESS_TOKEN_SECRET must be changed in production.")
         if not self.refresh_cookie_secure:
@@ -125,7 +183,17 @@ class Settings(BaseSettings):
             or "replace" in self.resend_api_key.get_secret_value().lower()
         ):
             raise ValueError("RESEND_API_KEY is required in production.")
+        if self.hsts_enabled and not self.trusted_https_termination:
+            raise ValueError(
+                "HSTS requires TRUSTED_HTTPS_TERMINATION=true in production."
+            )
         return self
+
+    @property
+    def docs_enabled(self) -> bool:
+        if self.api_docs_enabled is not None:
+            return self.api_docs_enabled
+        return self.environment.lower() != "production"
 
 
 @lru_cache

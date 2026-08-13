@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
@@ -20,7 +21,21 @@ logger = logging.getLogger(__name__)
 
 
 class OwnerChatProviderError(Exception):
-    """Base class for safe provider failures."""
+    """Base class for safe provider failures with optional accounting metadata."""
+
+    def __init__(
+        self,
+        *,
+        usage: TokenUsage | None = None,
+        provider_identifier: str | None = None,
+        model_identifier: str | None = None,
+        usage_uncertain: bool = True,
+    ) -> None:
+        self.usage = usage
+        self.provider_identifier = provider_identifier
+        self.model_identifier = model_identifier
+        self.usage_uncertain = usage_uncertain
+        super().__init__()
 
 
 class OwnerChatProviderTimeout(OwnerChatProviderError):
@@ -89,6 +104,7 @@ class OwnerChatRequest:
     knowledge: tuple[ProviderKnowledge, ...]
     messages: tuple[ProviderMessage, ...]
     requested_at: datetime
+    max_output_tokens: int = 512
 
 
 @dataclass(frozen=True)
@@ -101,9 +117,31 @@ class ProposedKnowledge:
 
 
 @dataclass(frozen=True)
+class TokenUsage:
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    authoritative: bool
+
+    def __post_init__(self) -> None:
+        if self.input_tokens < 0 or self.output_tokens < 0:
+            raise ValueError("Token usage cannot be negative.")
+        if self.total_tokens != self.input_tokens + self.output_tokens:
+            raise ValueError("Total token usage must equal input plus output.")
+
+
+def estimate_utf8_tokens(value: str) -> int:
+    """Conservatively approximate one token per three UTF-8 bytes."""
+    return max(0, math.ceil(len(value.encode("utf-8")) / 3))
+
+
+@dataclass(frozen=True)
 class OwnerChatResult:
     reply: str
     proposed_knowledge: tuple[ProposedKnowledge, ...] = ()
+    usage: TokenUsage | None = None
+    provider_identifier: str | None = None
+    model_identifier: str | None = None
 
 
 class OwnerChatProvider(Protocol):
@@ -140,7 +178,22 @@ class DeterministicMockOwnerChatProvider:
             reply = "I saved the reusable business information from your message."
         else:
             reply = "I received your message and kept it in this owner conversation."
-        return OwnerChatResult(reply=reply, proposed_knowledge=tuple(facts))
+        input_text = "".join(message.content for message in request.messages)
+        usage = TokenUsage(
+            input_tokens=estimate_utf8_tokens(input_text),
+            output_tokens=estimate_utf8_tokens(reply),
+            total_tokens=(
+                estimate_utf8_tokens(input_text) + estimate_utf8_tokens(reply)
+            ),
+            authoritative=False,
+        )
+        return OwnerChatResult(
+            reply=reply,
+            proposed_knowledge=tuple(facts),
+            usage=usage,
+            provider_identifier="mock",
+            model_identifier="deterministic",
+        )
 
     @staticmethod
     def _needs_expiry_clarification(text: str, facts: list[ProposedKnowledge]) -> bool:
@@ -289,6 +342,8 @@ class _OllamaChatResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     message: _OllamaMessage
+    prompt_eval_count: int | None = None
+    eval_count: int | None = None
 
 
 def _profile_context(profile: ProviderBusinessProfile) -> dict[str, Any]:
@@ -360,7 +415,11 @@ class OllamaOwnerChatProvider:
             if response.status_code >= 400:
                 reason = self._http_error_reason(response)
                 logger.warning("Owner chat provider failed: reason=%s", reason)
-                raise OwnerChatProviderUnavailable
+                raise OwnerChatProviderUnavailable(
+                    provider_identifier="ollama",
+                    model_identifier=self.model,
+                    usage_uncertain=False,
+                )
             envelope = _OllamaChatResponse.model_validate(response.json())
             structured = _OllamaStructuredResult.model_validate_json(
                 envelope.message.content
@@ -372,13 +431,48 @@ class OllamaOwnerChatProvider:
                 raise ValueError("Temporary fact expiry must be in the future.")
         except httpx.TimeoutException:
             logger.warning("Owner chat provider failed: reason=timeout")
-            raise OwnerChatProviderTimeout from None
+            raise OwnerChatProviderTimeout(
+                provider_identifier="ollama",
+                model_identifier=self.model,
+                usage_uncertain=True,
+            ) from None
         except httpx.RequestError:
             logger.warning("Owner chat provider failed: reason=unavailable")
-            raise OwnerChatProviderUnavailable from None
+            raise OwnerChatProviderUnavailable(
+                provider_identifier="ollama",
+                model_identifier=self.model,
+                usage_uncertain=False,
+            ) from None
         except ValueError:
             logger.warning("Owner chat provider failed: reason=invalid_response")
             raise OwnerChatProviderInvalidResponse from None
+
+        if envelope.prompt_eval_count is not None and envelope.eval_count is not None:
+            usage = TokenUsage(
+                input_tokens=envelope.prompt_eval_count,
+                output_tokens=envelope.eval_count,
+                total_tokens=envelope.prompt_eval_count + envelope.eval_count,
+                authoritative=True,
+            )
+        else:
+            input_tokens = estimate_utf8_tokens(
+                json.dumps(
+                    payload["messages"], ensure_ascii=False, separators=(",", ":")
+                )
+            )
+            output_tokens = estimate_utf8_tokens(envelope.message.content)
+            usage = TokenUsage(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=input_tokens + output_tokens,
+                authoritative=False,
+            )
+        if usage.output_tokens > request.max_output_tokens:
+            raise OwnerChatProviderInvalidResponse(
+                usage=usage,
+                provider_identifier="ollama",
+                model_identifier=self.model,
+            )
 
         return OwnerChatResult(
             reply=structured.reply,
@@ -392,6 +486,9 @@ class OllamaOwnerChatProvider:
                 )
                 for fact in structured.proposed_knowledge
             ),
+            usage=usage,
+            provider_identifier="ollama",
+            model_identifier=self.model,
         )
 
     def _request_payload(self, request: OwnerChatRequest) -> dict[str, Any]:
@@ -437,6 +534,7 @@ class OllamaOwnerChatProvider:
             "stream": False,
             "format": _OllamaStructuredResult.model_json_schema(),
             "messages": messages,
+            "options": {"num_predict": request.max_output_tokens},
         }
 
     @staticmethod

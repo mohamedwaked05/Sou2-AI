@@ -226,7 +226,7 @@ def test_resend_hourly_limit_and_already_verified_response(
         "/api/v1/auth/resend-verification", json={"email": "owner@example.com"}
     )
     assert limited.status_code == 429
-    assert limited.json()["error"]["code"] == "rate_limited"
+    assert limited.json()["error"]["code"] == "verification_resend_rate_limited"
 
     db_session.execute(
         update(AuthenticationEvent).values(created_at=utc_now() - timedelta(hours=2))

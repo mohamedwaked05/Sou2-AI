@@ -4,12 +4,13 @@ Sou2AI is a local AI assistant planned for small businesses, with future support
 
 ## Current milestone
 
-Milestone 6 adds authoritative `PENDING`, `ACTIVE`, and `DISABLED` business
-lifecycle states, controlled manual PostgreSQL transitions, and permanent
-append-only internal history. API `is_active` remains compatible but is derived
-only from `status == ACTIVE`. Owner chat retains its deterministic offline mock and
-opt-in local Ollama provider and requires an authenticated `FULL_ACCESS`
-membership plus a complete, confirmed active business.
+Milestone 7 adds PostgreSQL-backed registration and owner-generation limits,
+per-business local-day AI token allowances, leased usage reconciliation, a
+tenant-scoped current-usage endpoint, and controlled allowance administration. It
+also establishes trusted host/proxy/CORS handling, a streamed body limit, server
+request IDs, safe errors, security headers, environment-aware documentation, and
+redacted console/JSON logging. Milestone 6 lifecycle controls and the verified
+mock/local-Ollama owner chat remain intact.
 
 It does **not** include customer chat, activation/admin APIs, cloud or paid model
 providers, RAG, embeddings, pgvector, documents, operational
@@ -53,8 +54,19 @@ key only in `.env`; never commit it. Local links default to:
 Local HTTP uses `REFRESH_COOKIE_SECURE=false`. Production refuses to start with
 that setting or the development signing secret. Set `REFRESH_COOKIE_SECURE=true`
 in production and choose `REFRESH_COOKIE_SAMESITE` for the deployed frontend/API
-topology. Enable `TRUST_PROXY_HEADERS` only when a trusted reverse proxy replaces
-client-supplied forwarding headers.
+topology. `TRUSTED_PROXY_CIDRS` is empty by default. Add only actual reverse-proxy
+network ranges; forwarding headers from every other direct peer are ignored. Set
+`TRUSTED_HOSTS` to the real API domain in production. Production also requires
+explicit non-local CORS origins, disables `/docs`, `/redoc`, and `/openapi.json`
+unless `API_DOCS_ENABLED=true`, and rejects wildcard hosts/origins. Enable HSTS
+only with both `HSTS_ENABLED=true` and `TRUSTED_HTTPS_TERMINATION=true` after
+confirming production HTTPS termination. Local HTTP must leave HSTS disabled.
+
+The global current-endpoint request-body limit is 65,536 streamed bytes. CORS
+allows only `GET`, `POST`, `PATCH`, `DELETE`, and `OPTIONS`, the
+`Authorization`, `Content-Type`, and `Accept` request headers, and exposes
+`X-Request-ID` plus `Retry-After`. Every response receives a new server-controlled
+request UUID; client request IDs are ignored.
 
 ## Start PostgreSQL
 
@@ -178,6 +190,8 @@ Endpoints:
   `POST /api/v1/businesses/{business_id}/onboarding/confirm`
 - Owner chat: `POST/GET
   /api/v1/businesses/{business_id}/owner-chat/messages`
+- Current AI usage: `GET
+  /api/v1/businesses/{business_id}/ai-usage/current`
 - Learned knowledge: `GET /api/v1/businesses/{business_id}/knowledge` and
   `PATCH/DELETE /api/v1/businesses/{business_id}/knowledge/{knowledge_id}`
 
@@ -223,6 +237,33 @@ which bounds retries after a failure. Cleanup deletes at most 1,000 rows per
 invocation and is best-effort, so maintenance cannot change a valid authentication
 response or bypass its rate-limit transaction. An external database maintenance
 job may replace or supplement this mechanism later if event volume requires it.
+
+Registration adds independent PostgreSQL counters: five attempts per normalized
+email/hour, 30 per client IP/15 minutes, and 100 per client IP/24 hours. Successful
+and failed admissions count before password hashing and email delivery. Owner chat
+permits three generation attempts per business/minute and 20/hour. A blocked
+request returns `429`, a stable code, reset metadata, `Retry-After`, and the request
+ID without calling the provider or creating an assistant/token charge.
+
+Every business defaults to 20,000 input-plus-output tokens per stored-timezone
+local day. Twenty-five percent is reserved for owner traffic; current owner chat
+can use the full allowance, while future customer channels can use only the shared
+portion. Before generation the database reserves conservative estimated input plus
+`OWNER_CHAT_MAX_OUTPUT_TOKENS` (512 by default) for the 150-second generation
+lease. Ollama maps the cap to `options.num_predict`. Authoritative provider counts
+replace the reservation; otherwise Sou2AI estimates about one token per three
+UTF-8 bytes. This intentionally errs conservatively and is only approximate for
+Arabic, Franco-Arabic, and mixed-language text. Known failures before model use
+release reservations; reported usage is charged; uncertain/expired work charges
+the full reservation.
+
+Usage records contain identifiers, channel/capability, counters, safe
+provider/model identifiers, statuses, windows, and timestamps only. They never
+store messages, prompts, answers, bodies, raw payloads, reasoning, authorization
+data, or costs. Owner burst events retain for 24 hours, registration events for 48
+hours, detailed usage for 90 days, and daily summaries for 12 months. The existing
+PostgreSQL-coordinated best-effort maintenance pattern performs bounded cleanup;
+there is no internal scheduler.
 
 ## Formatting and linting
 
@@ -281,6 +322,30 @@ directly update `businesses.status` or insert, update, delete, or truncate histo
 FastAPI cannot execute the function. History cannot be updated or deleted and
 reasons are never returned by owner APIs. There is no admin HTTP endpoint or
 dashboard.
+
+### AI allowance administration
+
+Owners may view but cannot change the current usage summary. FastAPI and the
+operator cannot directly update `business_ai_allowance_configs` or mutate
+`business_ai_allowance_audit`. Connect with the restricted operator login and call
+only the controlled function; never run direct configuration updates:
+
+```powershell
+docker compose exec postgres psql -U sou2ai_lifecycle_operator_login -W -d sou2ai_dev `
+  -v business_id="00000000-0000-0000-0000-000000000000" `
+  -v daily_allowance="20000" `
+  -v owner_reserve_percent="25" `
+  -v admin_identifier="operator@example.com" `
+  -v reason="Approved local allowance adjustment" `
+  -c "SELECT * FROM public.sou2ai_change_business_ai_allowance(:'business_id'::uuid, :'daily_allowance'::integer, :'owner_reserve_percent'::integer, :'admin_identifier', :'reason');"
+```
+
+The function locks the business/configuration, validates bounded nonblank operator
+and reason fields, changes both allowance values, and inserts exactly one permanent
+append-only audit record atomically. Lowering below current usage never erases
+usage; it blocks new reservations immediately while existing reservations finish.
+The next local day uses the new value. `PUBLIC` and FastAPI cannot execute the
+function. PostgreSQL superusers remain trusted bootstrap administrators.
 
 ## Owner chat and learned knowledge
 
@@ -343,9 +408,9 @@ scheduler will call the existing retention operation.
 
 ## Implementation boundary
 
-Milestone 6 and the early optional local Ollama provider are complete. Much of the
-later provider abstraction also arrived early, without completing unrelated
-roadmap work. Later RAG,
+Milestone 7 and the early optional local Ollama provider are complete. Much of the
+later provider abstraction and the usage/cost-control foundation arrived early,
+without completing unrelated roadmap work. Later RAG,
 documents, cloud model connectivity, controlled live tools and analytics, customer
 channels, and frontend work remain planned only. Ollama is a local-development
 provider, not the production deployment decision.

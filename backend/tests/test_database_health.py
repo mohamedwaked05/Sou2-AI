@@ -37,6 +37,7 @@ def test_database_health_failure_is_safe() -> None:
         app.dependency_overrides.clear()
 
     assert response.status_code == 503
-    assert response.json() == {"status": "unavailable"}
+    assert response.json()["error"]["code"] == "database_unavailable"
+    assert response.json()["error"]["request_id"] == response.headers["x-request-id"]
     assert "secret-db-host" not in response.text
     assert "5432" not in response.text

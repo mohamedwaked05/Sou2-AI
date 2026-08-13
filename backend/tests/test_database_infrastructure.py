@@ -70,3 +70,57 @@ def test_alembic_downgrade_and_upgrade(
 
     command.upgrade(alembic_config, "head")
     assert "tool_call_logs" in inspect(database_engine).get_table_names()
+
+
+def test_milestone_7_upgrade_backfills_existing_business_allowance(
+    database_engine: Engine,
+    migration_engine: Engine,
+    alembic_config: Config,
+) -> None:
+    database_engine.dispose()
+    command.downgrade(alembic_config, "20260813_02")
+    business_id = "10000000-0000-0000-0000-000000000007"
+    user_id = "20000000-0000-0000-0000-000000000007"
+    conversation_id = "30000000-0000-0000-0000-000000000007"
+    with migration_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO users (id,email,first_name,last_name,password_hash) "
+                "VALUES (:user_id,'pre-m7@example.com','Pre','Migration','hash')"
+            ),
+            {"user_id": user_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO businesses (id,owner_user_id,name,normalized_name) "
+                "VALUES (:business_id,:user_id,'Pre M7','pre m7')"
+            ),
+            {"business_id": business_id, "user_id": user_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO owner_conversations (id,business_id) "
+                "VALUES (:conversation_id,:business_id)"
+            ),
+            {"conversation_id": conversation_id, "business_id": business_id},
+        )
+    command.upgrade(alembic_config, "head")
+    with migration_engine.connect() as connection:
+        config = connection.execute(
+            text(
+                "SELECT * FROM business_ai_allowance_configs "
+                "WHERE business_id=:business_id"
+            ),
+            {"business_id": business_id},
+        ).one()
+        assert config.daily_token_allowance == 20_000
+        assert config.owner_reserve_percent == 25
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM owner_conversations WHERE id=:conversation_id"
+                ),
+                {"conversation_id": conversation_id},
+            )
+            == 1
+        )

@@ -21,7 +21,7 @@ from tests.test_business_api import (
     headers,
 )
 
-MIGRATION_REVISION = "20260813_02"
+MIGRATION_REVISION = "20260813_03"
 LIFECYCLE_REVISION = "20260813_01"
 PRE_LIFECYCLE_REVISION = "20260812_03"
 
@@ -210,10 +210,9 @@ def test_disabled_business_cannot_use_owner_chat(
     )
 
     assert response.status_code == 403
-    assert response.json()["error"] == {
-        "code": "business_not_active",
-        "message": "This business is not active.",
-    }
+    assert response.json()["error"]["code"] == "business_not_active"
+    assert response.json()["error"]["message"] == "This business is not active."
+    assert response.json()["error"]["request_id"] == response.headers["x-request-id"]
 
 
 @pytest.mark.parametrize(

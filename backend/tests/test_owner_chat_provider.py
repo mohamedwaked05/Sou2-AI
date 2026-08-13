@@ -177,6 +177,7 @@ def test_ollama_request_uses_configured_context_model_and_timeout() -> None:
     assert isinstance(payload, dict)
     assert payload["model"] == "configured-model:7b"
     assert payload["stream"] is False
+    assert payload["options"] == {"num_predict": 512}
     assert isinstance(payload["format"], dict)
     assert [message["role"] for message in payload["messages"]] == [
         "system",
@@ -227,6 +228,32 @@ def test_ollama_request_uses_configured_context_model_and_timeout() -> None:
     timeout = captured["timeout"]
     assert isinstance(timeout, dict)
     assert set(timeout.values()) == {37}
+
+
+def test_ollama_authoritative_usage_is_provider_neutral() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {"reply": "Counted response.", "proposed_knowledge": []}
+                    ),
+                },
+                "prompt_eval_count": 123,
+                "eval_count": 17,
+            },
+        )
+    )
+    result = ollama_provider(transport).generate(provider_request())
+    assert result.usage is not None
+    assert result.usage.input_tokens == 123
+    assert result.usage.output_tokens == 17
+    assert result.usage.total_tokens == 140
+    assert result.usage.authoritative is True
+    assert result.provider_identifier == "ollama"
+    assert result.model_identifier == "qwen2.5:7b"
 
 
 @pytest.mark.parametrize(

@@ -3,6 +3,9 @@
 import os
 from collections.abc import Generator
 
+os.environ.setdefault("ENVIRONMENT", "testing")
+os.environ.setdefault("TRUSTED_HOSTS", "localhost,127.0.0.1,testserver")
+
 import pytest
 from alembic import command
 from alembic.config import Config
@@ -103,9 +106,18 @@ def db_session(database_engine: Engine, migration_engine: Engine) -> Generator[S
         )
         connection.execute(
             text(
+                "ALTER TABLE business_ai_allowance_audit DISABLE TRIGGER "
+                "trg_ai_allowance_audit_no_truncate"
+            )
+        )
+        connection.execute(
+            text(
                 "TRUNCATE authentication_maintenance_tasks, authentication_events, "
+                "registration_rate_limit_events, owner_chat_rate_limit_events, "
                 "password_reset_tokens, "
                 "email_verification_tokens, refresh_sessions, tool_call_logs, "
+                "ai_usage_reservations, business_ai_usage_daily, "
+                "business_ai_allowance_audit, business_ai_allowance_configs, "
                 "business_lifecycle_history, business_knowledge, owner_chat_messages, "
                 "owner_conversations, "
                 "business_opening_shifts, "
@@ -116,6 +128,12 @@ def db_session(database_engine: Engine, migration_engine: Engine) -> Generator[S
             text(
                 "ALTER TABLE business_lifecycle_history ENABLE TRIGGER "
                 "trg_business_lifecycle_history_no_truncate"
+            )
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE business_ai_allowance_audit ENABLE TRIGGER "
+                "trg_ai_allowance_audit_no_truncate"
             )
         )
 

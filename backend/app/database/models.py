@@ -95,6 +95,13 @@ class KnowledgeCategory(StrEnum):
     PROMOTION = "promotion"
 
 
+class AIUsageReservationStatus(StrEnum):
+    RESERVED = "reserved"
+    COMPLETED = "completed"
+    RELEASED = "released"
+    CHARGED = "charged"
+
+
 account_status_enum = ENUM(
     AccountStatus,
     name="account_status",
@@ -528,6 +535,9 @@ class Business(Base):
     lifecycle_history: Mapped[list[BusinessLifecycleHistory]] = relationship(
         back_populates="business", passive_deletes=True
     )
+    ai_allowance_config: Mapped[BusinessAIAllowanceConfig | None] = relationship(
+        back_populates="business", passive_deletes=True
+    )
 
     @property
     def is_active(self) -> bool:
@@ -623,6 +633,288 @@ class BusinessLifecycleHistory(Base):
     )
 
     business: Mapped[Business] = relationship(back_populates="lifecycle_history")
+
+
+class RegistrationRateLimitEvent(Base):
+    """Privacy-minimal registration-attempt counter."""
+
+    __tablename__ = "registration_rate_limit_events"
+    __table_args__ = (
+        Index("ix_registration_rate_email_created", "normalized_email", "created_at"),
+        Index("ix_registration_rate_ip_created", "client_ip", "created_at"),
+        Index("ix_registration_rate_created", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    normalized_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    client_ip: Mapped[str] = mapped_column(String(45), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class OwnerChatRateLimitEvent(Base):
+    """One admitted owner-chat generation attempt."""
+
+    __tablename__ = "owner_chat_rate_limit_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_message_id",
+            "generation_attempt",
+            name="uq_owner_chat_rate_message_attempt",
+        ),
+        CheckConstraint(
+            "generation_attempt > 0", name="ck_owner_chat_rate_attempt_positive"
+        ),
+        Index("ix_owner_chat_rate_business_created", "business_id", "created_at"),
+        Index("ix_owner_chat_rate_created", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    owner_message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("owner_chat_messages.id", ondelete="CASCADE"), nullable=False
+    )
+    generation_attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class BusinessAIAllowanceConfig(Base):
+    """Protected per-business daily AI allowance configuration."""
+
+    __tablename__ = "business_ai_allowance_configs"
+    __table_args__ = (
+        CheckConstraint(
+            "daily_token_allowance BETWEEN 1 AND 1000000000",
+            name="ck_ai_allowance_daily_range",
+        ),
+        CheckConstraint(
+            "owner_reserve_percent BETWEEN 0 AND 100",
+            name="ck_ai_allowance_reserve_range",
+        ),
+    )
+
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), primary_key=True
+    )
+    daily_token_allowance: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("20000")
+    )
+    owner_reserve_percent: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("25")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    business: Mapped[Business] = relationship(back_populates="ai_allowance_config")
+
+
+class BusinessAIAllowanceAudit(Base):
+    """Permanent append-only audit of administrative allowance changes."""
+
+    __tablename__ = "business_ai_allowance_audit"
+    __table_args__ = (
+        CheckConstraint(
+            "previous_daily_token_allowance <> new_daily_token_allowance OR "
+            "previous_owner_reserve_percent <> new_owner_reserve_percent",
+            name="ck_ai_allowance_audit_changed",
+        ),
+        CheckConstraint(
+            "char_length(btrim(admin_identifier)) BETWEEN 1 AND 320",
+            name="ck_ai_allowance_audit_admin_length",
+        ),
+        CheckConstraint(
+            "char_length(btrim(reason)) BETWEEN 1 AND 2000",
+            name="ck_ai_allowance_audit_reason_length",
+        ),
+        Index("ix_ai_allowance_audit_business_changed", "business_id", "changed_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="RESTRICT"), nullable=False
+    )
+    previous_daily_token_allowance: Mapped[int] = mapped_column(Integer, nullable=False)
+    new_daily_token_allowance: Mapped[int] = mapped_column(Integer, nullable=False)
+    previous_owner_reserve_percent: Mapped[int] = mapped_column(Integer, nullable=False)
+    new_owner_reserve_percent: Mapped[int] = mapped_column(Integer, nullable=False)
+    admin_identifier: Mapped[str] = mapped_column(String(320), nullable=False)
+    reason: Mapped[str] = mapped_column(String(2000), nullable=False)
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class BusinessAIUsageDaily(Base):
+    """Privacy-minimal daily token summary for one business-local window."""
+
+    __tablename__ = "business_ai_usage_daily"
+    __table_args__ = (
+        UniqueConstraint(
+            "business_id", "window_start", name="uq_ai_usage_daily_window"
+        ),
+        CheckConstraint(
+            "window_end > window_start", name="ck_ai_usage_daily_window_order"
+        ),
+        CheckConstraint(
+            "input_tokens_used >= 0 AND output_tokens_used >= 0 AND "
+            "total_tokens_used >= 0 AND tokens_reserved >= 0",
+            name="ck_ai_usage_daily_nonnegative",
+        ),
+        CheckConstraint(
+            "total_tokens_used = input_tokens_used + output_tokens_used",
+            name="ck_ai_usage_daily_total",
+        ),
+        Index("ix_ai_usage_daily_business_end", "business_id", "window_end"),
+        Index("ix_ai_usage_daily_window_end", "window_end"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    window_start: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    window_end: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    input_tokens_used: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    output_tokens_used: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    total_tokens_used: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    tokens_reserved: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class AIUsageReservation(Base):
+    """Leased provider-neutral reservation and final token accounting record."""
+
+    __tablename__ = "ai_usage_reservations"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_message_id",
+            "generation_attempt",
+            name="uq_ai_reservation_message_attempt",
+        ),
+        CheckConstraint(
+            "channel IN ('owner', 'customer', 'whatsapp')",
+            name="ck_ai_reservation_channel",
+        ),
+        CheckConstraint(
+            "status IN ('reserved', 'completed', 'released', 'charged')",
+            name="ck_ai_reservation_status",
+        ),
+        CheckConstraint(
+            "estimated_input_tokens >= 0 AND max_output_tokens > 0 AND "
+            "reserved_tokens = estimated_input_tokens + max_output_tokens",
+            name="ck_ai_reservation_reserved_total",
+        ),
+        CheckConstraint(
+            "input_tokens IS NULL OR input_tokens >= 0",
+            name="ck_ai_reservation_input_nonnegative",
+        ),
+        CheckConstraint(
+            "output_tokens IS NULL OR output_tokens >= 0",
+            name="ck_ai_reservation_output_nonnegative",
+        ),
+        CheckConstraint(
+            "total_tokens IS NULL OR total_tokens >= 0",
+            name="ck_ai_reservation_total_nonnegative",
+        ),
+        CheckConstraint(
+            "total_tokens IS NULL OR total_tokens = input_tokens + output_tokens",
+            name="ck_ai_reservation_actual_total",
+        ),
+        CheckConstraint(
+            "window_end > window_start AND lease_expires_at > created_at",
+            name="ck_ai_reservation_time_order",
+        ),
+        CheckConstraint(
+            "char_length(capability) BETWEEN 1 AND 50",
+            name="ck_ai_reservation_capability_length",
+        ),
+        CheckConstraint(
+            "provider_identifier IS NULL OR char_length(provider_identifier) <= 50",
+            name="ck_ai_reservation_provider_length",
+        ),
+        CheckConstraint(
+            "model_identifier IS NULL OR char_length(model_identifier) <= 100",
+            name="ck_ai_reservation_model_length",
+        ),
+        Index("ix_ai_reservation_business_window", "business_id", "window_start"),
+        Index("ix_ai_reservation_lease", "status", "lease_expires_at"),
+        Index("ix_ai_reservation_created", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    owner_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("owner_chat_messages.id", ondelete="SET NULL")
+    )
+    generation_attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    channel: Mapped[str] = mapped_column(String(20), nullable=False)
+    capability: Mapped[str] = mapped_column(String(50), nullable=False)
+    estimated_input_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_output_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    reserved_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
+    counts_authoritative: Mapped[bool | None] = mapped_column(Boolean)
+    provider_identifier: Mapped[str | None] = mapped_column(String(50))
+    model_identifier: Mapped[str | None] = mapped_column(String(100))
+    status: Mapped[AIUsageReservationStatus] = mapped_column(
+        String(20), nullable=False, server_default="reserved"
+    )
+    window_start: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    window_end: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    lease_expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class BusinessOpeningDay(Base):

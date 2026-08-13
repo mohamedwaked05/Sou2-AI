@@ -1,7 +1,8 @@
 """Authentication application logic and transactional session management."""
 
+import math
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from fastapi import status
 from sqlalchemy import delete, func, select, text, update
@@ -28,6 +29,7 @@ from app.database.models import (
     RefreshSession,
     User,
 )
+from app.services.api_limits import admit_registration_attempt
 from app.services.email import EmailDeliveryError, EmailService
 
 CHECK_EMAIL_MESSAGE = "Check your email to verify your account."
@@ -45,9 +47,27 @@ def _error(
     error_code: str,
     *,
     details: dict[str, object] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> ApplicationError:
     return ApplicationError(
-        detail, status_code=status_code, error_code=error_code, details=details
+        detail,
+        status_code=status_code,
+        error_code=error_code,
+        details=details,
+        headers=headers,
+    )
+
+
+def _rate_error(
+    detail: str, code: str, now: datetime, reset_at: datetime
+) -> ApplicationError:
+    retry_after = max(1, math.ceil((reset_at - now).total_seconds()))
+    return _error(
+        detail,
+        status.HTTP_429_TOO_MANY_REQUESTS,
+        code,
+        details={"reset_at": reset_at.isoformat()},
+        headers={"Retry-After": str(retry_after)},
     )
 
 
@@ -87,8 +107,12 @@ def register_user(
     last_name: str,
     email: str,
     password: str,
+    client_ip: str,
 ) -> User:
     normalized_email = normalize_email(email)
+    admit_registration_attempt(
+        session, normalized_email=normalized_email, client_ip=client_ip
+    )
     session.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:email, 0))"),
         {"email": normalized_email},
@@ -231,8 +255,11 @@ def resend_verification(
         .limit(1)
     )
     if latest is not None and latest > now - timedelta(seconds=60):
-        raise _error(
-            "Please wait before requesting another email.", 429, "resend_cooldown"
+        raise _rate_error(
+            "Please wait before requesting another email.",
+            "resend_cooldown",
+            now,
+            latest + timedelta(seconds=60),
         )
     since = now - timedelta(hours=1)
     account_count = session.scalar(
@@ -254,8 +281,19 @@ def resend_verification(
         )
     )
     if (account_count or 0) >= 5 or (ip_count or 0) >= 5:
-        raise _error(
-            "Too many verification requests. Try again later.", 429, "rate_limited"
+        oldest = session.scalar(
+            select(func.min(AuthenticationEvent.created_at)).where(
+                AuthenticationEvent.event_type == "verification_resend",
+                AuthenticationEvent.created_at >= since,
+                (AuthenticationEvent.normalized_email == normalized_email)
+                | (AuthenticationEvent.client_ip == client_ip),
+            )
+        )
+        raise _rate_error(
+            "Too many verification requests. Try again later.",
+            "verification_resend_rate_limited",
+            now,
+            oldest + timedelta(hours=1),
         )
 
     session.execute(
@@ -304,8 +342,11 @@ def login(
         )
     )
     if last_block is not None and last_block >= cutoff:
-        raise _error(
-            "Too many login attempts. Try again later.", 429, "login_rate_limited"
+        raise _rate_error(
+            "Too many login attempts. Try again later.",
+            "login_rate_limited",
+            now,
+            last_block + timedelta(minutes=15),
         )
     failure_count = _event_count(
         session, "login_failure", normalized_email, client_ip, cutoff
@@ -454,8 +495,19 @@ def forgot_password(
         )
         >= 5
     ):
-        raise _error(
-            "Too many password-reset requests. Try again later.", 429, "rate_limited"
+        oldest = session.scalar(
+            select(func.min(AuthenticationEvent.created_at)).where(
+                AuthenticationEvent.event_type == "password_reset_request",
+                AuthenticationEvent.normalized_email == normalized_email,
+                AuthenticationEvent.client_ip == client_ip,
+                AuthenticationEvent.created_at >= now - timedelta(hours=1),
+            )
+        )
+        raise _rate_error(
+            "Too many password-reset requests. Try again later.",
+            "password_reset_rate_limited",
+            now,
+            oldest + timedelta(hours=1),
         )
     _record_event(session, "password_reset_request", normalized_email, client_ip)
     user = session.scalar(

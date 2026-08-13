@@ -72,16 +72,23 @@ Testing and quality:
 
 ## Current status
 
-Milestone 6 is implemented on the authenticated PostgreSQL platform. Each
+Milestone 7 is implemented on the authenticated PostgreSQL platform. Each
 business has one authoritative `PENDING`, `ACTIVE`, or `DISABLED` status;
 `is_active` is derived only for response compatibility. Controlled direct
 PostgreSQL administration performs manual activation, disabling, and re-enabling
 with permanent append-only internal history. Owner chat requires a complete,
-confirmed `ACTIVE` business and `FULL_ACCESS` membership.
+confirmed `ACTIVE` business and `FULL_ACCESS` membership. PostgreSQL now enforces
+registration and owner-generation limits plus per-business local-day AI token
+allowances with leased reservations, a protected 25% owner reserve, permanent
+allowance-change audit, and privacy-minimal retained accounting. The API also has
+server request IDs, CIDR-aware proxy trust, trusted hosts, streamed body limits,
+restricted CORS/docs, safe errors, security headers, and environment-aware
+redacted logging.
 
-Milestone 8 Ollama owner-chat connectivity was completed early, and much of the
-Milestone 10 provider abstraction is already present. Unrelated later roadmap
-work remains planned rather than complete.
+Milestone 8 Ollama owner-chat connectivity was completed early. Much of the
+Milestone 10 provider abstraction, and the usage/cost-control portion of
+Milestone 20, is also present early. Unrelated later roadmap work remains planned
+rather than complete.
 
 The current repository does not yet contain:
 
@@ -174,14 +181,27 @@ Authentication identifies the user; it does not by itself grant access to a busi
 Online payments are not implemented for the MVP. Lifecycle reasons are internal
 and are not exposed through owner-facing APIs.
 
-### Milestone 7: API security foundation
+### Milestone 7: API security foundation - Complete
 
-* Standardize request validation and API error responses.
-* Configure CORS, trusted hosts, proxy behavior, and request limits by environment.
-* Add rate limiting to authentication, generation, and upload endpoints.
-* Add correlation IDs and safe structured logging.
-* Prevent passwords, tokens, connection strings, credentials, and sensitive tool arguments from entering logs.
-* Test malformed requests, unauthorized access, rate limits, and safe errors.
+* Standardize validation and safe error envelopes with a server-generated request
+  UUID on every response.
+* Enforce explicit CORS, trusted hosts, CIDR-based proxy trust, streamed 65,536-byte
+  request bodies, security headers, and environment-controlled API documentation.
+* Apply PostgreSQL-backed concurrent registration and owner-generation limits with
+  stable `429` errors, reset metadata, and `Retry-After`.
+* Give every business a protected 20,000-token local-day allowance, 25% owner
+  reserve, leased pre-generation reservations, atomic reconciliation, and an
+  authenticated tenant-scoped current-usage endpoint.
+* Change allowances only through the restricted database operator function and
+  retain permanent append-only audit history.
+* Retain owner burst events for 24 hours, registration events for 48 hours,
+  detailed AI usage for 90 days, and daily summaries for 12 months through
+  PostgreSQL-coordinated best-effort maintenance without an internal scheduler.
+* Emit readable safe development logs, quiet test logs, and one JSON object per
+  production event with central defense-in-depth secret redaction.
+
+Upload-specific limits remain deferred to Milestone 12 because no upload endpoint
+exists. Customer and WhatsApp limits remain deferred to Milestone 19.
 
 ### Milestone 8: Local Ollama connectivity
 
@@ -285,6 +305,17 @@ The first integration proves the contract and adapter design. Sou2AI will add co
 * Define retention, short-term context, and limited approved long-term memory.
 * Prevent cross-business conversation access.
 * Never allow memory or a previous AI answer to override current structured data, retrieved sources, or live tool results.
+* Keep the latest 12 messages verbatim and compress older messages into a short
+  rolling summary with a checkpoint of the latest summarized sequence.
+* Never delete original messages because of summarization; update summaries in
+  controlled batches and preserve the last valid summary on failure.
+* Charge summary-generation tokens to the business allowance and scope summaries
+  by tenant, channel, and conversation.
+* Never leak customer conversations into owner or other customer context. Treat
+  summaries as untrusted conversational context: current profile data, approved
+  knowledge, RAG sources, and live tool results override them.
+* Test summary ordering, concurrency, retry, isolation, and hallucination
+  boundaries.
 
 ### Milestone 19: External customer messaging integrations
 
@@ -293,6 +324,15 @@ The first integration proves the contract and adapter design. Sou2AI will add co
 * Separate external-customer permissions from owner-only tools and information.
 * Add rate limits, deduplication, retry handling, human handoff, and privacy rules.
 * Preserve message source, answer sources, and safe tool traceability.
+* Keep the owner-generation limit separate from customer limits; scope
+  customer/WhatsApp limits per customer conversation and add an aggregate
+  business customer-channel burst limit.
+* Deduplicate webhook deliveries before counting them. Rejected pre-generation
+  messages consume no AI tokens.
+* Share the daily business token allowance across every channel while preventing
+  customers from consuming the owner reserve.
+* Decide exact customer and WhatsApp ceilings when their webhook and concurrency
+  architecture is implemented.
 
 ### Milestone 20: Production readiness and cloud deployment
 
@@ -303,6 +343,11 @@ The first integration proves the contract and adapter design. Sou2AI will add co
 * Add per-business usage limits and cloud-model cost controls.
 * Run tenant-isolation, security, load, and reliability reviews before release.
 * Preserve manual offline payment for the MVP and local Ollama development.
+
+Milestone 7 implements the provider-neutral usage metadata and per-business
+allowance foundation early. It does not complete the unrelated deployment,
+monitoring, backup, cloud-provider, or operational-readiness work in this
+milestone.
 
 ## Main user use case
 

@@ -10,6 +10,7 @@ from app.api.dependencies import (
     get_client_ip,
     get_current_user,
     run_authentication_event_cleanup,
+    run_security_record_cleanup,
 )
 from app.core.config import Settings, get_settings
 from app.core.exceptions import ApplicationError
@@ -86,10 +87,13 @@ def _clear_refresh_cookie(response: Response, settings: Settings) -> None:
     "/register",
     response_model=MessageResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(run_security_record_cleanup)],
 )
 def register(
     body: RegistrationRequest,
+    request: Request,
     session: DatabaseSession,
+    settings: AppSettings,
     email_service: TransactionalEmail,
 ) -> MessageResponse:
     register_user(
@@ -99,6 +103,7 @@ def register(
         last_name=body.last_name,
         email=body.email,
         password=body.password,
+        client_ip=get_client_ip(request, settings),
     )
     return MessageResponse(message=CHECK_EMAIL_MESSAGE)
 

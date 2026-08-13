@@ -605,7 +605,7 @@ def test_cleanup_failure_is_private_and_does_not_bypass_rate_limit(
     responses.append(limited)
 
     assert limited.status_code == 429
-    assert limited.json()["error"]["code"] == "rate_limited"
+    assert limited.json()["error"]["code"] == "password_reset_rate_limited"
     assert cleanup_attempts == 1
     assert warnings == [("Authentication-event cleanup failed.", ())]
     logged_text = repr(warnings)
