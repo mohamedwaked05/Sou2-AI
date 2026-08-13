@@ -6,6 +6,10 @@ from collections.abc import Generator
 import pytest
 from alembic import command
 from alembic.config import Config
+from app.agent.owner_chat_provider import (
+    DeterministicMockOwnerChatProvider,
+    get_owner_chat_provider,
+)
 from app.core.config import Settings, get_settings
 from app.database.session import ensure_test_database_url, get_db_session
 from app.main import app
@@ -86,6 +90,9 @@ def api_client(
 
     app.dependency_overrides[get_db_session] = override_session
     app.dependency_overrides[get_email_service] = lambda: email_service
+    app.dependency_overrides[get_owner_chat_provider] = (
+        DeterministicMockOwnerChatProvider
+    )
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
         yield client
     app.dependency_overrides.clear()

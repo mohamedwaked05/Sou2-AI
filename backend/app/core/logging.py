@@ -7,6 +7,10 @@ def configure_logging(log_level: str) -> None:
     """Configure timestamped console logging without adding duplicate handlers."""
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level.upper())
+    # HTTP client request logs include local provider URLs; provider services emit
+    # their own privacy-safe operational reasons instead.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     handler = next(
         (

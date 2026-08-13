@@ -1,13 +1,16 @@
 """Milestone 5 owner chat, knowledge, idempotency, and isolation tests."""
 
+import json
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from threading import Barrier, Event, Lock
 
+import httpx
 import pytest
 from app.agent.owner_chat_provider import (
+    OllamaOwnerChatProvider,
     OwnerChatProviderTimeout,
     OwnerChatRequest,
     OwnerChatResult,
@@ -35,6 +38,7 @@ from tests.test_business_api import (
     create_draft,
     create_user,
     headers,
+    valid_hours,
 )
 
 
@@ -304,6 +308,104 @@ def test_provider_failure_keeps_one_owner_message_and_retry_reuses_it(
     retried = submit(api_client, user, business["id"], "Please remember this")
     assert retried.status_code == 200
     assert db_session.scalar(select(func.count()).select_from(OwnerChatMessage)) == 2
+
+
+def test_ollama_connection_failure_is_safe_and_retry_is_idempotent(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email="ollama-failure@example.com",
+        name="Ollama Failure Market",
+    )
+
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    provider = OllamaOwnerChatProvider(
+        base_url="http://ollama.invalid",
+        model="qwen2.5:7b",
+        timeout_seconds=120,
+        transport=httpx.MockTransport(unavailable),
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+
+    failed = submit(
+        api_client, user, business["id"], "Use the local model", key="ollama-retry"
+    )
+
+    assert failed.status_code == 503
+    assert failed.json()["error"]["code"] == "assistant_unavailable"
+    messages = db_session.scalars(select(OwnerChatMessage)).all()
+    assert len(messages) == 1
+    assert messages[0].role == ChatMessageRole.OWNER
+
+    app.dependency_overrides[get_owner_chat_provider] = lambda: CapturingProvider()
+    retried = submit(
+        api_client, user, business["id"], "Use the local model", key="ollama-retry"
+    )
+    assert retried.status_code == 200
+    assert db_session.scalar(select(func.count()).select_from(OwnerChatMessage)) == 2
+
+
+def test_mocked_ollama_answers_saturday_hours_from_business_schedule(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email="ollama-hours@example.com",
+        name="Ollama Hours Market",
+    )
+    working_hours = valid_hours()
+    working_hours[5] = {
+        "weekday": "SATURDAY",
+        "is_closed": False,
+        "shifts": [{"start": "09:00", "end": "14:00"}],
+    }
+    updated = api_client.patch(
+        f"/api/v1/businesses/{business['id']}",
+        headers=headers(user),
+        json={"working_hours": working_hours},
+    )
+    assert updated.status_code == 200, updated.text
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        system = payload["messages"][0]["content"]
+        assert '"weekday":"saturday","is_open":true' in system
+        assert '"start":"09:00","end":"14:00"' in system
+        content = {
+            "reply": "Your business is open on Saturday from 9:00 AM to 2:00 PM.",
+            "proposed_knowledge": [],
+        }
+        return httpx.Response(
+            200,
+            json={"message": {"role": "assistant", "content": json.dumps(content)}},
+        )
+
+    provider = OllamaOwnerChatProvider(
+        base_url="http://ollama.invalid",
+        model="qwen2.5:7b",
+        timeout_seconds=120,
+        transport=httpx.MockTransport(answer),
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "What are my business opening hours on Saturday?",
+        key="saturday-hours-unique",
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["assistant_message"]["content"] == (
+        "Your business is open on Saturday from 9:00 AM to 2:00 PM."
+    )
+    assert response.json()["replayed"] is False
 
 
 def test_context_uses_latest_twelve_messages_and_excludes_expired_knowledge(

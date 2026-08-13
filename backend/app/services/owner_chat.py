@@ -13,7 +13,7 @@ from fastapi import status
 from sqlalchemy import and_, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.agent.owner_chat_provider import (
     OwnerChatProvider,
@@ -24,6 +24,8 @@ from app.agent.owner_chat_provider import (
     ProviderBusinessProfile,
     ProviderKnowledge,
     ProviderMessage,
+    ProviderWorkingDay,
+    ProviderWorkingShift,
 )
 from app.core.config import Settings
 from app.core.exceptions import ApplicationError
@@ -31,6 +33,7 @@ from app.core.security import utc_now
 from app.database.models import (
     Business,
     BusinessKnowledge,
+    BusinessOpeningDay,
     ChatGenerationState,
     ChatMessageRole,
     OwnerChatMessage,
@@ -49,6 +52,15 @@ from app.services.businesses import load_full_access_business
 
 CHAT_CONTEXT_MESSAGE_LIMIT = 12
 HISTORY_PAGE_SIZE = 50
+PROVIDER_WEEKDAYS = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
 
 
 @dataclass(frozen=True)
@@ -254,7 +266,14 @@ def _build_provider_request(
     settings: Settings,
 ) -> OwnerChatRequest:
     owner_message = session.get(OwnerChatMessage, owner_message_id)
-    business = session.get(Business, business_id)
+    business = session.scalar(
+        select(Business)
+        .where(Business.id == business_id)
+        .options(
+            selectinload(Business.opening_days).selectinload(BusinessOpeningDay.shifts)
+        )
+        .execution_options(populate_existing=True)
+    )
     if owner_message is None or business is None:
         raise _provider_unavailable()
     messages = session.scalars(
@@ -290,6 +309,22 @@ def _build_provider_request(
             city=business.city or "",
             address_line=business.address_line or "",
             timezone=business.timezone,
+            working_hours=tuple(
+                ProviderWorkingDay(
+                    weekday=PROVIDER_WEEKDAYS[day.day_of_week],
+                    is_open=day.is_open,
+                    shifts=tuple(
+                        ProviderWorkingShift(
+                            start=shift.opens_at,
+                            end=shift.closes_at,
+                        )
+                        for shift in sorted(day.shifts, key=lambda item: item.opens_at)
+                    ),
+                )
+                for day in sorted(
+                    business.opening_days, key=lambda item: item.day_of_week
+                )
+            ),
         ),
         knowledge=_select_relevant_knowledge(knowledge, owner_message.content),
         messages=tuple(

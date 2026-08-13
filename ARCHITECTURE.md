@@ -255,11 +255,20 @@ upserts, and completion commit atomically. Different conversations do not block
 one another. Redis, queues, workers, sticky sessions, and process-local locks are
 not used.
 
-The provider boundary accepts a provider-neutral business profile, bounded active
-knowledge, ordered messages, and request time. It returns an English reply and
-structured proposed facts. Milestone 5 supplies only a deterministic offline mock
-and safe timeout, unavailable, and invalid-response errors. Cloud and Ollama
-providers remain future implementations behind the same boundary.
+The provider boundary accepts a provider-neutral business profile with all seven
+working days and ordered local-time shifts, bounded active knowledge, ordered
+messages, and request time. It returns an English reply and structured proposed
+facts. The deterministic offline mock remains the default.
+The optional local Ollama implementation sends one non-streaming `/api/chat`
+request to configurable `qwen2.5:7b`, validates its JSON-schema response, and maps
+timeouts, missing models, unavailability, HTTP failures, and invalid output to the
+same safe provider errors. Routes, orchestration, and persistence remain
+provider-neutral. Backend startup performs no provider probe.
+
+Ollama calls use a 120-second default timeout. The persisted generation lease
+defaults to 150 seconds and must exceed the Ollama timeout, so another replica
+cannot reclaim a turn while the first provider call is still within its deadline.
+Automated tests use mocked HTTP transports and never call the local service.
 
 `business_knowledge` stores a tenant-unique normalized subject, content, allowed
 category, owner-chat provenance, lifecycle, expiry, and timestamps. Permanent
@@ -306,9 +315,9 @@ Docker Compose persists `sou2ai_dev` in a named volume and creates isolated
 ## 15. Model-provider boundary and future deployment
 
 React may be hosted separately, FastAPI may run on a cloud server, and PostgreSQL
-may become managed. Ollama is only the local-development and early-testing
-provider. Production will use a cloud provider behind a provider abstraction, so
-database and domain code must never depend on Ollama or a particular model.
+may become managed. Ollama is implemented only as an opt-in local-development
+provider. Production will use a future approved cloud provider behind the same
+abstraction, so database and domain code do not depend on Ollama or a model.
 WhatsApp is a future input channel, not the core system.
 
 ## 16. Current implementation boundary
@@ -317,6 +326,6 @@ The repository contains the FastAPI/PostgreSQL platform foundation, user
 authentication, multi-business management, tenant-scoped authorization, resumable
 onboarding, one owner conversation per business, ordered persistent owner chat, a
 deterministic mock provider, and managed permanent/temporary learned knowledge.
-Cloud or Ollama connectivity, pgvector, RAG, live tools and analytics, customer
+Cloud-provider connectivity, pgvector, RAG, live tools and analytics, customer
 chat, documents, billing, activation APIs, and frontend functionality remain
 future work.

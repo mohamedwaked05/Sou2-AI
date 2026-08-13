@@ -34,9 +34,11 @@ class Settings(BaseSettings):
         ]
     )
     log_level: str = "INFO"
-    ollama_base_url: str = "http://localhost:11434"
+    owner_chat_provider: Literal["mock", "ollama"] = "mock"
+    ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_chat_model: str = "qwen2.5:7b"
     ollama_embedding_model: str = "bge-m3"
+    ollama_request_timeout_seconds: int = Field(default=120, ge=1)
     postgresql_database_url: str = (
         "postgresql+psycopg://sou2ai:sou2ai_local@127.0.0.1:5433/sou2ai_dev"
     )
@@ -73,7 +75,7 @@ class Settings(BaseSettings):
     verification_link_path: str = "/verify-email"
     password_reset_link_path: str = "/reset-password"
     owner_chat_knowledge_context_limit: int = Field(default=100, ge=1, le=200)
-    owner_chat_generation_lease_seconds: int = Field(default=30, ge=5, le=300)
+    owner_chat_generation_lease_seconds: int = Field(default=150, ge=5, le=300)
     owner_chat_generation_wait_seconds: int = Field(default=30, ge=1, le=300)
 
     @field_validator("allowed_cors_origins", mode="before")
@@ -100,6 +102,15 @@ class Settings(BaseSettings):
         """Reject development-only authentication settings in production."""
         if self.refresh_cookie_samesite == "none" and not self.refresh_cookie_secure:
             raise ValueError("SameSite=None requires REFRESH_COOKIE_SECURE=true.")
+        if (
+            self.owner_chat_provider == "ollama"
+            and self.owner_chat_generation_lease_seconds
+            <= self.ollama_request_timeout_seconds
+        ):
+            raise ValueError(
+                "OWNER_CHAT_GENERATION_LEASE_SECONDS must exceed "
+                "OLLAMA_REQUEST_TIMEOUT_SECONDS when using Ollama."
+            )
         if self.environment.lower() != "production":
             return self
         if self.access_token_secret.get_secret_value().startswith("development-only"):

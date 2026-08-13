@@ -74,14 +74,13 @@ Testing and quality:
 
 Milestone 5, owner chat and learned business knowledge, is implemented on the
 authenticated PostgreSQL platform. Each isolated business has one private owner
-conversation, persistent messages, idempotent ordered generation through an
-offline deterministic provider, and owner-reviewable permanent or expiring facts.
+conversation, persistent messages, configurable deterministic-mock or local
+Ollama generation, and owner-reviewable permanent or expiring facts.
 Chat requires a complete, manually active business and `FULL_ACCESS` membership.
 
 The current repository does not yet contain:
 
 * pgvector integration
-* Ollama connectivity
 * Embeddings
 * RAG
 * Agent tools
@@ -136,8 +135,8 @@ Authentication identifies the user; it does not by itself grant access to a busi
 
 * Provide exactly one private main owner conversation for every business.
 * Persist owner and assistant messages and return stable 50-message cursor pages.
-* Send only the newest 12 messages through a replaceable provider contract,
-  implemented here by a deterministic offline mock.
+* Send only the newest 12 messages through a replaceable provider contract, with
+  the deterministic offline mock as default and local Ollama as an opt-in provider.
 * Require authentication, `FULL_ACCESS`, profile completion, and existing manual
   activation before chat.
 * Enforce database idempotency and PostgreSQL-backed ordered generation across API
@@ -149,6 +148,8 @@ Authentication identifies the user; it does not by itself grant access to a busi
   and appointment availability; future controlled integrations remain their source.
 * Prevent active businesses from becoming profile-incomplete through profile or
   schedule edits.
+* Support opt-in local `qwen2.5:7b` owner-chat generation through Ollama while
+  retaining the deterministic mock as the default provider.
 
 ### Milestone 6: Business lifecycle and manual activation
 
@@ -172,11 +173,10 @@ A graphical admin dashboard and online payments are not required for the MVP.
 
 ### Milestone 8: Local Ollama connectivity
 
-* Connect FastAPI to the configurable local Ollama HTTP API.
-* Verify Qwen2.5 7B availability and add a minimal model-status service.
-* Add an authenticated test-generation endpoint behind an application service.
-* Handle provider unavailability, missing models, timeouts, and invalid responses.
-* Mock Ollama in automated tests.
+The owner-chat path now connects to the configurable local Ollama HTTP API through
+the provider boundary, uses `qwen2.5:7b`, handles provider failures, and uses mocked
+HTTP transports in automated tests. It does not add startup probes, a model-status
+endpoint, or a separate generation-demo endpoint.
 
 This milestone does not add RAG, memory, agent tools, or business-answering logic.
 

@@ -5,13 +5,14 @@ Sou2AI is a local AI assistant planned for small businesses, with future support
 ## Current milestone
 
 Milestone 5 adds one private owner conversation per business, persistent ordered
-messages, a replaceable generation-provider contract, and a deterministic offline
-mock provider. Chat requires an authenticated `FULL_ACCESS` membership plus a
+messages, a replaceable generation-provider contract, a deterministic offline
+mock provider, and opt-in local Ollama generation. Chat requires an authenticated
+`FULL_ACCESS` membership plus a
 currently complete and manually active business. It also adds permanent and
 expiring learned business knowledge with owner list, edit, and delete operations.
 
 It does **not** include customer chat, activation/admin APIs, cloud or paid model
-providers, Ollama connectivity, RAG, embeddings, pgvector, documents, operational
+providers, RAG, embeddings, pgvector, documents, operational
 integrations or analytics, tool execution, payments, frontend code, invitations,
 or additional roles.
 
@@ -77,6 +78,58 @@ uvicorn app.main:app --reload
 ```
 
 Open Swagger UI at <http://127.0.0.1:8000/docs>.
+
+### Optional local Ollama owner chat
+
+Owner chat defaults to `OWNER_CHAT_PROVIDER=mock`, which is deterministic and
+offline. To use the local complete-response provider, install/start Ollama and run:
+
+```powershell
+ollama list
+ollama pull qwen2.5:7b
+ollama run qwen2.5:7b
+```
+
+`ollama list` verifies service availability and installed models; `ollama run`
+provides a quick direct model check. Do not substitute `qwen2.5-coder:7b` for owner
+chat. Configure the backend before starting it:
+
+```powershell
+$env:OWNER_CHAT_PROVIDER = "ollama"
+$env:OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+$env:OLLAMA_CHAT_MODEL = "qwen2.5:7b"
+$env:OLLAMA_REQUEST_TIMEOUT_SECONDS = "120"
+$env:OWNER_CHAT_GENERATION_LEASE_SECONDS = "150"
+uvicorn app.main:app --reload
+```
+
+Startup does not contact Ollama. The service is called only for eligible owner-chat
+generation, with `stream: false`; the API waits for one complete response. A
+missing model or unavailable service returns the same retryable safe `503` as other
+provider failures. Models are never pulled automatically.
+
+For an opt-in end-to-end check, first authenticate, complete and manually activate
+a test business through the existing workflow. Put only temporary values in the
+current PowerShell process, then submit and read the persisted conversation:
+
+```powershell
+$env:SOU2AI_ACCESS_TOKEN = "replace-with-temporary-access-token"
+$env:SOU2AI_BUSINESS_ID = "replace-with-active-business-uuid"
+$headers = @{ Authorization = "Bearer $env:SOU2AI_ACCESS_TOKEN" }
+$body = @{
+    idempotency_key = [guid]::NewGuid().ToString()
+    content = "What are my business opening hours on Saturday?"
+} | ConvertTo-Json
+$base = "http://127.0.0.1:8000/api/v1/businesses/$env:SOU2AI_BUSINESS_ID"
+Invoke-RestMethod -Method Post -Uri "$base/owner-chat/messages" `
+    -Headers $headers -ContentType "application/json" -Body $body
+Invoke-RestMethod -Method Get -Uri "$base/owner-chat/messages" -Headers $headers
+```
+
+Use a new idempotency key for each new owner message; reusing the same key and
+content intentionally returns the already stored turn with `replayed: true`. Do
+not save or commit access tokens. Normal automated tests use mocked HTTP transports
+and never contact `127.0.0.1:11434`.
 
 Endpoints:
 
@@ -190,6 +243,14 @@ after a crashed claimant, while `OWNER_CHAT_GENERATION_WAIT_SECONDS` bounds inli
 waiting. This coordinates independent replicas without Redis, workers,
 process-local locks, or holding a pooled connection during provider work.
 
+Provider selection is `OWNER_CHAT_PROVIDER=mock|ollama`. Ollama uses the configured
+base URL and model, a 120-second default HTTP timeout, JSON-schema structured
+output, and complete non-streaming responses. Its generation lease defaults to 150
+seconds and must exceed the HTTP timeout. The application still validates every
+proposed fact and remains authoritative for allowed knowledge categories. The
+provider-neutral business profile includes the authoritative seven-day stored
+schedule, including closed days and chronologically ordered local-time shifts.
+
 Learned facts have a normalized tenant-unique subject, allowed stable category,
 owner-chat provenance, and permanent or temporary lifecycle. Temporary facts need
 a future timezone-aware expiry; explicit “today” uses the business timezone.
@@ -219,6 +280,8 @@ scheduler will call the existing retention operation.
 
 ## Implementation boundary
 
-Milestone 5 is complete. Later RAG, documents, model connectivity, controlled live
-tools and analytics, customer channels, and frontend work remain planned only.
+Milestone 5 and its optional local Ollama provider are complete. Later RAG,
+documents, cloud model connectivity, controlled live tools and analytics, customer
+channels, and frontend work remain planned only. Ollama is a local-development
+provider, not the production deployment decision.
 Authentication alone never grants business access without membership.
