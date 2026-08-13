@@ -70,6 +70,8 @@ def normalize_cors_origin(value: str) -> tuple[str, str]:
         or parsed.query
         or parsed.fragment
         or raw_origin == "*"
+        or parsed.netloc.endswith(":")
+        or (port is not None and not 1 <= port <= 65_535)
     ):
         raise ValueError("ALLOWED_CORS_ORIGINS must contain explicit HTTP(S) origins.")
     try:

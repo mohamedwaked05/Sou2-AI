@@ -249,6 +249,44 @@ def test_production_rejects_local_or_malformed_cors_origins(origin: str) -> None
         production_settings(allowed_cors_origins=[origin])
 
 
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://app.example.com:",
+        "http://app.example.com:",
+        "http://127.0.0.1:",
+        "http://[::1]:",
+        "https://[2001:db8::1]:",
+        "https://app.example.com:0",
+        "https://app.example.com:65536",
+        "https://app.example.com:not-a-port",
+        "https://[2001:db8::1",
+        "https://[not-ipv6]:443",
+    ],
+)
+def test_cors_origins_reject_empty_or_invalid_ports(origin: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, allowed_cors_origins=[origin])
+
+
+@pytest.mark.parametrize(
+    ("origin", "normalized"),
+    [
+        ("https://app.example.com", "https://app.example.com"),
+        ("https://app.example.com/", "https://app.example.com"),
+        ("https://app.example.com:443", "https://app.example.com"),
+        ("http://app.example.com:80", "http://app.example.com"),
+        ("https://app.example.com:8443", "https://app.example.com:8443"),
+        ("https://[2001:db8::1]:8443", "https://[2001:db8::1]:8443"),
+    ],
+)
+def test_production_cors_origins_accept_complete_valid_ports(
+    origin: str, normalized: str
+) -> None:
+    settings = production_settings(allowed_cors_origins=[origin])
+    assert settings.allowed_cors_origins == [normalized]
+
+
 def test_cors_origins_normalize_valid_domains_and_allow_development_loopback() -> None:
     production = production_settings(
         allowed_cors_origins=["HTTPS://App.Example.COM.:443/"]

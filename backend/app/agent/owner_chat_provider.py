@@ -451,7 +451,7 @@ class OllamaOwnerChatProvider:
             response_payload = self._safe_response_payload(response)
             usage = self._authoritative_usage(response_payload)
             if response.status_code >= 400:
-                reason = self._http_error_reason(response_payload)
+                reason = self._http_error_reason(response.status_code, response_payload)
                 logger.warning("Owner chat provider failed: reason=%s", reason)
                 raise OwnerChatProviderUnavailable(
                     usage=usage,
@@ -614,11 +614,15 @@ class OllamaOwnerChatProvider:
         )
 
     @staticmethod
-    def _http_error_reason(payload: object | None) -> str:
+    def _http_error_reason(status_code: int, payload: object | None) -> str:
         if not isinstance(payload, dict):
             return "http_error"
         error = str(payload.get("error", "")).casefold()
-        if "model" in error and ("not found" in error or "does not exist" in error):
+        if (
+            status_code == 404
+            and "model" in error
+            and ("not found" in error or "does not exist" in error)
+        ):
             return "model_missing"
         return "http_error"
 

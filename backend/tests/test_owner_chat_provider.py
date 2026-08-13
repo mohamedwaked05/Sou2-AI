@@ -560,7 +560,18 @@ def test_ollama_failures_map_to_safe_provider_errors(
         ),
         (
             httpx.MockTransport(
-                lambda request: httpx.Response(500, text="private provider failure")
+                lambda request: httpx.Response(
+                    500, json={"error": "model qwen2.5:7b not found"}
+                )
+            ),
+            OwnerChatProviderUnavailable,
+            True,
+        ),
+        (
+            httpx.MockTransport(
+                lambda request: httpx.Response(
+                    503, json={"error": "model does not exist"}
+                )
             ),
             OwnerChatProviderUnavailable,
             True,
@@ -614,6 +625,25 @@ def test_invalid_structured_response_preserves_authoritative_usage() -> None:
     assert raised.value.usage.authoritative is True
 
 
+def test_http_failure_preserves_authoritative_usage() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            500,
+            json={
+                "error": "model qwen2.5:7b not found",
+                "prompt_eval_count": 31,
+                "eval_count": 7,
+            },
+        )
+    )
+    with pytest.raises(OwnerChatProviderUnavailable) as raised:
+        ollama_provider(transport).generate(provider_request())
+    assert raised.value.usage is not None
+    assert raised.value.usage.total_tokens == 38
+    assert raised.value.usage.authoritative is True
+    assert raised.value.usage_uncertain is True
+
+
 def test_invalid_response_without_usage_is_uncertain() -> None:
     transport = httpx.MockTransport(
         lambda request: httpx.Response(200, content=b"not-json")
@@ -624,8 +654,14 @@ def test_invalid_response_without_usage_is_uncertain() -> None:
     assert raised.value.usage_uncertain is True
 
 
-def test_missing_model_logs_only_safe_machine_reason(
+@pytest.mark.parametrize(
+    ("status_code", "expected_reason"),
+    [(404, "model_missing"), (500, "http_error")],
+)
+def test_http_errors_log_only_safe_machine_reason(
     monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    expected_reason: str,
 ) -> None:
     logged: list[tuple[object, ...]] = []
     monkeypatch.setattr(
@@ -633,13 +669,13 @@ def test_missing_model_logs_only_safe_machine_reason(
         "warning",
         lambda *arguments: logged.append(arguments),
     )
+    private_error = "model qwen2.5:7b not found; private-provider-detail"
     transport = httpx.MockTransport(
-        lambda request: httpx.Response(
-            404, json={"error": "model qwen2.5:7b not found"}
-        )
+        lambda request: httpx.Response(status_code, json={"error": private_error})
     )
 
     with pytest.raises(OwnerChatProviderUnavailable):
         ollama_provider(transport).generate(provider_request())
 
-    assert logged == [("Owner chat provider failed: reason=%s", "model_missing")]
+    assert logged == [("Owner chat provider failed: reason=%s", expected_reason)]
+    assert private_error not in repr(logged)

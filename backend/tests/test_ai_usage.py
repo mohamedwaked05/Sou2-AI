@@ -246,9 +246,39 @@ def test_provider_failures_release_or_charge_reported_usage(
             0,
         ),
         (
-            httpx.MockTransport(lambda request: httpx.Response(500, text="failure")),
+            httpx.MockTransport(
+                lambda request: httpx.Response(
+                    500,
+                    json={
+                        "error": "model qwen2.5:7b not found; private-provider-detail"
+                    },
+                )
+            ),
             "charged",
             None,
+        ),
+        (
+            httpx.MockTransport(
+                lambda request: httpx.Response(
+                    503, json={"error": "model does not exist"}
+                )
+            ),
+            "charged",
+            None,
+        ),
+        (
+            httpx.MockTransport(
+                lambda request: httpx.Response(
+                    500,
+                    json={
+                        "error": "model qwen2.5:7b not found",
+                        "prompt_eval_count": 31,
+                        "eval_count": 7,
+                    },
+                )
+            ),
+            "charged",
+            38,
         ),
         (
             httpx.MockTransport(
@@ -308,7 +338,10 @@ def test_ollama_failure_reservation_accounting(
     response = submit(api_client, user, business["id"], "provider accounting")
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "assistant_unavailable"
-    assert "failure" not in response.text
+    assert response.json()["error"]["message"] == (
+        "The assistant is temporarily unavailable. Please retry."
+    )
+    assert "private-provider-detail" not in response.text
     with migration_engine.connect() as connection:
         reservation = connection.execute(
             text("SELECT * FROM ai_usage_reservations")
@@ -338,9 +371,9 @@ def test_reported_failure_reconciles_once_and_retry_preserves_first_charge(
         calls += 1
         if calls == 1:
             return httpx.Response(
-                200,
+                500,
                 json={
-                    "message": {"role": "assistant", "content": "bad"},
+                    "error": "model qwen2.5:7b not found",
                     "prompt_eval_count": 10,
                     "eval_count": 2,
                 },
