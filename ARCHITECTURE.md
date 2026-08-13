@@ -192,13 +192,31 @@ the required operator identifier and reason; permits only `PENDING -> ACTIVE`,
 inserts exactly one history row. Activation and re-enabling reuse the authoritative
 database profile-completion function and also require `onboarding_submitted_at`.
 
-Triggers reject direct status changes, non-pending inserts, and ordinary history
-inserts, updates, or deletes. History references businesses with `ON DELETE
-RESTRICT`, matching permanent audit integrity: a business with lifecycle history
-cannot be deleted unless project policy is deliberately changed in a future
-migration. Owner-facing APIs expose status and derived activity only, never audit
-operators or reasons. Pending and disabled businesses cannot use owner chat or
-future paid AI capabilities. No admin HTTP endpoint, role, or dashboard exists.
+PostgreSQL privilege separation is the authorization boundary. The trusted local
+Docker bootstrap login runs Alembic, while the `NOLOGIN` `sou2ai_migrator` role owns
+the protected tables, enum, triggers, and `SECURITY DEFINER` lifecycle function.
+FastAPI connects through a non-superuser login that inherits only
+`sou2ai_runtime`; its column-level business update grant excludes `status`, it has
+no lifecycle-history mutation grants, and it cannot execute the lifecycle
+function. The SQLAlchemy connection setup also fails closed if FastAPI is pointed
+at a superuser, migrator, or operator role. A separate non-superuser operator login
+inherits only `sou2ai_lifecycle_operator`, which can execute the function but
+cannot update the table or mutate history directly. The function is fully
+qualified, has fixed `search_path = pg_catalog`, and is not executable by `PUBLIC`.
+Schema creation is also revoked from runtime, operator, and `PUBLIC`, preventing
+function replacement.
+Former custom lifecycle GUCs are not authorization controls and are no longer used.
+
+A trigger still rejects non-pending inserts, and append-only triggers provide
+defense in depth against history updates, deletes, and truncation. Privileges deny
+ordinary history inserts. History references businesses with `ON DELETE RESTRICT`,
+matching permanent audit integrity: a business with lifecycle history cannot be
+deleted unless project policy is deliberately changed in a future migration.
+Owner-facing APIs expose status and derived activity only, never audit operators or
+reasons. Pending and disabled businesses cannot use owner chat or future paid AI
+capabilities. PostgreSQL superusers remain trusted bootstrap administrators and
+cannot be restricted by database ACLs. No admin HTTP endpoint, application admin
+role, or dashboard exists.
 
 Business names trim outer whitespace, collapse internal whitespace, and compare
 case-insensitively while preserving punctuation. Immutable `owner_user_id` supports
@@ -328,9 +346,12 @@ flowchart TD
 ```
 
 Docker Compose persists `sou2ai_dev` in a named volume and creates isolated
-`sou2ai_test` automatically. Tests reject any database name other than
-`sou2ai_test`. `GET /api/v1/health/database` performs `SELECT 1` and returns only
-`healthy` or `unavailable` without connection details.
+`sou2ai_test` automatically. Its initialization also provisions distinct local
+runtime and lifecycle-operator logins backed by `NOLOGIN` privilege roles. Alembic
+uses a separate bootstrap URL; FastAPI uses only the restricted runtime URL. Tests
+reject any database name other than `sou2ai_test` and exercise lifecycle attacks
+through the real non-superuser logins. `GET /api/v1/health/database` performs
+`SELECT 1` and returns only `healthy` or `unavailable` without connection details.
 
 ## 15. Model-provider boundary and future deployment
 

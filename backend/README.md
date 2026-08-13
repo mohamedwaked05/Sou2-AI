@@ -34,6 +34,13 @@ Copy-Item .env.example .env
 
 Edit `.env` only for local configuration. Do not commit it. The default CORS origins target a future local React development server. In production, set `ALLOWED_CORS_ORIGINS` to explicit trusted origins; wildcard origins are rejected.
 
+The API's `POSTGRESQL_DATABASE_URL` must use the restricted runtime login. Keep
+`MIGRATION_POSTGRESQL_DATABASE_URL` and lifecycle-operator credentials out of the
+FastAPI process environment in deployed environments; they are separate
+administrative credentials, not application configuration. Runtime connections
+fail closed when configured as a PostgreSQL superuser, migrator, or lifecycle
+operator.
+
 Authentication also requires a strong `ACCESS_TOKEN_SECRET` and Resend settings.
 For initial Resend testing, `onboarding@resend.dev` can send only to the email
 address associated with the Resend account. To send to other recipients, verify a
@@ -56,6 +63,7 @@ From the repository root:
 ```powershell
 docker compose up -d postgres
 docker compose ps
+docker compose exec postgres pg_isready
 ```
 
 The initialization script creates `sou2ai_dev` and `sou2ai_test`. Development
@@ -63,13 +71,39 @@ data persists in the `sou2ai_postgres_data` volume. Local credentials in
 `.env.example` are development defaults only. Tests refuse to run destructive
 setup against any database not named `sou2ai_test`.
 
+For an existing named volume created before the role-separated setup, provision
+the roles and local logins idempotently once (this does not reset either database):
+
+```powershell
+docker compose exec postgres sh /docker-entrypoint-initdb.d/10-init-test-db.sh
+```
+
+The local role model is:
+
+- Docker `sou2ai`: trusted bootstrap superuser used only to initialize roles and
+  run migrations.
+- `sou2ai_migrator`: `NOLOGIN` owner of protected lifecycle objects.
+- `sou2ai_runtime`: `NOLOGIN` privileges inherited by
+  `sou2ai_runtime_login`, which FastAPI uses.
+- `sou2ai_lifecycle_operator`: `NOLOGIN` execute-only lifecycle privilege inherited
+  by `sou2ai_lifecycle_operator_login`.
+
+PostgreSQL superusers remain trusted bootstrap administrators and can bypass
+ordinary grants. Neither FastAPI nor normal lifecycle operators may use one.
+
 From `backend`, apply or roll back the schema:
 
 ```powershell
+$env:MIGRATION_POSTGRESQL_DATABASE_URL = "postgresql+psycopg://sou2ai:local-bootstrap-password@127.0.0.1:5433/sou2ai_dev"
 python -m alembic upgrade head
 python -m alembic downgrade base
 python -m alembic upgrade head
+Remove-Item Env:MIGRATION_POSTGRESQL_DATABASE_URL
 ```
+
+Use a secret-injection mechanism rather than command history for real deployment
+credentials. Alembic loads this bootstrap-only variable separately; FastAPI's
+settings object does not contain it.
 
 ## Run the API
 
@@ -159,7 +193,9 @@ Endpoints:
 ## Run tests
 
 ```powershell
-$env:TEST_POSTGRESQL_DATABASE_URL = "postgresql+psycopg://sou2ai:sou2ai_local@127.0.0.1:5433/sou2ai_test"
+$env:TEST_POSTGRESQL_DATABASE_URL = "postgresql+psycopg://sou2ai_runtime_login:sou2ai_runtime_local@127.0.0.1:5433/sou2ai_test"
+$env:TEST_MIGRATION_POSTGRESQL_DATABASE_URL = "postgresql+psycopg://sou2ai:sou2ai_local@127.0.0.1:5433/sou2ai_test"
+$env:TEST_LIFECYCLE_OPERATOR_POSTGRESQL_DATABASE_URL = "postgresql+psycopg://sou2ai_lifecycle_operator_login:sou2ai_lifecycle_operator_local@127.0.0.1:5433/sou2ai_test"
 python -m pytest
 ```
 
@@ -220,12 +256,15 @@ PostgreSQL also prevents an active business from ending a transaction with an
 incomplete profile after either profile-field or schedule edits.
 
 Lifecycle status is the only stored activation source of truth. Operators must not
-run direct `UPDATE businesses SET status = ...` statements; a database trigger
-rejects that bypass. Connect with the authorized PostgreSQL operator role and use
-the schema-qualified function with `psql` variables so values remain parameters:
+run direct `UPDATE businesses SET status = ...` statements; column privileges deny
+that bypass even if a client forges the former `sou2ai.lifecycle_*` custom settings.
+Those settings are no longer used as security controls. Connect with the restricted
+operator login and use only the schema-qualified function with `psql` variables so
+values remain parameters. `-W` prompts without placing the password in command
+history:
 
 ```powershell
-docker compose exec postgres psql -U sou2ai -d sou2ai_dev `
+docker compose exec postgres psql -U sou2ai_lifecycle_operator_login -W -d sou2ai_dev `
   -v business_id="00000000-0000-0000-0000-000000000000" `
   -v admin_identifier="operator@example.com" `
   -v reason="Offline payment received" `
@@ -237,8 +276,11 @@ same command with `DISABLED` and an appropriate reason to disable an active
 business, or with `ACTIVE` to re-enable an eligible disabled business. Allowed
 transitions are only `PENDING -> ACTIVE`, `ACTIVE -> DISABLED`, and `DISABLED ->
 ACTIVE`. Every successful call atomically writes one internal history record;
-rejected calls write none. History cannot be updated or deleted and reasons are
-never returned by owner APIs. There is no admin HTTP endpoint or dashboard.
+rejected calls write none. The operator has function execution only: it cannot
+directly update `businesses.status` or insert, update, delete, or truncate history.
+FastAPI cannot execute the function. History cannot be updated or deleted and
+reasons are never returned by owner APIs. There is no admin HTTP endpoint or
+dashboard.
 
 ## Owner chat and learned knowledge
 

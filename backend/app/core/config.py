@@ -40,10 +40,12 @@ class Settings(BaseSettings):
     ollama_embedding_model: str = "bge-m3"
     ollama_request_timeout_seconds: int = Field(default=120, ge=1)
     postgresql_database_url: str = (
-        "postgresql+psycopg://sou2ai:sou2ai_local@127.0.0.1:5433/sou2ai_dev"
+        "postgresql+psycopg://sou2ai_runtime_login:sou2ai_runtime_local@"
+        "127.0.0.1:5433/sou2ai_dev"
     )
     test_postgresql_database_url: str = (
-        "postgresql+psycopg://sou2ai:sou2ai_local@127.0.0.1:5433/sou2ai_test"
+        "postgresql+psycopg://sou2ai_runtime_login:sou2ai_runtime_local@"
+        "127.0.0.1:5433/sou2ai_test"
     )
     postgresql_connect_timeout_seconds: int = Field(default=5, ge=1)
     tool_call_audit_retention_days: int = Field(default=90, ge=1)

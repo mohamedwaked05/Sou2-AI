@@ -6,8 +6,12 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sou2ai_local}
       POSTGRES_DB: ${POSTGRES_DEV_DB:-sou2ai_dev}
       POSTGRES_TEST_DB: ${POSTGRES_TEST_DB:-sou2ai_test}
+      POSTGRES_RUNTIME_USER: ${POSTGRES_RUNTIME_USER:-sou2ai_runtime_login}
+      POSTGRES_RUNTIME_PASSWORD: ${POSTGRES_RUNTIME_PASSWORD:-sou2ai_runtime_local}
+      POSTGRES_LIFECYCLE_OPERATOR_USER: ${POSTGRES_LIFECYCLE_OPERATOR_USER:-sou2ai_lifecycle_operator_login}
+      POSTGRES_LIFECYCLE_OPERATOR_PASSWORD: ${POSTGRES_LIFECYCLE_OPERATOR_PASSWORD:-sou2ai_lifecycle_operator_local}
     ports:
-      - "127.0.0.1:5433:5432"
+      - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5433}:5432"
 
     volumes:
       - sou2ai_postgres_data:/var/lib/postgresql/data

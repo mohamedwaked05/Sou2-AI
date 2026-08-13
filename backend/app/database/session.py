@@ -3,7 +3,7 @@
 from collections.abc import Generator
 from functools import lru_cache
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -17,17 +17,53 @@ def ensure_test_database_url(database_url: str) -> None:
         raise ValueError("Tests must use the isolated sou2ai_test database.")
 
 
+def _reject_privileged_runtime_connection(
+    dbapi_connection: object, _connection_record: object
+) -> None:
+    """Fail closed if FastAPI is configured with an administrative database role."""
+    cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
+    try:
+        cursor.execute(
+            """
+            SELECT role.rolsuper OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_roles AS privileged
+                WHERE privileged.rolname IN (
+                    'sou2ai_migrator',
+                    'sou2ai_lifecycle_operator'
+                )
+                  AND pg_catalog.pg_has_role(
+                      current_user,
+                      privileged.oid,
+                      'MEMBER'
+                  )
+            )
+            FROM pg_catalog.pg_roles AS role
+            WHERE role.rolname = current_user
+            """
+        )
+        is_privileged = cursor.fetchone()[0]
+    finally:
+        cursor.close()
+    if is_privileged:
+        raise RuntimeError(
+            "FastAPI must connect with the restricted PostgreSQL runtime role."
+        )
+
+
 @lru_cache
 def get_engine() -> Engine:
     """Create one process-wide thread-safe engine and connection pool."""
     settings = get_settings()
-    return create_engine(
+    engine = create_engine(
         settings.postgresql_database_url,
         pool_pre_ping=True,
         connect_args={
             "connect_timeout": settings.postgresql_connect_timeout_seconds,
         },
     )
+    event.listen(engine, "connect", _reject_privileged_runtime_connection)
+    return engine
 
 
 @lru_cache

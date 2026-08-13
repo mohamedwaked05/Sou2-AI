@@ -197,7 +197,9 @@ def test_duplicate_membership_is_rejected(db_session: Session) -> None:
         db_session.commit()
 
 
-def test_membership_restricts_user_and_business_deletion(db_session: Session) -> None:
+def test_membership_restricts_user_and_business_deletion(
+    db_session: Session, migration_engine: Engine
+) -> None:
     user = make_user()
     business = Business(owner=user, name="Protected")
     db_session.add(BusinessMembership(user=user, business=business))
@@ -209,8 +211,8 @@ def test_membership_restricts_user_and_business_deletion(db_session: Session) ->
     db_session.rollback()
 
     with pytest.raises(IntegrityError):
-        db_session.execute(delete(Business).where(Business.id == business.id))
-        db_session.commit()
+        with migration_engine.begin() as connection:
+            connection.execute(delete(Business).where(Business.id == business.id))
 
 
 def test_business_query_indexes_exist(database_engine: Engine) -> None:

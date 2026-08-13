@@ -18,6 +18,9 @@ Customer chat, cloud providers, RAG, embeddings, pgvector,
 documents, live operational integrations and analytics, frontend functionality,
 payments, and activation/admin HTTP endpoints remain future work. Manual lifecycle
 changes use a controlled PostgreSQL function with permanent append-only history.
+The local database uses separate bootstrap, restricted FastAPI runtime, and
+restricted lifecycle-operator roles; the backend never connects as the database
+owner or Docker bootstrap superuser.
 
 The planned architecture is a FastAPI backend, PostgreSQL with pgvector, local Ollama models, and a React frontend. The backend lives in [`backend/`](backend/README.md).
 

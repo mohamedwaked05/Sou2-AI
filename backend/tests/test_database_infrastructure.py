@@ -4,7 +4,10 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from app.core.config import Settings
-from app.database.session import ensure_test_database_url
+from app.database.session import (
+    _reject_privileged_runtime_connection,
+    ensure_test_database_url,
+)
 from sqlalchemy import Engine, inspect, text
 from sqlalchemy.engine import make_url
 
@@ -12,10 +15,12 @@ from sqlalchemy.engine import make_url
 def test_development_and_test_urls_are_separate() -> None:
     settings = Settings(
         postgresql_database_url=(
-            "postgresql+psycopg://sou2ai:sou2ai_local@127.0.0.1:5433/sou2ai_dev"
+            "postgresql+psycopg://sou2ai_runtime_login:sou2ai_runtime_local@"
+            "127.0.0.1:5433/sou2ai_dev"
         ),
         test_postgresql_database_url=(
-            "postgresql+psycopg://sou2ai:sou2ai_local@127.0.0.1:5433/sou2ai_test"
+            "postgresql+psycopg://sou2ai_runtime_login:sou2ai_runtime_local@"
+            "127.0.0.1:5433/sou2ai_test"
         ),
         _env_file=None,
     )
@@ -26,7 +31,8 @@ def test_development_and_test_urls_are_separate() -> None:
 def test_safety_guard_rejects_development_database() -> None:
     with pytest.raises(ValueError, match="isolated"):
         ensure_test_database_url(
-            "postgresql+psycopg://sou2ai:sou2ai_local@127.0.0.1:5433/sou2ai_dev"
+            "postgresql+psycopg://sou2ai_runtime_login:sou2ai_runtime_local@"
+            "127.0.0.1:5433/sou2ai_dev"
         )
 
 
@@ -40,6 +46,17 @@ def test_test_database_uses_docker_endpoint(database_engine: Engine) -> None:
 def test_postgresql_connection_works(database_engine: Engine) -> None:
     with database_engine.connect() as connection:
         assert connection.scalar(text("SELECT 1")) == 1
+
+
+def test_runtime_connection_guard_rejects_bootstrap_role(
+    migration_engine: Engine,
+) -> None:
+    connection = migration_engine.raw_connection()
+    try:
+        with pytest.raises(RuntimeError, match="restricted PostgreSQL runtime role"):
+            _reject_privileged_runtime_connection(connection.driver_connection, None)
+    finally:
+        connection.close()
 
 
 def test_alembic_downgrade_and_upgrade(

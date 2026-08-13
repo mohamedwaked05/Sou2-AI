@@ -23,6 +23,8 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from tests.test_business_api import change_business_status
+
 
 def complete_business(name: str = "Complete Shop") -> Business:
     owner = User(
@@ -63,15 +65,13 @@ def load_business(db_session: Session, business_id: object) -> Business:
 def activate(db_session: Session, business: Business) -> None:
     business.onboarding_submitted_at = utc_now()
     db_session.commit()
-    db_session.execute(
-        text(
-            "SELECT * FROM public.sou2ai_change_business_status("
-            ":id, 'ACTIVE'::business_status, 'test:profiles', "
-            "'Profile guard test activation')"
-        ),
-        {"id": business.id},
+    change_business_status(
+        db_session,
+        business.id,
+        "ACTIVE",
+        admin_identifier="test:profiles",
+        reason="Profile guard test activation",
     )
-    db_session.commit()
 
 
 def test_incomplete_business_is_allowed_while_disabled(db_session: Session) -> None:
@@ -166,13 +166,12 @@ def test_controlled_activation_of_incomplete_business_is_rejected(
     business.onboarding_submitted_at = utc_now()
     db_session.commit()
     with pytest.raises(IntegrityError, match="complete confirmed profile"):
-        db_session.execute(
-            text(
-                "SELECT * FROM public.sou2ai_change_business_status("
-                ":id, 'ACTIVE'::business_status, 'test:profiles', "
-                "'Attempt incomplete activation')"
-            ),
-            {"id": business.id},
+        change_business_status(
+            db_session,
+            business.id,
+            "ACTIVE",
+            admin_identifier="test:profiles",
+            reason="Attempt incomplete activation",
         )
 
 

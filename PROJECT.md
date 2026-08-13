@@ -163,7 +163,9 @@ Authentication identifies the user; it does not by itself grant access to a busi
 * Preserve PostgreSQL profile-completion protection and require confirmed
   onboarding for activation and re-enabling.
 * Perform manual lifecycle changes only through the controlled PostgreSQL
-  function; the MVP has no platform-admin HTTP API or dashboard.
+  function; PostgreSQL ownership and grants separate migration, FastAPI runtime,
+  and lifecycle-operator privileges, and the MVP has no platform-admin HTTP API
+  or dashboard.
 * Block pending and disabled businesses from paid AI functionality independently
   for every tenant business.
 * Record every successful change with operator, reason, transition, and timestamp

@@ -1,5 +1,6 @@
 """Milestone 4 business management, onboarding, and tenant-isolation tests."""
 
+import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -16,7 +17,7 @@ from app.database.models import (
 )
 from app.services.businesses import create_business
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, func, select, text
+from sqlalchemy import Engine, create_engine, func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 
@@ -96,20 +97,27 @@ def change_business_status(
     admin_identifier: str = "test:operator",
     reason: str = "Test lifecycle transition",
 ) -> object:
-    result = session.execute(
-        text(
-            "SELECT * FROM public.sou2ai_change_business_status("
-            ":business_id, CAST(:new_status AS business_status), "
-            ":admin_identifier, :reason)"
-        ),
-        {
-            "business_id": business_id,
-            "new_status": new_status,
-            "admin_identifier": admin_identifier,
-            "reason": reason,
-        },
-    ).one()
-    session.commit()
+    operator_engine = create_engine(
+        os.environ["TEST_LIFECYCLE_OPERATOR_POSTGRESQL_DATABASE_URL"]
+    )
+    try:
+        with operator_engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    "SELECT * FROM public.sou2ai_change_business_status("
+                    ":business_id, CAST(:new_status AS business_status), "
+                    ":admin_identifier, :reason)"
+                ),
+                {
+                    "business_id": business_id,
+                    "new_status": new_status,
+                    "admin_identifier": admin_identifier,
+                    "reason": reason,
+                },
+            ).one()
+    finally:
+        operator_engine.dispose()
+    session.expire_all()
     return result
 
 
@@ -164,12 +172,13 @@ def test_creation_rejects_protected_fields(
 
 
 def test_creation_rolls_back_if_membership_insert_fails(
-    api_client: TestClient, db_session: Session
+    api_client: TestClient, db_session: Session, migration_engine: Engine
 ) -> None:
     user = create_user(db_session, "atomic@example.com")
-    db_session.execute(
-        text(
-            """
+    with migration_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
             CREATE FUNCTION test_reject_membership() RETURNS trigger AS $$
             BEGIN RAISE EXCEPTION 'test rejection' USING ERRCODE = '23514'; END;
             $$ LANGUAGE plpgsql;
@@ -177,9 +186,8 @@ def test_creation_rolls_back_if_membership_insert_fails(
             BEFORE INSERT ON business_memberships
             FOR EACH ROW EXECUTE FUNCTION test_reject_membership();
             """
+            )
         )
-    )
-    db_session.commit()
     try:
         response = api_client.post(
             "/api/v1/businesses",
@@ -192,14 +200,15 @@ def test_creation_rolls_back_if_membership_insert_fails(
             db_session.scalar(select(func.count()).select_from(BusinessMembership)) == 0
         )
     finally:
-        db_session.execute(
-            text(
-                "DROP TRIGGER IF EXISTS test_reject_membership "
-                "ON business_memberships; "
-                "DROP FUNCTION IF EXISTS test_reject_membership()"
+        db_session.rollback()
+        with migration_engine.begin() as connection:
+            connection.execute(
+                text(
+                    "DROP TRIGGER IF EXISTS test_reject_membership "
+                    "ON business_memberships; "
+                    "DROP FUNCTION IF EXISTS test_reject_membership()"
+                )
             )
-        )
-        db_session.commit()
 
 
 def test_owner_name_uniqueness_and_similar_names(

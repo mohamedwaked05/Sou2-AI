@@ -131,7 +131,9 @@ def test_deleting_user_nulls_audit_user_id(db_session: Session) -> None:
     assert log.user_id is None
 
 
-def test_business_deletion_is_restricted(db_session: Session) -> None:
+def test_business_deletion_is_restricted(
+    db_session: Session, migration_engine: Engine
+) -> None:
     scoped_business = business()
     db_session.add(
         ToolCallLog(
@@ -144,8 +146,10 @@ def test_business_deletion_is_restricted(db_session: Session) -> None:
     db_session.commit()
 
     with pytest.raises(IntegrityError):
-        db_session.execute(delete(Business).where(Business.id == scoped_business.id))
-        db_session.commit()
+        with migration_engine.begin() as connection:
+            connection.execute(
+                delete(Business).where(Business.id == scoped_business.id)
+            )
 
 
 def test_retention_deletes_only_strictly_older_rows(db_session: Session) -> None:

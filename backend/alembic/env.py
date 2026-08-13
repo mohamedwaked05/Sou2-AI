@@ -3,18 +3,36 @@
 from logging.config import fileConfig
 
 from alembic import context
-from app.core.config import get_settings
 from app.database import models  # noqa: F401
 from app.database.base import Base
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import engine_from_config, pool
+
+
+class MigrationSettings(BaseSettings):
+    """Bootstrap-only settings that are never loaded by the FastAPI runtime."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    migration_postgresql_database_url: str = (
+        "postgresql+psycopg://sou2ai:sou2ai_local@127.0.0.1:5433/sou2ai_dev"
+    )
+    postgresql_connect_timeout_seconds: int = 5
+
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-settings = get_settings()
+settings = MigrationSettings()
 config.set_main_option(
-    "sqlalchemy.url", settings.postgresql_database_url.replace("%", "%%")
+    "sqlalchemy.url",
+    settings.migration_postgresql_database_url.replace("%", "%%"),
 )
 target_metadata = Base.metadata
 

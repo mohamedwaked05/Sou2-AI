@@ -18,11 +18,26 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
-TEST_SETTINGS = Settings()
+TEST_SETTINGS = Settings(_env_file=None)
 TEST_DATABASE_URL = TEST_SETTINGS.test_postgresql_database_url
+TEST_MIGRATION_DATABASE_URL = os.getenv(
+    "TEST_MIGRATION_POSTGRESQL_DATABASE_URL",
+    "postgresql+psycopg://sou2ai:sou2ai_local@127.0.0.1:5433/sou2ai_test",
+)
+TEST_OPERATOR_DATABASE_URL = os.getenv(
+    "TEST_LIFECYCLE_OPERATOR_POSTGRESQL_DATABASE_URL",
+    "postgresql+psycopg://sou2ai_lifecycle_operator_login:"
+    "sou2ai_lifecycle_operator_local@127.0.0.1:5433/sou2ai_test",
+)
 os.environ["POSTGRESQL_DATABASE_URL"] = TEST_DATABASE_URL
+os.environ["MIGRATION_POSTGRESQL_DATABASE_URL"] = TEST_MIGRATION_DATABASE_URL
+os.environ["TEST_LIFECYCLE_OPERATOR_POSTGRESQL_DATABASE_URL"] = (
+    TEST_OPERATOR_DATABASE_URL
+)
 get_settings.cache_clear()
 ensure_test_database_url(TEST_DATABASE_URL)
+ensure_test_database_url(TEST_MIGRATION_DATABASE_URL)
+ensure_test_database_url(TEST_OPERATOR_DATABASE_URL)
 
 
 @pytest.fixture(scope="session")
@@ -31,9 +46,23 @@ def alembic_config() -> Config:
 
 
 @pytest.fixture(scope="session")
-def database_engine(alembic_config: Config) -> Generator[Engine]:
-    ensure_test_database_url(TEST_DATABASE_URL)
+def migration_engine(alembic_config: Config) -> Generator[Engine]:
+    ensure_test_database_url(TEST_MIGRATION_DATABASE_URL)
     command.upgrade(alembic_config, "head")
+    engine = create_engine(
+        TEST_MIGRATION_DATABASE_URL,
+        pool_pre_ping=True,
+        connect_args={
+            "connect_timeout": TEST_SETTINGS.postgresql_connect_timeout_seconds,
+        },
+    )
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture(scope="session")
+def database_engine(migration_engine: Engine) -> Generator[Engine]:
+    ensure_test_database_url(TEST_DATABASE_URL)
     engine = create_engine(
         TEST_DATABASE_URL,
         pool_pre_ping=True,
@@ -45,13 +74,27 @@ def database_engine(alembic_config: Config) -> Generator[Engine]:
     engine.dispose()
 
 
+@pytest.fixture(scope="session")
+def operator_engine(migration_engine: Engine) -> Generator[Engine]:
+    ensure_test_database_url(TEST_OPERATOR_DATABASE_URL)
+    engine = create_engine(
+        TEST_OPERATOR_DATABASE_URL,
+        pool_pre_ping=True,
+        connect_args={
+            "connect_timeout": TEST_SETTINGS.postgresql_connect_timeout_seconds,
+        },
+    )
+    yield engine
+    engine.dispose()
+
+
 @pytest.fixture
-def db_session(database_engine: Engine) -> Generator[Session]:
+def db_session(database_engine: Engine, migration_engine: Engine) -> Generator[Session]:
     factory = sessionmaker(bind=database_engine, expire_on_commit=False)
     with factory() as session:
         yield session
         session.rollback()
-    with database_engine.begin() as connection:
+    with migration_engine.begin() as connection:
         connection.execute(
             text(
                 "ALTER TABLE business_lifecycle_history DISABLE TRIGGER "

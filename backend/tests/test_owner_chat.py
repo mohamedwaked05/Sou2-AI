@@ -671,12 +671,13 @@ def test_cross_tenant_knowledge_resource_is_privacy_safe(
 
 
 def test_assistant_persistence_failure_never_returns_unsaved_reply(
-    api_client: TestClient, db_session: Session
+    api_client: TestClient, db_session: Session, migration_engine: Engine
 ) -> None:
     user, business = active_business(api_client, db_session)
-    db_session.execute(
-        text(
-            """
+    with migration_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
             CREATE FUNCTION test_reject_assistant() RETURNS trigger AS $$
             BEGIN
                 IF NEW.role = 'assistant' THEN
@@ -689,9 +690,8 @@ def test_assistant_persistence_failure_never_returns_unsaved_reply(
             BEFORE INSERT ON owner_chat_messages
             FOR EACH ROW EXECUTE FUNCTION test_reject_assistant();
             """
+            )
         )
-    )
-    db_session.commit()
     try:
         response = submit(api_client, user, business["id"], "Persist this safely")
         assert response.status_code == 503
@@ -700,14 +700,15 @@ def test_assistant_persistence_failure_never_returns_unsaved_reply(
         assert messages[0].role == ChatMessageRole.OWNER
         assert messages[0].generation_state == "failed"
     finally:
-        db_session.execute(
-            text(
-                "DROP TRIGGER IF EXISTS test_reject_assistant_message "
-                "ON owner_chat_messages; "
-                "DROP FUNCTION IF EXISTS test_reject_assistant()"
+        db_session.rollback()
+        with migration_engine.begin() as connection:
+            connection.execute(
+                text(
+                    "DROP TRIGGER IF EXISTS test_reject_assistant_message "
+                    "ON owner_chat_messages; "
+                    "DROP FUNCTION IF EXISTS test_reject_assistant()"
+                )
             )
-        )
-        db_session.commit()
 
     retried = submit(api_client, user, business["id"], "Persist this safely")
     assert retried.status_code == 200
