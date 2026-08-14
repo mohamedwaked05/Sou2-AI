@@ -23,6 +23,8 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from app.agent.owner_chat_provider import (  # noqa: E402
     OllamaOwnerChatProvider,
+    OwnerChatProviderInvalidResponse,
+    OwnerChatProviderTimeout,
     OwnerChatResult,
     ProposedKnowledge,
 )
@@ -56,8 +58,12 @@ from experiments.owner_chat_language_eval.scoring import (  # noqa: E402
     validate_completed_scoring,
 )
 from experiments.owner_chat_language_eval.workflow import (  # noqa: E402
+    INCOMPLETE_DIRECTORY,
+    MODEL_CONTRACT_FAILURE,
+    eligible_baseline_attempts,
     execute_evaluation,
     persist_run_document,
+    promote_incomplete_artifact,
 )
 
 EVALUATION_TEST_ARTIFACTS = (
@@ -134,6 +140,43 @@ def completed_baseline() -> dict[str, object]:
     }
 
 
+def baseline_with_invalid_response(index: int = 0) -> dict[str, object]:
+    document = completed_baseline()
+    results = document["results"]
+    assert isinstance(results, list)
+    result = results[index]
+    assert isinstance(result, dict)
+    result["response"] = None
+    result["proposed_knowledge"] = []
+    result["usage"] = None
+    result["execution_error"] = MODEL_CONTRACT_FAILURE
+    document["status"] = "incomplete"
+    return document
+
+
+@pytest.fixture
+def incomplete_artifact_path() -> Path:
+    INCOMPLETE_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    source_path = INCOMPLETE_DIRECTORY / f"test-{uuid4()}.json"
+    try:
+        yield source_path
+    finally:
+        source_path.unlink(missing_ok=True)
+
+
+def write_incomplete_artifact(path: Path, document: dict[str, object]) -> Path:
+    path.write_text(
+        json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return path
+
+
+def incomplete_reference(path: Path) -> Path:
+    return path.relative_to(REPOSITORY_ROOT)
+
+
 def completed_selective_rerun() -> dict[str, object]:
     document = completed_baseline()
     document["run_kind"] = "selective_rerun"
@@ -160,6 +203,8 @@ def complete_reviews(scoring: dict[str, object]) -> None:
     for review in reviews:
         assert isinstance(review, dict)
         review["scores"] = {criterion: 2 for criterion in RUBRIC_CRITERIA}
+        if review["baseline_execution_error"] == MODEL_CONTRACT_FAILURE:
+            review["scores"]["instruction_following"] = 0
         review["critical_failure_review"] = {
             "confirmed": False,
             "categories": [],
@@ -455,6 +500,246 @@ def test_persistence_rejects_a_custom_full_baseline_path(
         )
 
 
+def test_fifty_attempts_with_invalid_model_response_are_baseline_eligible() -> None:
+    document = baseline_with_invalid_response()
+
+    valid_count, invalid_count = eligible_baseline_attempts(document)
+
+    assert valid_count == 49
+    assert invalid_count == 1
+
+
+def test_invalid_model_response_does_not_make_full_baseline_incomplete(
+    evaluation_repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = baseline_with_invalid_response()
+    document["status"] = "complete_with_model_failures"
+    mock_cli_execution(monkeypatch, document)
+
+    exit_code = evaluation_cli._run_command(
+        Namespace(scenario_ids=None, output=None),
+        canonical_baseline_path=canonical_baseline_path(evaluation_repository),
+    )
+
+    assert exit_code == 0
+    assert (
+        json.loads(
+            canonical_baseline_path(evaluation_repository).read_text(encoding="utf-8")
+        )["status"]
+        == "complete_with_model_failures"
+    )
+
+
+def test_runner_marks_only_invalid_structured_response_baseline_complete() -> None:
+    class Provider:
+        model = "qwen2.5:7b"
+        timeout_seconds = 120
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, _: object) -> OwnerChatResult:
+            self.calls += 1
+            if self.calls == 1:
+                raise OwnerChatProviderInvalidResponse
+            return OwnerChatResult(reply="A valid English response.")
+
+    provider = Provider()
+    document = execute_evaluation(
+        provider=provider,  # type: ignore[arg-type]
+        scenarios=load_dataset(),
+        fixture=load_fixture(),
+        run_kind="baseline",
+    )
+
+    assert provider.calls == 50
+    assert document["status"] == "complete_with_model_failures"
+
+
+def test_runner_marks_infrastructure_failure_baseline_incomplete() -> None:
+    class Provider:
+        model = "qwen2.5:7b"
+        timeout_seconds = 120
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, _: object) -> OwnerChatResult:
+            self.calls += 1
+            if self.calls == 1:
+                raise OwnerChatProviderTimeout
+            return OwnerChatResult(reply="A valid English response.")
+
+    document = execute_evaluation(
+        provider=Provider(),  # type: ignore[arg-type]
+        scenarios=load_dataset(),
+        fixture=load_fixture(),
+        run_kind="baseline",
+    )
+
+    assert document["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "provider_timeout",
+        "provider_unavailable",
+        "provider_error",
+        "unexpected_execution_error",
+        "interrupted",
+    ],
+)
+def test_infrastructure_failures_are_not_baseline_eligible(error: str) -> None:
+    document = baseline_with_invalid_response()
+    results = document["results"]
+    assert isinstance(results, list)
+    result = results[1]
+    assert isinstance(result, dict)
+    result["execution_error"] = error
+
+    with pytest.raises(ValueError, match="infrastructure or execution error"):
+        eligible_baseline_attempts(document)
+
+
+def test_fewer_than_fifty_attempts_are_not_baseline_eligible() -> None:
+    document = baseline_with_invalid_response()
+    results = document["results"]
+    assert isinstance(results, list)
+    document["results"] = results[:-1]
+
+    with pytest.raises(ValueError, match="exactly 50"):
+        eligible_baseline_attempts(document)
+
+
+def test_promotion_accepts_eligible_artifact_without_constructing_provider(
+    incomplete_artifact_path: Path,
+    evaluation_repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = write_incomplete_artifact(
+        incomplete_artifact_path, baseline_with_invalid_response()
+    )
+
+    def provider(**_: object) -> object:
+        raise AssertionError("Promotion must not construct the provider.")
+
+    monkeypatch.setattr(evaluation_cli, "OllamaOwnerChatProvider", provider)
+    output = promote_incomplete_artifact(
+        incomplete_reference(source),
+        canonical_baseline_path=canonical_baseline_path(evaluation_repository),
+    )
+
+    promoted = json.loads(output.read_text(encoding="utf-8"))
+    assert output == canonical_baseline_path(evaluation_repository)
+    assert promoted["status"] == "complete_with_model_failures"
+    assert promoted["results"] == baseline_with_invalid_response()["results"]
+
+
+def test_promotion_provenance_and_original_timestamps_are_preserved(
+    incomplete_artifact_path: Path,
+    evaluation_repository: Path,
+) -> None:
+    source_document = baseline_with_invalid_response()
+    source = write_incomplete_artifact(incomplete_artifact_path, source_document)
+    source_bytes = source.read_bytes()
+
+    output = promote_incomplete_artifact(
+        incomplete_reference(source),
+        canonical_baseline_path=canonical_baseline_path(evaluation_repository),
+    )
+    promoted = json.loads(output.read_text(encoding="utf-8"))
+    promotion = promoted["promotion"]
+
+    assert promoted["started_at"] == source_document["started_at"]
+    assert promoted["completed_at"] == source_document["completed_at"]
+    assert promoted["configuration"] == source_document["configuration"]
+    assert promoted["results"] == source_document["results"]
+    assert promotion["source_sha256"] == hashlib.sha256(source_bytes).hexdigest()
+    assert promotion["valid_structured_response_count"] == 49
+    assert promotion["invalid_model_response_count"] == 1
+
+
+def test_promotion_rejects_outside_and_traversing_input(
+    incomplete_artifact_path: Path,
+    evaluation_repository: Path,
+) -> None:
+    outside = evaluation_repository / "outside.json"
+    write_incomplete_artifact(outside, baseline_with_invalid_response())
+
+    with pytest.raises(ValueError, match="outside artifacts/incomplete"):
+        promote_incomplete_artifact(
+            outside.relative_to(REPOSITORY_ROOT),
+            canonical_baseline_path=canonical_baseline_path(evaluation_repository),
+        )
+    with pytest.raises(ValueError, match="relative incomplete-artifact"):
+        promote_incomplete_artifact(
+            Path("../outside.json"),
+            canonical_baseline_path=canonical_baseline_path(evaluation_repository),
+        )
+
+
+def test_promotion_rejects_symlink_input(
+    monkeypatch: pytest.MonkeyPatch,
+    evaluation_repository: Path,
+) -> None:
+    source = INCOMPLETE_DIRECTORY / f"link-{uuid4()}.json"
+    monkeypatch.setattr(Path, "is_symlink", lambda _: True)
+
+    with pytest.raises(ValueError, match="cannot be a symlink"):
+        promote_incomplete_artifact(
+            incomplete_reference(source),
+            canonical_baseline_path=canonical_baseline_path(evaluation_repository),
+        )
+
+
+@pytest.mark.parametrize("mutation", ["dataset", "ordering", "duplicate", "count"])
+def test_promotion_rejects_invalid_dataset_matrix(
+    mutation: str,
+    incomplete_artifact_path: Path,
+    evaluation_repository: Path,
+) -> None:
+    document = baseline_with_invalid_response()
+    results = document["results"]
+    assert isinstance(results, list)
+    if mutation == "dataset":
+        document["dataset_fingerprint_sha256"] = "0" * 64
+    elif mutation == "ordering":
+        results[0], results[1] = results[1], results[0]
+    elif mutation == "duplicate":
+        duplicate = results[1]
+        assert isinstance(duplicate, dict)
+        duplicate["scenario_id"] = results[0]["scenario_id"]
+    else:
+        document["results"] = results[:-1]
+    source = write_incomplete_artifact(incomplete_artifact_path, document)
+
+    with pytest.raises(ValueError):
+        promote_incomplete_artifact(
+            incomplete_reference(source),
+            canonical_baseline_path=canonical_baseline_path(evaluation_repository),
+        )
+
+
+def test_promotion_never_overwrites_canonical_baseline(
+    incomplete_artifact_path: Path,
+    evaluation_repository: Path,
+) -> None:
+    source = write_incomplete_artifact(
+        incomplete_artifact_path, baseline_with_invalid_response()
+    )
+    canonical = write_canonical_baseline(evaluation_repository)
+    original = canonical.read_bytes()
+
+    with pytest.raises(ValueError, match="already exists"):
+        promote_incomplete_artifact(
+            incomplete_reference(source), canonical_baseline_path=canonical
+        )
+
+    assert canonical.read_bytes() == original
+
+
 def test_scoring_preparation_binds_exact_canonical_baseline_bytes(
     evaluation_repository: Path,
 ) -> None:
@@ -584,6 +869,82 @@ def test_report_uses_verified_canonical_baseline_metadata_and_warnings(
     assert "verified-qwen2.5:7b" in report
     assert "2026-08-14T12:34:56+00:00" in report
     assert "verified_baseline_warning" in report
+
+
+def test_scoring_accepts_promoted_baseline_and_marks_invalid_response(
+    evaluation_repository: Path,
+) -> None:
+    baseline = baseline_with_invalid_response()
+    baseline["status"] = "complete_with_model_failures"
+    write_canonical_baseline(evaluation_repository, baseline)
+
+    scoring = build_scoring_template(repository_root=evaluation_repository)
+    reviews = scoring["reviews"]
+    assert isinstance(reviews, list)
+    invalid_review = reviews[0]
+    assert isinstance(invalid_review, dict)
+
+    assert invalid_review["baseline_execution_error"] == MODEL_CONTRACT_FAILURE
+    assert MODEL_CONTRACT_FAILURE in invalid_review["deterministic_warnings"]
+    assert "instruction_following must be 0" in invalid_review["reviewer_guidance"]
+    assert invalid_review["critical_failure_review"]["confirmed"] is None
+
+
+def test_invalid_response_always_counts_as_normal_failure(
+    evaluation_repository: Path,
+) -> None:
+    baseline = baseline_with_invalid_response()
+    baseline["status"] = "complete_with_model_failures"
+    write_canonical_baseline(evaluation_repository, baseline)
+    scoring = completed_scoring(evaluation_repository)
+    reviews = scoring["reviews"]
+    assert isinstance(reviews, list)
+    invalid_review = reviews[0]
+    assert isinstance(invalid_review, dict)
+    scores = invalid_review["scores"]
+    assert isinstance(scores, dict)
+    scores.update({criterion: 2 for criterion in RUBRIC_CRITERIA})
+    scores["instruction_following"] = 0
+
+    summary = calculate_language_results(scoring, repository_root=evaluation_repository)
+
+    assert summary["english"]["failed_scenarios"] == 1
+    assert summary["english"]["failure_rate_percent"] == 10.0
+    assert normal_failure(
+        RubricScores(**{criterion: 2 for criterion in RUBRIC_CRITERIA}),
+        baseline_execution_error=MODEL_CONTRACT_FAILURE,
+    )
+
+
+def test_invalid_response_does_not_create_critical_failure_or_change_decision(
+    evaluation_repository: Path,
+) -> None:
+    baseline = baseline_with_invalid_response()
+    baseline["status"] = "complete_with_model_failures"
+    write_canonical_baseline(evaluation_repository, baseline)
+    scoring = completed_scoring(evaluation_repository)
+
+    decision = decide_model(scoring, repository_root=evaluation_repository)
+
+    assert decision["accepted"] is True
+    assert decision["confirmed_critical_failure_count"] == 0
+
+
+def test_invalid_response_report_lists_counts_and_ids(
+    evaluation_repository: Path,
+) -> None:
+    baseline = baseline_with_invalid_response()
+    baseline["status"] = "complete_with_model_failures"
+    write_canonical_baseline(evaluation_repository, baseline)
+    scoring = completed_scoring(evaluation_repository)
+
+    report = render_report(scoring, repository_root=evaluation_repository)
+
+    assert "Valid structured responses: 49" in report
+    assert "Invalid model responses: 1" in report
+    assert "m9-en-01-working-hours" in report
+    assert "model response-contract failures" in report
+    assert "not automatically human-confirmed critical failures" in report
 
 
 def test_runner_uses_existing_ollama_provider_with_mocked_transport() -> None:

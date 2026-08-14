@@ -6,23 +6,21 @@ import hashlib
 import hmac
 import json
 import re
-from collections import Counter
 from pathlib import Path, PurePosixPath
 from statistics import fmean
 from typing import Any
 
 from pydantic import ValidationError
 
-from experiments.owner_chat_language_eval.dataset import (
-    DEFAULT_DATASET_PATH,
-    dataset_fingerprint,
-    load_dataset,
-)
 from experiments.owner_chat_language_eval.models import (
     RUBRIC_CRITERIA,
     LanguageGroup,
     RubricScores,
     ScenarioReview,
+)
+from experiments.owner_chat_language_eval.workflow import (
+    MODEL_CONTRACT_FAILURE,
+    validate_canonical_baseline,
 )
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -79,61 +77,7 @@ def _validate_baseline_reference(value: object) -> str:
 def _validated_baseline_results(
     run_document: dict[str, object],
 ) -> list[dict[str, Any]]:
-    if run_document.get("run_kind") != "baseline":
-        raise ValueError("Manual scoring requires a baseline run.")
-    if run_document.get("status") != "complete":
-        raise ValueError("Manual scoring requires a completed baseline run.")
-    configuration = run_document.get("configuration")
-    if (
-        not isinstance(configuration, dict)
-        or configuration.get("provider") != "ollama"
-        or not isinstance(configuration.get("model"), str)
-        or not configuration["model"].strip()
-    ):
-        raise ValueError("Baseline is missing its Ollama model configuration.")
-    raw_results = run_document.get("results")
-    if not isinstance(raw_results, list) or len(raw_results) != 50:
-        raise ValueError("A completed baseline must contain exactly 50 results.")
-    expected_scenarios = load_dataset()
-    if run_document.get("dataset_version") != "1.0" or run_document.get(
-        "dataset_fingerprint_sha256"
-    ) != dataset_fingerprint(DEFAULT_DATASET_PATH):
-        raise ValueError("Baseline does not match the current versioned dataset.")
-    results: list[dict[str, Any]] = []
-    identifiers: set[str] = set()
-    for raw_result in raw_results:
-        if not isinstance(raw_result, dict):
-            raise ValueError("Baseline results must be JSON objects.")
-        scenario_id = raw_result.get("scenario_id")
-        language = raw_result.get("language")
-        if not isinstance(scenario_id, str) or scenario_id in identifiers:
-            raise ValueError("Baseline scenario IDs must be present and unique.")
-        try:
-            LanguageGroup(language)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Baseline result language is invalid.") from exc
-        if raw_result.get("execution_error") is not None:
-            raise ValueError("A completed baseline cannot contain execution errors.")
-        if (
-            not isinstance(raw_result.get("response"), str)
-            or not raw_result["response"].strip()
-        ):
-            raise ValueError("A completed baseline requires nonblank responses.")
-        identifiers.add(scenario_id)
-        results.append(raw_result)
-    expected_matrix = [
-        (scenario.id, scenario.language.value, scenario.scenario_type.value)
-        for scenario in expected_scenarios
-    ]
-    actual_matrix = [
-        (result["scenario_id"], result["language"], result.get("scenario_type"))
-        for result in results
-    ]
-    if actual_matrix != expected_matrix:
-        raise ValueError("Baseline results do not match the versioned scenario matrix.")
-    language_counts = Counter(result["language"] for result in results)
-    if any(language_counts[group.value] != 10 for group in LanguageGroup):
-        raise ValueError("A completed baseline needs 10 results per language group.")
+    results, _, _ = validate_canonical_baseline(run_document)
     return results
 
 
@@ -154,6 +98,22 @@ def build_scoring_template(
         "reviews": [
             {
                 "scenario_id": result["scenario_id"],
+                "baseline_execution_error": result["execution_error"],
+                "deterministic_warnings": list(result.get("deterministic_warnings", []))
+                + (
+                    [MODEL_CONTRACT_FAILURE]
+                    if result["execution_error"] == MODEL_CONTRACT_FAILURE
+                    else []
+                ),
+                "reviewer_guidance": (
+                    "No valid visible response was produced. Score all six criteria; "
+                    "instruction_following must be 0 because the model failed the "
+                    "required structured-response contract. Score the other criteria "
+                    "from the absence of a usable answer. This is not automatically a "
+                    "critical failure."
+                    if result["execution_error"] == MODEL_CONTRACT_FAILURE
+                    else ""
+                ),
                 "scores": {criterion: None for criterion in RUBRIC_CRITERIA},
                 "critical_failure_review": {
                     "confirmed": None,
@@ -190,14 +150,20 @@ def _load_verified_baseline(
     return baseline, _validated_baseline_results(baseline)
 
 
-def normal_failure(scores: RubricScores) -> bool:
+def normal_failure(
+    scores: RubricScores,
+    *,
+    baseline_execution_error: str | None = None,
+) -> bool:
     """A scenario fails normally when any of the six human scores is zero."""
     values = scores.values_by_criterion().values()
     if any(value is None for value in values):
         raise ValueError(
             "Normal failure cannot be calculated before scoring is complete."
         )
-    return any(value == 0 for value in values)
+    return baseline_execution_error == MODEL_CONTRACT_FAILURE or any(
+        value == 0 for value in values
+    )
 
 
 def validate_completed_scoring(
@@ -227,7 +193,29 @@ def validate_completed_scoring(
     if review_ids != expected_ids or len(set(review_ids)) != 50:
         raise ValueError("Reviews must match baseline scenarios in baseline order.")
 
+    results_by_id = {result["scenario_id"]: result for result in results}
     for review in reviews:
+        baseline_result = results_by_id[review.scenario_id]
+        expected_error = baseline_result["execution_error"]
+        if review.baseline_execution_error != expected_error:
+            raise ValueError(
+                f"Scenario {review.scenario_id} does not match its baseline outcome."
+            )
+        if expected_error == MODEL_CONTRACT_FAILURE:
+            if MODEL_CONTRACT_FAILURE not in review.deterministic_warnings:
+                raise ValueError(
+                    f"Scenario {review.scenario_id} lacks its contract-failure warning."
+                )
+            if review.scores.instruction_following != 0:
+                raise ValueError(
+                    f"Scenario {review.scenario_id} must score instruction_following 0."
+                )
+        elif review.deterministic_warnings != list(
+            baseline_result.get("deterministic_warnings", [])
+        ):
+            raise ValueError(
+                f"Scenario {review.scenario_id} does not match baseline warnings."
+            )
         if any(value is None for value in review.scores.values_by_criterion().values()):
             raise ValueError(
                 f"Scenario {review.scenario_id} has incomplete rubric scores."
@@ -265,6 +253,7 @@ def calculate_language_results(
         scoring_document, repository_root=repository_root
     )
     reviews_by_id = {review.scenario_id: review for review in reviews}
+    results_by_id = {result["scenario_id"]: result for result in results}
     summary: dict[str, dict[str, object]] = {}
     for group in LanguageGroup:
         group_results = [
@@ -273,7 +262,15 @@ def calculate_language_results(
         group_reviews = [
             reviews_by_id[result["scenario_id"]] for result in group_results
         ]
-        failed_count = sum(normal_failure(review.scores) for review in group_reviews)
+        failed_count = sum(
+            normal_failure(
+                review.scores,
+                baseline_execution_error=results_by_id[review.scenario_id][
+                    "execution_error"
+                ],
+            )
+            for review in group_reviews
+        )
         criterion_averages = {
             criterion: round(
                 fmean(
@@ -357,10 +354,27 @@ def render_report(
         for criterion in RUBRIC_CRITERIA
     }
     warning_rows = [
-        [result["scenario_id"], ", ".join(result.get("deterministic_warnings", []))]
+        [
+            result["scenario_id"],
+            ", ".join(
+                list(result.get("deterministic_warnings", []))
+                + (
+                    [MODEL_CONTRACT_FAILURE]
+                    if result["execution_error"] == MODEL_CONTRACT_FAILURE
+                    else []
+                )
+            ),
+        ]
         for result in results
         if result.get("deterministic_warnings")
+        or result["execution_error"] == MODEL_CONTRACT_FAILURE
     ]
+    invalid_response_rows = [
+        [result["language"], result["scenario_id"]]
+        for result in results
+        if result["execution_error"] == MODEL_CONTRACT_FAILURE
+    ]
+    valid_response_count = sum(result["execution_error"] is None for result in results)
     confirmed_reviews = [
         review for review in reviews if review.critical_failure_review.confirmed
     ]
@@ -380,13 +394,45 @@ def render_report(
         f"- Dataset version: `{baseline.get('dataset_version')}`",
         f"- Dataset SHA-256: `{baseline.get('dataset_fingerprint_sha256')}`",
         f"- Scenarios: {len(results)}",
+        f"- Valid structured responses: {valid_response_count}",
+        f"- Invalid model responses: {len(invalid_response_rows)}",
+        f"- Baseline started: `{baseline.get('started_at')}`",
         f"- Baseline completed: `{baseline.get('completed_at')}`",
         "- Execution: one baseline model call per scenario; no repeated result is used "
         "in baseline scoring.",
         "",
-        "## Results by language",
+        "## Invalid structured responses",
         "",
     ]
+    if invalid_response_rows:
+        lines.append(
+            "These are model response-contract failures and always count as normal "
+            "failures. They are not automatically human-confirmed critical failures."
+        )
+        lines.append("")
+        lines.extend(_markdown_table(["Language", "Scenario"], invalid_response_rows))
+    else:
+        lines.append("No invalid structured responses occurred in this baseline.")
+    promotion = baseline.get("promotion")
+    if isinstance(promotion, dict):
+        lines.extend(["", "## Promotion provenance", ""])
+        lines.extend(
+            [
+                f"- Source artifact: `{promotion.get('source_reference')}`",
+                f"- Source SHA-256: `{promotion.get('source_sha256')}`",
+                f"- Promoted at: `{promotion.get('promoted_at')}`",
+                "- Promoted valid structured responses: "
+                f"{promotion.get('valid_structured_response_count')}",
+                "- Promoted invalid model responses: "
+                f"{promotion.get('invalid_model_response_count')}",
+            ]
+        )
+    lines.extend(
+        [
+            "## Results by language",
+            "",
+        ]
+    )
     lines.extend(
         _markdown_table(
             ["Language", "Scenarios", "Normal failures", "Failure rate"],

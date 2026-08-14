@@ -25,6 +25,7 @@ from experiments.owner_chat_language_eval.workflow import (
     DEFAULT_BASELINE_PATH,
     execute_evaluation,
     persist_run_document,
+    promote_incomplete_artifact,
     write_json_exclusive,
     write_text_exclusive,
 )
@@ -53,6 +54,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Stable scenario ID to rerun; repeat for multiple IDs.",
     )
     run.add_argument("--output", type=Path)
+
+    promote = subparsers.add_parser(
+        "promote-baseline",
+        help="Promote one eligible incomplete artifact without provider I/O.",
+    )
+    promote.add_argument("--input", type=Path, required=True)
 
     prepare = subparsers.add_parser(
         "prepare-scoring", help="Create a human-editable scoring artifact."
@@ -126,7 +133,8 @@ def _run_command(
         canonical_baseline_path=canonical_baseline_path,
     )
     print(f"{document['status']} evaluation artifact: {output_path}")
-    return 0 if document["status"] == "complete" else 2
+    completed_statuses = {"complete", "complete_with_model_failures"}
+    return 0 if document["status"] in completed_statuses else 2
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -144,6 +152,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if arguments.command == "run":
             return _run_command(arguments)
+        if arguments.command == "promote-baseline":
+            output_path = promote_incomplete_artifact(arguments.input)
+            print(f"canonical baseline promoted: {output_path}")
+            return 0
         if arguments.command == "prepare-scoring":
             template = build_scoring_template()
             output_path = write_json_exclusive(arguments.output, template)

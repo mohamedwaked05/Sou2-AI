@@ -55,8 +55,11 @@ Run commands from the repository root with the existing Python environment:
 The full-run command calls every scenario once and can write only the canonical
 `results/baseline.json`. A full baseline cannot use `--output`. If the canonical
 artifact already exists, the runner rejects another baseline before contacting
-Ollama. A provider failure or interruption writes a separate ignored artifact
-under `artifacts/incomplete/` and exits unsuccessfully.
+Ollama. A valid structured response is a success. An invalid structured response
+is a **model response-contract failure**: it remains in the completed baseline
+because it is an honest result of that scenario attempt. Timeouts, unavailable
+providers, interruptions, and other execution failures remain infrastructure
+failures and write a separate ignored artifact under `artifacts/incomplete/`.
 
 To intentionally restart an unscored baseline, first manually preserve the old
 `results/baseline.json` outside the canonical path for investigation, or
@@ -80,6 +83,27 @@ reruns, and excluded from baseline scores and the model decision. A selective
 rerun may use a custom output path, but it cannot replace or modify the canonical
 baseline.
 
+## Offline promotion of an eligible first run
+
+If the first unbiased 50-attempt artifact is marked incomplete only because it
+contains invalid structured model responses, promote that exact artifact without
+calling Ollama:
+
+```powershell
+.\backend\.venv\Scripts\python.exe -m experiments.owner_chat_language_eval promote-baseline `
+  --input experiments\owner_chat_language_eval\artifacts\incomplete\incomplete-20260814T002421323634Z.json
+```
+
+Promotion accepts only a repository-relative file directly inside
+`artifacts/incomplete/`; it rejects traversal, escaping symlinks, outside files,
+wrong datasets, duplicate or unordered attempts, non-50 artifacts, and every
+infrastructure error. It never chooses the newest or best artifact, never
+constructs the provider, never changes the original results or execution
+timestamps, and never overwrites a canonical baseline. The promoted baseline
+records the source reference, source SHA-256, promotion time, and valid/invalid
+response counts. Promote only the first unbiased run; later artifacts are
+selective evidence and cannot affect baseline scoring or the decision.
+
 ## Human scoring and report
 
 Create the scoring-ready JSON after a complete baseline:
@@ -100,6 +124,12 @@ In `results/manual_scoring.json`, enter an integer `0`, `1`, or `2` for each of
 `intent`, `relevance`, `hallucination`, `clarification`, `tone`, and
 `instruction_following`: `0` means failed, `1` means partially acceptable, and
 `2` means passed. A `0` in any criterion is one normal scenario failure.
+For `provider_invalid_response`, the template marks that no valid visible answer
+exists. Complete all six scores, set `instruction_following` to `0`, and score
+the other five criteria from the absence of a usable answer. That scenario always
+counts as a normal failure even if another score is mistakenly nonzero. It is not
+automatically a confirmed critical failure; the four critical categories remain a
+human decision.
 For every scenario, also set `critical_failure_review.confirmed` to `true` or
 `false` and provide a short explanation. When confirmed, select one or more of
 these exact categories:

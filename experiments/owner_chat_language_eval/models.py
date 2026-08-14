@@ -258,6 +258,9 @@ class ScenarioReview(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     scenario_id: str
+    baseline_execution_error: Literal["provider_invalid_response"] | None = None
+    deterministic_warnings: list[str] = Field(default_factory=list)
+    reviewer_guidance: str = ""
     scores: RubricScores = Field(default_factory=RubricScores)
     critical_failure_review: CriticalFailureReview = Field(
         default_factory=CriticalFailureReview
