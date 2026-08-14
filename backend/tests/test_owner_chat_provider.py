@@ -10,10 +10,13 @@ from app.agent import owner_chat_provider
 from app.agent.owner_chat_provider import (
     DeterministicMockOwnerChatProvider,
     OllamaOwnerChatProvider,
+    OwnerChatProvider,
+    OwnerChatProviderError,
     OwnerChatProviderInvalidResponse,
     OwnerChatProviderTimeout,
     OwnerChatProviderUnavailable,
     OwnerChatRequest,
+    OwnerChatResult,
     ProviderBusinessProfile,
     ProviderKnowledge,
     ProviderMessage,
@@ -162,14 +165,14 @@ def maximal_provider_request() -> OwnerChatRequest:
     )
 
 
-@pytest.mark.parametrize("configured", [None, "mock"])
-def test_mock_provider_selection_is_default_and_offline(
-    configured: str | None, monkeypatch: pytest.MonkeyPatch
+def test_mock_provider_selection_is_explicit_and_offline(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("OWNER_CHAT_PROVIDER", raising=False)
-    values = {} if configured is None else {"owner_chat_provider": configured}
 
-    provider = create_owner_chat_provider(Settings(_env_file=None, **values))
+    provider = create_owner_chat_provider(
+        Settings(_env_file=None, owner_chat_provider="mock")
+    )
 
     assert isinstance(provider, DeterministicMockOwnerChatProvider)
 
@@ -184,6 +187,102 @@ def test_ollama_provider_selection_does_not_contact_service() -> None:
 
     assert isinstance(provider, OllamaOwnerChatProvider)
     assert provider.model == "qwen2.5:7b"
+
+
+def test_default_provider_selection_is_ollama_without_startup_io() -> None:
+    transport = httpx.MockTransport(
+        lambda request: pytest.fail("Provider selection must not perform HTTP I/O")
+    )
+
+    provider = create_owner_chat_provider(Settings(_env_file=None), transport=transport)
+
+    assert isinstance(provider, OllamaOwnerChatProvider)
+
+
+@pytest.fixture(params=["mock", "ollama"])
+def contract_provider(request: pytest.FixtureRequest) -> OwnerChatProvider:
+    if request.param == "mock":
+        return DeterministicMockOwnerChatProvider()
+    return ollama_provider(
+        successful_transport({"reply": "Safe visible reply.", "proposed_knowledge": []})
+    )
+
+
+def test_shared_provider_contract(
+    contract_provider: OwnerChatProvider,
+) -> None:
+    request = maximal_provider_request()
+    original_request = request
+
+    assert isinstance(contract_provider, OwnerChatProvider)
+    assert contract_provider.estimate_input_tokens(request) > 0
+    assert contract_provider.estimate_input_tokens(request) == (
+        contract_provider.estimate_input_tokens(request)
+    )
+
+    result = contract_provider.generate(request)
+
+    assert isinstance(result, OwnerChatResult)
+    assert result.reply.strip()
+    assert result.proposed_knowledge == ()
+    assert isinstance(result.provider_identifier, str) and result.provider_identifier
+    assert isinstance(result.model_identifier, str) and result.model_identifier
+    assert result.usage is not None
+    assert result.usage.input_tokens >= 0
+    assert result.usage.output_tokens >= 0
+    assert result.usage.total_tokens == (
+        result.usage.input_tokens + result.usage.output_tokens
+    )
+    assert result.usage.output_tokens <= request.max_output_tokens
+    assert request == original_request
+
+
+def test_mock_provider_is_network_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        owner_chat_provider.httpx,
+        "Client",
+        lambda *args, **kwargs: pytest.fail(
+            "Mock provider must not create an HTTP client"
+        ),
+    )
+
+    result = DeterministicMockOwnerChatProvider().generate(provider_request())
+
+    assert result.provider_identifier == "mock"
+
+
+def test_mock_provider_honors_small_output_limit() -> None:
+    request = replace(provider_request(), max_output_tokens=1)
+
+    result = DeterministicMockOwnerChatProvider().generate(request)
+
+    assert result.usage is not None
+    assert result.usage.output_tokens <= request.max_output_tokens
+
+
+@pytest.mark.parametrize(
+    ("behavior", "error_type"),
+    [
+        ("timeout", OwnerChatProviderTimeout),
+        ("unavailable", OwnerChatProviderUnavailable),
+        ("invalid", OwnerChatProviderInvalidResponse),
+    ],
+)
+def test_mock_failures_keep_safe_accounting_identifiers(
+    behavior: str,
+    error_type: type[OwnerChatProviderError],
+) -> None:
+    provider = DeterministicMockOwnerChatProvider(behavior=behavior)  # type: ignore[arg-type]
+
+    with pytest.raises(error_type) as raised:
+        provider.generate(provider_request())
+
+    error = raised.value
+    assert error.provider_identifier == "mock"
+    assert error.model_identifier == "deterministic"
+    assert error.usage_uncertain is True
 
 
 def test_unknown_provider_and_nonpositive_timeout_are_rejected() -> None:

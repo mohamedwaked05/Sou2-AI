@@ -8,7 +8,7 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
-from typing import Annotated, Any, Literal, Protocol
+from typing import Annotated, Any, Literal, Protocol, runtime_checkable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -144,6 +144,7 @@ class OwnerChatResult:
     model_identifier: str | None = None
 
 
+@runtime_checkable
 class OwnerChatProvider(Protocol):
     """Replaceable provider boundary used by owner-chat orchestration."""
 
@@ -166,11 +167,20 @@ class DeterministicMockOwnerChatProvider:
 
     def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
         if self.behavior == "timeout":
-            raise OwnerChatProviderTimeout
+            raise OwnerChatProviderTimeout(
+                provider_identifier="mock",
+                model_identifier="deterministic",
+            )
         if self.behavior == "unavailable":
-            raise OwnerChatProviderUnavailable
+            raise OwnerChatProviderUnavailable(
+                provider_identifier="mock",
+                model_identifier="deterministic",
+            )
         if self.behavior == "invalid":
-            raise OwnerChatProviderInvalidResponse
+            raise OwnerChatProviderInvalidResponse(
+                provider_identifier="mock",
+                model_identifier="deterministic",
+            )
 
         owner_text = request.messages[-1].content.strip()
         facts = self._extract_facts(owner_text, request)
@@ -183,6 +193,8 @@ class DeterministicMockOwnerChatProvider:
             reply = "I saved the reusable business information from your message."
         else:
             reply = "I received your message and kept it in this owner conversation."
+        if estimate_utf8_tokens(reply) > request.max_output_tokens:
+            reply = "OK"
         input_tokens = self.estimate_input_tokens(request)
         output_tokens = estimate_utf8_tokens(reply)
         usage = TokenUsage(

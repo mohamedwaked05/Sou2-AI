@@ -7,8 +7,7 @@ Sou2AI is planned as a local AI assistant for small businesses, supporting Engli
 Milestone 7 is implemented. The backend includes authentication, isolated
 multi-business onboarding, database-controlled lifecycle management, and one
 persistent private owner conversation per business. Complete, confirmed active
-businesses can use the default
-offline deterministic mock or opt into local Ollama with `qwen2.5:7b`, retain full
+businesses use local Ollama with `qwen2.5:7b` in development, retain full
 chat history, and learn owner-reviewable permanent or expiring business facts.
 Idempotent submissions, PostgreSQL-backed
 turn ordering, cursor pagination, and tenant-scoped knowledge management are
@@ -41,9 +40,11 @@ allowance through the API.
 
 The planned architecture is a FastAPI backend, PostgreSQL with pgvector, local Ollama models, and a React frontend. The backend lives in [`backend/`](backend/README.md).
 
-Owner chat defaults to the offline mock. Local development can select Ollama with
-`OWNER_CHAT_PROVIDER=ollama`; startup remains independent of Ollama, and production
-will later use an approved cloud provider through the same abstraction.
+Local development uses deployment-wide Ollama for every business; startup remains
+independent of Ollama. The mock provider is explicit and offline-only for tests or
+offline development—there is no automatic fallback. Milestone 9 found critical
+multilingual failures, so Qwen2.5 7B is not production-approved. Production will
+later use an approved OpenAI model through this boundary; OpenAI is not implemented.
 
 - [Project specification](PROJECT.md)
 - [System architecture](ARCHITECTURE.md)

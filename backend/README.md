@@ -129,10 +129,12 @@ uvicorn app.main:app --reload
 
 Open Swagger UI at <http://127.0.0.1:8000/docs>.
 
-### Optional local Ollama owner chat
+### Local Ollama owner chat
 
-Owner chat defaults to `OWNER_CHAT_PROVIDER=mock`, which is deterministic and
-offline. To use the local complete-response provider, install/start Ollama and run:
+Local development uses deployment-wide `OWNER_CHAT_PROVIDER=ollama` for every
+business. The deterministic mock is explicit and offline-only for tests or offline
+development; Ollama failure never falls back to it. To use the local
+complete-response provider, install/start Ollama and run:
 
 ```powershell
 ollama list
@@ -390,13 +392,16 @@ after a crashed claimant, while `OWNER_CHAT_GENERATION_WAIT_SECONDS` bounds inli
 waiting. This coordinates independent replicas without Redis, workers,
 process-local locks, or holding a pooled connection during provider work.
 
-Provider selection is `OWNER_CHAT_PROVIDER=mock|ollama`. Ollama uses the configured
-base URL and model, a 120-second default HTTP timeout, JSON-schema structured
-output, and complete non-streaming responses. Its generation lease defaults to 150
-seconds and must exceed the HTTP timeout. The application still validates every
-proposed fact and remains authoritative for allowed knowledge categories. The
-provider-neutral business profile includes the authoritative seven-day stored
-schedule, including closed days and chronologically ordered local-time shifts.
+Provider selection is deployment-wide `OWNER_CHAT_PROVIDER=mock|ollama`; changing
+the provider or model requires a backend restart. Ollama uses the configured base
+URL and model, a 120-second default HTTP timeout, JSON-schema structured output,
+and complete non-streaming responses. Its generation lease defaults to 150 seconds
+and must exceed the HTTP timeout. The application still validates every proposed
+fact and remains authoritative for allowed knowledge categories. The provider-neutral
+business profile includes the authoritative seven-day stored schedule, including
+closed days and chronologically ordered local-time shifts. Provider-specific
+request/response formats remain inside the adapter, failures remain generic to
+owners, and no generation or provider failure is retried automatically.
 
 Learned facts have a normalized tenant-unique subject, allowed stable category,
 owner-chat provenance, and permanent or temporary lifecycle. Temporary facts need
@@ -427,10 +432,12 @@ scheduler will call the existing retention operation.
 
 ## Implementation boundary
 
-Milestone 7 and the early optional local Ollama provider are complete. Much of the
-later provider abstraction and the usage/cost-control foundation arrived early,
-without completing unrelated roadmap work. Later RAG,
-documents, cloud model connectivity, controlled live tools and analytics, customer
-channels, and frontend work remain planned only. Ollama is a local-development
-provider, not the production deployment decision.
+Milestone 10 completes the owner-chat-specific provider boundary. Ollama remains
+the local-development provider using `qwen2.5:7b`, but Milestone 9 found critical
+multilingual failures, so Qwen2.5 7B is not production-approved. Production will
+later use an approved OpenAI model through this boundary; no OpenAI integration is
+implemented here. Authoritative provider token counts are preferred; otherwise the
+existing conservative estimate is recorded as non-authoritative. Later RAG,
+documents, controlled live tools and analytics, customer channels, and frontend
+work remain planned only.
 Authentication alone never grants business access without membership.

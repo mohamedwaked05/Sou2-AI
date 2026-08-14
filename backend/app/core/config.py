@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     hsts_enabled: bool = False
     trusted_https_termination: bool = False
     log_level: str = "INFO"
-    owner_chat_provider: Literal["mock", "ollama"] = "mock"
+    owner_chat_provider: Literal["mock", "ollama"] = "ollama"
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_chat_model: str = "qwen2.5:7b"
     ollama_embedding_model: str = "bge-m3"
