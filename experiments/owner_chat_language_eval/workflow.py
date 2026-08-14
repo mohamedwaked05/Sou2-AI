@@ -199,13 +199,26 @@ def persist_run_document(
     document: dict[str, object],
     *,
     requested_path: Path | None = None,
+    canonical_baseline_path: Path = DEFAULT_BASELINE_PATH,
 ) -> Path:
     """Keep incomplete work separate and preserve completed baselines."""
     now = _utc_now()
+    run_kind = document.get("run_kind")
+    if run_kind not in {"baseline", "selective_rerun"}:
+        raise ValueError("Evaluation artifact has an invalid run kind.")
+    if run_kind == "baseline" and requested_path is not None:
+        raise ValueError("A full baseline cannot use a custom output path.")
+    if (
+        run_kind == "selective_rerun"
+        and requested_path is not None
+        and requested_path.resolve() == canonical_baseline_path.resolve()
+    ):
+        raise ValueError("A selective rerun cannot replace the canonical baseline.")
+
     if document.get("status") != "complete":
         target = INCOMPLETE_DIRECTORY / f"incomplete-{_timestamp_slug(now)}.json"
-    elif document.get("run_kind") == "baseline":
-        target = requested_path or DEFAULT_BASELINE_PATH
+    elif run_kind == "baseline":
+        target = canonical_baseline_path
     else:
         target = requested_path or (
             DEFAULT_RERUN_DIRECTORY / f"rerun-{_timestamp_slug(now)}.json"

@@ -57,7 +57,6 @@ def _build_parser() -> argparse.ArgumentParser:
     prepare = subparsers.add_parser(
         "prepare-scoring", help="Create a human-editable scoring artifact."
     )
-    prepare.add_argument("--run", type=Path, default=DEFAULT_BASELINE_PATH)
     prepare.add_argument("--output", type=Path, default=DEFAULT_SCORING_PATH)
 
     validate_scoring = subparsers.add_parser(
@@ -80,23 +79,34 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run_command(arguments: argparse.Namespace) -> int:
+def _run_command(
+    arguments: argparse.Namespace,
+    *,
+    canonical_baseline_path: Path = DEFAULT_BASELINE_PATH,
+) -> int:
     scenarios = load_dataset()
     fixture = load_fixture()
     selected = select_scenarios(scenarios, arguments.scenario_ids)
     run_kind = "selective_rerun" if arguments.scenario_ids else "baseline"
 
+    if run_kind == "baseline" and arguments.output is not None:
+        raise ValueError(
+            "A full baseline always uses results/baseline.json; --output is only "
+            "available for selective reruns."
+        )
     if arguments.output is not None and arguments.output.exists():
         raise ValueError(f"Refusing to overwrite existing result: {arguments.output}")
-    if (
-        run_kind == "baseline"
-        and arguments.output is None
-        and DEFAULT_BASELINE_PATH.exists()
-    ):
+    if run_kind == "baseline" and canonical_baseline_path.exists():
         raise ValueError(
             f"Completed baseline already exists and will not be replaced: "
-            f"{DEFAULT_BASELINE_PATH}"
+            f"{canonical_baseline_path}"
         )
+    if (
+        run_kind == "selective_rerun"
+        and arguments.output is not None
+        and arguments.output.resolve() == canonical_baseline_path.resolve()
+    ):
+        raise ValueError("A selective rerun cannot replace the canonical baseline.")
 
     settings = Settings(_env_file=REPOSITORY_ROOT / "backend" / ".env")
     provider = OllamaOwnerChatProvider(
@@ -110,7 +120,11 @@ def _run_command(arguments: argparse.Namespace) -> int:
         fixture=fixture,
         run_kind=run_kind,
     )
-    output_path = persist_run_document(document, requested_path=arguments.output)
+    output_path = persist_run_document(
+        document,
+        requested_path=arguments.output,
+        canonical_baseline_path=canonical_baseline_path,
+    )
     print(f"{document['status']} evaluation artifact: {output_path}")
     return 0 if document["status"] == "complete" else 2
 
@@ -131,8 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.command == "run":
             return _run_command(arguments)
         if arguments.command == "prepare-scoring":
-            run_document = load_json_document(arguments.run)
-            template = build_scoring_template(run_document)
+            template = build_scoring_template()
             output_path = write_json_exclusive(arguments.output, template)
             print(f"scoring template: {output_path}")
             return 0

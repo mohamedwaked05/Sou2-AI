@@ -16,8 +16,10 @@ answers must remain English under the existing owner-chat contract.
   expected behavior for deterministic checks and human review.
 - `data/business_fixture.json` — deterministic profile, hours, knowledge, and
   request time shared by all scenarios.
-- `results/` — optional completed baseline, scoring artifact, report, and
-  selective reruns suitable for version control after review.
+- `results/baseline.json` — the one canonical, commit-ready baseline evidence.
+- `results/manual_scoring.json` — human reviews bound to the exact canonical
+  baseline bytes, without a duplicate editable copy of its responses.
+- `results/reruns/` — optional selective reruns kept outside baseline scoring.
 - `artifacts/` — ignored incomplete/interrupted runs. They cannot be mistaken
   for a completed baseline.
 
@@ -50,21 +52,33 @@ Run commands from the repository root with the existing Python environment:
 .\backend\.venv\Scripts\python.exe -m experiments.owner_chat_language_eval run
 ```
 
-The baseline command calls every scenario once and writes
-`results/baseline.json` only if all 50 calls succeed. It refuses to overwrite an
-existing completed baseline. A provider failure or interruption writes a
-separate ignored artifact under `artifacts/incomplete/` and exits unsuccessfully.
+The full-run command calls every scenario once and can write only the canonical
+`results/baseline.json`. A full baseline cannot use `--output`. If the canonical
+artifact already exists, the runner rejects another baseline before contacting
+Ollama. A provider failure or interruption writes a separate ignored artifact
+under `artifacts/incomplete/` and exits unsuccessfully.
+
+To intentionally restart an unscored baseline, first manually preserve the old
+`results/baseline.json` outside the canonical path for investigation, or
+intentionally remove it after deciding it is not evidence you need to retain.
+Then run the normal baseline command again. The tooling provides no automatic
+overwrite or deletion command. Never restart after scoring merely to replace an
+unfavorable result; preserve the evaluated evidence and use clearly labelled
+selective reruns instead.
 
 Rerun selected stable IDs without altering or replacing the baseline:
 
 ```powershell
 .\backend\.venv\Scripts\python.exe -m experiments.owner_chat_language_eval run `
   --scenario-id m9-fr-04-live-inventory `
-  --scenario-id m9-mx-08-prompt-override
+  --scenario-id m9-mx-08-prompt-override `
+  --output experiments\owner_chat_language_eval\results\reruns\focused-review.json
 ```
 
 Completed selective reruns are stored below `results/reruns/`, identified as
-reruns, and excluded from baseline scores and the model decision.
+reruns, and excluded from baseline scores and the model decision. A selective
+rerun may use a custom output path, but it cannot replace or modify the canonical
+baseline.
 
 ## Human scoring and report
 
@@ -73,6 +87,14 @@ Create the scoring-ready JSON after a complete baseline:
 ```powershell
 .\backend\.venv\Scripts\python.exe -m experiments.owner_chat_language_eval prepare-scoring
 ```
+
+Preparation records the fixed repository-relative canonical baseline reference
+and the SHA-256 fingerprint of its exact bytes. It does not copy the baseline
+responses into the editable scoring file. Validation and report generation load
+`results/baseline.json` independently, verify that fingerprint, and use the
+verified baseline as the only source of responses, warnings, model metadata,
+configuration, and timestamps. Changing the canonical baseline after scoring
+preparation invalidates the scoring artifact and blocks validation and reports.
 
 In `results/manual_scoring.json`, enter an integer `0`, `1`, or `2` for each of
 `intent`, `relevance`, `hallucination`, `clarification`, `tone`, and

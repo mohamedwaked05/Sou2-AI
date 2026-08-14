@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import shutil
 import sys
+from argparse import Namespace
 from collections import Counter, defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import httpx
@@ -21,6 +25,9 @@ from app.agent.owner_chat_provider import (  # noqa: E402
     OllamaOwnerChatProvider,
     OwnerChatResult,
     ProposedKnowledge,
+)
+from experiments.owner_chat_language_eval import (  # noqa: E402
+    __main__ as evaluation_cli,
 )
 from experiments.owner_chat_language_eval.checks import (  # noqa: E402
     run_deterministic_checks,
@@ -40,6 +47,7 @@ from experiments.owner_chat_language_eval.models import (  # noqa: E402
     RubricScores,
 )
 from experiments.owner_chat_language_eval.scoring import (  # noqa: E402
+    CANONICAL_BASELINE_REFERENCE,
     build_scoring_template,
     calculate_language_results,
     decide_model,
@@ -51,6 +59,39 @@ from experiments.owner_chat_language_eval.workflow import (  # noqa: E402
     execute_evaluation,
     persist_run_document,
 )
+
+EVALUATION_TEST_ARTIFACTS = (
+    REPOSITORY_ROOT / "experiments" / "owner_chat_language_eval" / "artifacts" / "tests"
+)
+
+
+@pytest.fixture
+def evaluation_repository() -> Path:
+    root = EVALUATION_TEST_ARTIFACTS / str(uuid4())
+    root.mkdir(parents=True)
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root)
+
+
+def canonical_baseline_path(repository_root: Path) -> Path:
+    return repository_root.joinpath(*CANONICAL_BASELINE_REFERENCE.split("/"))
+
+
+def write_canonical_baseline(
+    repository_root: Path,
+    document: dict[str, object] | None = None,
+) -> Path:
+    path = canonical_baseline_path(repository_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(document or completed_baseline(), ensure_ascii=False, indent=2)
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return path
 
 
 def completed_baseline() -> dict[str, object]:
@@ -93,8 +134,27 @@ def completed_baseline() -> dict[str, object]:
     }
 
 
-def completed_scoring() -> dict[str, object]:
-    scoring = build_scoring_template(completed_baseline())
+def completed_selective_rerun() -> dict[str, object]:
+    document = completed_baseline()
+    document["run_kind"] = "selective_rerun"
+    results = document["results"]
+    assert isinstance(results, list)
+    document["results"] = results[:1]
+    configuration = document["configuration"]
+    assert isinstance(configuration, dict)
+    configuration["scenario_count"] = 1
+    return document
+
+
+def completed_scoring(repository_root: Path) -> dict[str, object]:
+    if not canonical_baseline_path(repository_root).exists():
+        write_canonical_baseline(repository_root)
+    scoring = build_scoring_template(repository_root=repository_root)
+    complete_reviews(scoring)
+    return scoring
+
+
+def complete_reviews(scoring: dict[str, object]) -> None:
     reviews = scoring["reviews"]
     assert isinstance(reviews, list)
     for review in reviews:
@@ -105,7 +165,24 @@ def completed_scoring() -> dict[str, object]:
             "categories": [],
             "explanation": "No critical failure observed.",
         }
-    return scoring
+
+
+def mock_cli_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    document: dict[str, object],
+) -> None:
+    settings = SimpleNamespace(
+        ollama_base_url="http://ollama.invalid",
+        ollama_chat_model="qwen2.5:7b",
+        ollama_request_timeout_seconds=120,
+    )
+    monkeypatch.setattr(evaluation_cli, "Settings", lambda **_: settings)
+    monkeypatch.setattr(
+        evaluation_cli,
+        "OllamaOwnerChatProvider",
+        lambda **_: SimpleNamespace(model="qwen2.5:7b", timeout_seconds=120),
+    )
+    monkeypatch.setattr(evaluation_cli, "execute_evaluation", lambda **_: document)
 
 
 def test_dataset_has_exact_comparable_language_matrix_and_stable_ids() -> None:
@@ -171,8 +248,10 @@ def test_any_zero_score_is_a_normal_failure() -> None:
     assert normal_failure(failing) is True
 
 
-def test_language_failure_rate_is_failed_scenarios_divided_by_ten() -> None:
-    scoring = completed_scoring()
+def test_language_failure_rate_is_failed_scenarios_divided_by_ten(
+    evaluation_repository: Path,
+) -> None:
+    scoring = completed_scoring(evaluation_repository)
     reviews = scoring["reviews"]
     assert isinstance(reviews, list)
     first = reviews[0]
@@ -181,15 +260,17 @@ def test_language_failure_rate_is_failed_scenarios_divided_by_ten() -> None:
     assert isinstance(scores, dict)
     scores["intent"] = 0
 
-    summary = calculate_language_results(scoring)
+    summary = calculate_language_results(scoring, repository_root=evaluation_repository)
 
     assert summary["english"]["failed_scenarios"] == 1
     assert summary["english"]["failure_rate_percent"] == 10.0
     assert summary["arabic"]["failure_rate_percent"] == 0.0
 
 
-def test_confirmed_critical_failure_rejects_model() -> None:
-    scoring = completed_scoring()
+def test_confirmed_critical_failure_rejects_model(
+    evaluation_repository: Path,
+) -> None:
+    scoring = completed_scoring(evaluation_repository)
     reviews = scoring["reviews"]
     assert isinstance(reviews, list)
     review = reviews[0]
@@ -200,26 +281,34 @@ def test_confirmed_critical_failure_rejects_model() -> None:
         "explanation": "The answer invented a stock quantity.",
     }
 
-    decision = decide_model(scoring)
+    decision = decide_model(scoring, repository_root=evaluation_repository)
 
     assert decision["accepted"] is False
     assert decision["decision"] == "reject_qwen2.5_7b"
 
 
-def test_zero_confirmed_critical_failures_keeps_model_accepted() -> None:
-    decision = decide_model(completed_scoring())
+def test_zero_confirmed_critical_failures_keeps_model_accepted(
+    evaluation_repository: Path,
+) -> None:
+    decision = decide_model(
+        completed_scoring(evaluation_repository),
+        repository_root=evaluation_repository,
+    )
 
     assert decision["accepted"] is True
     assert decision["decision"] == "keep_qwen2.5_7b"
 
 
-def test_incomplete_human_scoring_cannot_generate_report() -> None:
-    scoring = build_scoring_template(completed_baseline())
+def test_incomplete_human_scoring_cannot_generate_report(
+    evaluation_repository: Path,
+) -> None:
+    write_canonical_baseline(evaluation_repository)
+    scoring = build_scoring_template(repository_root=evaluation_repository)
 
     with pytest.raises(ValueError, match="incomplete rubric scores"):
-        validate_completed_scoring(scoring)
+        validate_completed_scoring(scoring, repository_root=evaluation_repository)
     with pytest.raises(ValueError, match="incomplete rubric scores"):
-        render_report(scoring)
+        render_report(scoring, repository_root=evaluation_repository)
 
 
 def test_selective_scenario_filtering_preserves_dataset_order() -> None:
@@ -238,22 +327,263 @@ def test_selective_scenario_filtering_preserves_dataset_order() -> None:
         select_scenarios(scenarios, ["m9-unknown"])
 
 
-def test_completed_baseline_is_never_silently_overwritten() -> None:
-    target = (
-        REPOSITORY_ROOT
-        / "experiments"
-        / "owner_chat_language_eval"
-        / "artifacts"
-        / f"test-baseline-{uuid4()}.json"
-    )
-    document = completed_baseline()
+def test_full_baseline_uses_only_canonical_path(
+    evaluation_repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical_path = canonical_baseline_path(evaluation_repository)
+    mock_cli_execution(monkeypatch, completed_baseline())
 
-    try:
-        persist_run_document(document, requested_path=target)
-        with pytest.raises(ValueError, match="Refusing to overwrite"):
-            persist_run_document(document, requested_path=target)
-    finally:
-        target.unlink(missing_ok=True)
+    exit_code = evaluation_cli._run_command(
+        Namespace(scenario_ids=None, output=None),
+        canonical_baseline_path=canonical_path,
+    )
+
+    assert exit_code == 0
+    assert canonical_path.exists()
+    assert json.loads(canonical_path.read_text(encoding="utf-8"))["run_kind"] == (
+        "baseline"
+    )
+
+
+def test_baseline_with_custom_output_is_rejected_before_provider_execution(
+    evaluation_repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_constructions = 0
+
+    def provider(**_: object) -> object:
+        nonlocal provider_constructions
+        provider_constructions += 1
+        raise AssertionError("Provider must not be constructed.")
+
+    monkeypatch.setattr(evaluation_cli, "OllamaOwnerChatProvider", provider)
+
+    with pytest.raises(ValueError, match="--output is only available"):
+        evaluation_cli._run_command(
+            Namespace(
+                scenario_ids=None,
+                output=evaluation_repository / "not-a-baseline.json",
+            ),
+            canonical_baseline_path=canonical_baseline_path(evaluation_repository),
+        )
+
+    assert provider_constructions == 0
+
+
+def test_second_full_baseline_is_rejected_before_provider_execution(
+    evaluation_repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_canonical_baseline(evaluation_repository)
+    provider_constructions = 0
+
+    def provider(**_: object) -> object:
+        nonlocal provider_constructions
+        provider_constructions += 1
+        raise AssertionError("Provider must not be constructed.")
+
+    monkeypatch.setattr(evaluation_cli, "OllamaOwnerChatProvider", provider)
+
+    with pytest.raises(ValueError, match="already exists"):
+        evaluation_cli._run_command(
+            Namespace(scenario_ids=None, output=None),
+            canonical_baseline_path=canonical_baseline_path(evaluation_repository),
+        )
+
+    assert provider_constructions == 0
+
+
+def test_selective_rerun_may_use_custom_output(
+    evaluation_repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    custom_output = evaluation_repository / "selected.json"
+    mock_cli_execution(monkeypatch, completed_selective_rerun())
+
+    exit_code = evaluation_cli._run_command(
+        Namespace(
+            scenario_ids=["m9-en-01-working-hours"],
+            output=custom_output,
+        ),
+        canonical_baseline_path=canonical_baseline_path(evaluation_repository),
+    )
+
+    assert exit_code == 0
+    assert json.loads(custom_output.read_text(encoding="utf-8"))["run_kind"] == (
+        "selective_rerun"
+    )
+
+
+def test_selective_rerun_never_modifies_canonical_baseline(
+    evaluation_repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical_path = write_canonical_baseline(evaluation_repository)
+    original_baseline = canonical_path.read_bytes()
+    custom_output = evaluation_repository / "rerun.json"
+    mock_cli_execution(monkeypatch, completed_selective_rerun())
+
+    evaluation_cli._run_command(
+        Namespace(
+            scenario_ids=["m9-en-01-working-hours"],
+            output=custom_output,
+        ),
+        canonical_baseline_path=canonical_path,
+    )
+
+    assert canonical_path.read_bytes() == original_baseline
+    with pytest.raises(ValueError, match="overwrite existing result"):
+        evaluation_cli._run_command(
+            Namespace(
+                scenario_ids=["m9-en-01-working-hours"],
+                output=canonical_path,
+            ),
+            canonical_baseline_path=canonical_path,
+        )
+    assert canonical_path.read_bytes() == original_baseline
+
+
+def test_persistence_rejects_a_custom_full_baseline_path(
+    evaluation_repository: Path,
+) -> None:
+    with pytest.raises(ValueError, match="full baseline cannot use"):
+        persist_run_document(
+            completed_baseline(),
+            requested_path=evaluation_repository / "alternate-baseline.json",
+            canonical_baseline_path=canonical_baseline_path(evaluation_repository),
+        )
+
+
+def test_scoring_preparation_binds_exact_canonical_baseline_bytes(
+    evaluation_repository: Path,
+) -> None:
+    baseline_path = write_canonical_baseline(evaluation_repository)
+
+    scoring = build_scoring_template(repository_root=evaluation_repository)
+
+    assert scoring["format_version"] == "2.0"
+    assert scoring["baseline_reference"] == CANONICAL_BASELINE_REFERENCE
+    assert (
+        scoring["baseline_sha256"]
+        == hashlib.sha256(baseline_path.read_bytes()).hexdigest()
+    )
+
+
+def test_scoring_artifact_does_not_embed_editable_baseline_evidence(
+    evaluation_repository: Path,
+) -> None:
+    write_canonical_baseline(evaluation_repository)
+
+    scoring = build_scoring_template(repository_root=evaluation_repository)
+    serialized = json.dumps(scoring)
+
+    assert "baseline_run" not in scoring
+    assert "results" not in scoring
+    assert "A valid English response." not in serialized
+
+
+def test_completed_scoring_validates_against_unchanged_canonical_baseline(
+    evaluation_repository: Path,
+) -> None:
+    scoring = completed_scoring(evaluation_repository)
+
+    reviews = validate_completed_scoring(scoring, repository_root=evaluation_repository)
+
+    assert len(reviews) == 50
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["response", "model", "warnings", "timestamp"],
+)
+def test_any_canonical_baseline_edit_invalidates_prepared_scoring(
+    mutation: str,
+    evaluation_repository: Path,
+) -> None:
+    scoring = completed_scoring(evaluation_repository)
+    changed = completed_baseline()
+    results = changed["results"]
+    configuration = changed["configuration"]
+    assert isinstance(results, list)
+    assert isinstance(results[0], dict)
+    assert isinstance(configuration, dict)
+    if mutation == "response":
+        results[0]["response"] = "An edited response."
+    elif mutation == "model":
+        configuration["model"] = "edited-model"
+    elif mutation == "warnings":
+        results[0]["deterministic_warnings"] = ["edited_warning"]
+    else:
+        changed["completed_at"] = "2026-08-14T11:00:00+00:00"
+    write_canonical_baseline(evaluation_repository, changed)
+
+    with pytest.raises(ValueError, match="changed after"):
+        validate_completed_scoring(scoring, repository_root=evaluation_repository)
+
+
+def test_missing_canonical_baseline_is_rejected(
+    evaluation_repository: Path,
+) -> None:
+    scoring = completed_scoring(evaluation_repository)
+    canonical_baseline_path(evaluation_repository).unlink()
+
+    with pytest.raises(ValueError, match="Canonical baseline is unavailable"):
+        validate_completed_scoring(scoring, repository_root=evaluation_repository)
+
+
+def test_incorrect_canonical_baseline_fingerprint_is_rejected(
+    evaluation_repository: Path,
+) -> None:
+    scoring = completed_scoring(evaluation_repository)
+    scoring["baseline_sha256"] = "0" * 64
+
+    with pytest.raises(ValueError, match="changed after"):
+        validate_completed_scoring(scoring, repository_root=evaluation_repository)
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "C:/tmp/baseline.json",
+        "/tmp/baseline.json",
+        "../results/baseline.json",
+        "experiments/owner_chat_language_eval/results/../baseline.json",
+        "experiments\\owner_chat_language_eval\\results\\baseline.json",
+    ],
+)
+def test_noncanonical_baseline_references_are_rejected(
+    reference: str,
+    evaluation_repository: Path,
+) -> None:
+    scoring = completed_scoring(evaluation_repository)
+    scoring["baseline_reference"] = reference
+
+    with pytest.raises(ValueError, match="reference is not canonical"):
+        validate_completed_scoring(scoring, repository_root=evaluation_repository)
+
+
+def test_report_uses_verified_canonical_baseline_metadata_and_warnings(
+    evaluation_repository: Path,
+) -> None:
+    baseline = completed_baseline()
+    baseline["completed_at"] = "2026-08-14T12:34:56+00:00"
+    configuration = baseline["configuration"]
+    results = baseline["results"]
+    assert isinstance(configuration, dict)
+    assert isinstance(results, list)
+    assert isinstance(results[0], dict)
+    configuration["model"] = "verified-qwen2.5:7b"
+    results[0]["deterministic_warnings"] = ["verified_baseline_warning"]
+    write_canonical_baseline(evaluation_repository, baseline)
+    scoring = build_scoring_template(repository_root=evaluation_repository)
+    complete_reviews(scoring)
+
+    report = render_report(scoring, repository_root=evaluation_repository)
+
+    assert "verified-qwen2.5:7b" in report
+    assert "2026-08-14T12:34:56+00:00" in report
+    assert "verified_baseline_warning" in report
 
 
 def test_runner_uses_existing_ollama_provider_with_mocked_transport() -> None:
@@ -354,7 +684,9 @@ def test_deterministic_checks_flag_language_and_unexpected_knowledge() -> None:
     assert critical_candidates == []
 
 
-def test_report_keeps_selective_reruns_separate_from_baseline_decision() -> None:
+def test_report_keeps_selective_reruns_separate_from_baseline_decision(
+    evaluation_repository: Path,
+) -> None:
     rerun = copy.deepcopy(completed_baseline())
     rerun["run_kind"] = "selective_rerun"
     results = rerun["results"]
@@ -364,7 +696,11 @@ def test_report_keeps_selective_reruns_separate_from_baseline_decision() -> None
     assert isinstance(configuration, dict)
     configuration["scenario_count"] = 1
 
-    report = render_report(completed_scoring(), selective_reruns=[rerun])
+    report = render_report(
+        completed_scoring(evaluation_repository),
+        selective_reruns=[rerun],
+        repository_root=evaluation_repository,
+    )
 
     assert "one baseline model call per scenario" in report
     assert "separate from the one-call-per-scenario baseline" in report

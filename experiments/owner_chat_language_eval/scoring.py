@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import re
 from collections import Counter
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from statistics import fmean
 from typing import Any
 
@@ -21,6 +24,56 @@ from experiments.owner_chat_language_eval.models import (
     RubricScores,
     ScenarioReview,
 )
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+CANONICAL_BASELINE_REFERENCE = (
+    "experiments/owner_chat_language_eval/results/baseline.json"
+)
+SCORING_FORMAT_VERSION = "2.0"
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+
+def _canonical_baseline_path(repository_root: Path) -> Path:
+    reference = PurePosixPath(CANONICAL_BASELINE_REFERENCE)
+    return repository_root.joinpath(*reference.parts)
+
+
+def _read_canonical_baseline(repository_root: Path) -> bytes:
+    path = _canonical_baseline_path(repository_root)
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"Canonical baseline is unavailable: {path}") from exc
+
+
+def _parse_json_object(content: bytes, *, artifact_name: str) -> dict[str, object]:
+    try:
+        document = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{artifact_name} is not valid UTF-8 JSON.") from exc
+    if not isinstance(document, dict):
+        raise ValueError(f"{artifact_name} must be a JSON object.")
+    return document
+
+
+def _sha256(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _validate_baseline_reference(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError(
+            "Scoring artifact is missing its canonical baseline reference."
+        )
+    reference = PurePosixPath(value)
+    if (
+        reference.is_absolute()
+        or "\\" in value
+        or ".." in reference.parts
+        or value != CANONICAL_BASELINE_REFERENCE
+    ):
+        raise ValueError("Scoring artifact baseline reference is not canonical.")
+    return value
 
 
 def _validated_baseline_results(
@@ -84,13 +137,20 @@ def _validated_baseline_results(
     return results
 
 
-def build_scoring_template(run_document: dict[str, object]) -> dict[str, object]:
-    """Create a human-editable review artifact from a completed baseline."""
+def build_scoring_template(
+    *, repository_root: Path = REPOSITORY_ROOT
+) -> dict[str, object]:
+    """Create reviews cryptographically bound to the canonical baseline bytes."""
+    baseline_bytes = _read_canonical_baseline(repository_root)
+    run_document = _parse_json_object(
+        baseline_bytes, artifact_name="Canonical baseline"
+    )
     results = _validated_baseline_results(run_document)
     return {
-        "format_version": "1.0",
+        "format_version": SCORING_FORMAT_VERSION,
         "artifact_kind": "manual_scoring",
-        "baseline_run": run_document,
+        "baseline_reference": CANONICAL_BASELINE_REFERENCE,
+        "baseline_sha256": _sha256(baseline_bytes),
         "reviews": [
             {
                 "scenario_id": result["scenario_id"],
@@ -108,6 +168,28 @@ def build_scoring_template(run_document: dict[str, object]) -> dict[str, object]
     }
 
 
+def _load_verified_baseline(
+    scoring_document: dict[str, object],
+    *,
+    repository_root: Path,
+) -> tuple[dict[str, object], list[dict[str, Any]]]:
+    _validate_baseline_reference(scoring_document.get("baseline_reference"))
+    expected_fingerprint = scoring_document.get("baseline_sha256")
+    if (
+        not isinstance(expected_fingerprint, str)
+        or SHA256_PATTERN.fullmatch(expected_fingerprint) is None
+    ):
+        raise ValueError("Scoring artifact baseline fingerprint is invalid.")
+    baseline_bytes = _read_canonical_baseline(repository_root)
+    actual_fingerprint = _sha256(baseline_bytes)
+    if not hmac.compare_digest(expected_fingerprint, actual_fingerprint):
+        raise ValueError(
+            "Canonical baseline changed after this scoring artifact was prepared."
+        )
+    baseline = _parse_json_object(baseline_bytes, artifact_name="Canonical baseline")
+    return baseline, _validated_baseline_results(baseline)
+
+
 def normal_failure(scores: RubricScores) -> bool:
     """A scenario fails normally when any of the six human scores is zero."""
     values = scores.values_by_criterion().values()
@@ -120,17 +202,19 @@ def normal_failure(scores: RubricScores) -> bool:
 
 def validate_completed_scoring(
     scoring_document: dict[str, object],
+    *,
+    repository_root: Path = REPOSITORY_ROOT,
 ) -> list[ScenarioReview]:
     """Require all six scores and explicit critical review for all 50 scenarios."""
     if (
-        scoring_document.get("format_version") != "1.0"
+        scoring_document.get("format_version") != SCORING_FORMAT_VERSION
         or scoring_document.get("artifact_kind") != "manual_scoring"
+        or "baseline_run" in scoring_document
     ):
         raise ValueError("Scoring artifact format is invalid.")
-    baseline = scoring_document.get("baseline_run")
-    if not isinstance(baseline, dict):
-        raise ValueError("Scoring artifact is missing its baseline run.")
-    results = _validated_baseline_results(baseline)
+    _, results = _load_verified_baseline(
+        scoring_document, repository_root=repository_root
+    )
     expected_ids = [result["scenario_id"] for result in results]
     raw_reviews = scoring_document.get("reviews")
     if not isinstance(raw_reviews, list) or len(raw_reviews) != 50:
@@ -170,12 +254,16 @@ def validate_completed_scoring(
 
 def calculate_language_results(
     scoring_document: dict[str, object],
+    *,
+    repository_root: Path = REPOSITORY_ROOT,
 ) -> dict[str, dict[str, object]]:
     """Calculate normal failures and human criterion averages per language."""
-    reviews = validate_completed_scoring(scoring_document)
-    baseline = scoring_document["baseline_run"]
-    assert isinstance(baseline, dict)
-    results = _validated_baseline_results(baseline)
+    reviews = validate_completed_scoring(
+        scoring_document, repository_root=repository_root
+    )
+    _, results = _load_verified_baseline(
+        scoring_document, repository_root=repository_root
+    )
     reviews_by_id = {review.scenario_id: review for review in reviews}
     summary: dict[str, dict[str, object]] = {}
     for group in LanguageGroup:
@@ -206,9 +294,15 @@ def calculate_language_results(
     return summary
 
 
-def decide_model(scoring_document: dict[str, object]) -> dict[str, object]:
+def decide_model(
+    scoring_document: dict[str, object],
+    *,
+    repository_root: Path = REPOSITORY_ROOT,
+) -> dict[str, object]:
     """Apply the exact critical-failure-only model decision rule."""
-    reviews = validate_completed_scoring(scoring_document)
+    reviews = validate_completed_scoring(
+        scoring_document, repository_root=repository_root
+    )
     confirmed = [
         review for review in reviews if review.critical_failure_review.confirmed is True
     ]
@@ -236,16 +330,21 @@ def render_report(
     scoring_document: dict[str, object],
     *,
     selective_reruns: list[dict[str, object]] | None = None,
+    repository_root: Path = REPOSITORY_ROOT,
 ) -> str:
     """Render the final report only after all human review is valid."""
-    reviews = validate_completed_scoring(scoring_document)
-    summaries = calculate_language_results(scoring_document)
-    decision = decide_model(scoring_document)
-    baseline = scoring_document["baseline_run"]
-    assert isinstance(baseline, dict)
+    reviews = validate_completed_scoring(
+        scoring_document, repository_root=repository_root
+    )
+    summaries = calculate_language_results(
+        scoring_document, repository_root=repository_root
+    )
+    decision = decide_model(scoring_document, repository_root=repository_root)
+    baseline, results = _load_verified_baseline(
+        scoring_document, repository_root=repository_root
+    )
     configuration = baseline.get("configuration")
     assert isinstance(configuration, dict)
-    results = _validated_baseline_results(baseline)
     criterion_averages = {
         criterion: round(
             fmean(
