@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:17-alpine
+    image: pgvector/pgvector:0.8.0-pg17
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-sou2ai}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sou2ai_local}

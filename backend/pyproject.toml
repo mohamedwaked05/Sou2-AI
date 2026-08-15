@@ -18,6 +18,7 @@ dependencies = [
     "resend>=2.19,<3.0",
     "uvicorn>=0.40,<1.0",
     "pydantic-settings>=2.12,<3.0",
+    "pgvector>=0.3,<1.0",
     "sqlalchemy>=2.0,<3.0",
 ]
 
@@ -38,6 +39,7 @@ ignore = []
 
 [tool.ruff.lint.per-file-ignores]
 "alembic/versions/*.py" = ["E501"]
+"app/database/models.py" = ["E501"]
 
 [tool.ruff.format]
 quote-style = "double"

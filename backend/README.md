@@ -74,6 +74,13 @@ request UUID; client request IDs are ignored.
 
 ## Start PostgreSQL
 
+The compose service uses `pgvector/pgvector:0.8.0-pg17`. The Milestone 11
+migration enables `vector` in development and test databases. Documents store
+tenant-scoped metadata and provider-neutral storage keys only; file bytes, upload,
+parsing, embeddings, similarity indexes, retrieval, and RAG are not implemented.
+Migration downgrade intentionally retains the extension because future objects may
+depend on it.
+
 From the repository root:
 
 ```powershell

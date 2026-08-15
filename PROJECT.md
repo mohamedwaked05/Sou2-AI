@@ -252,12 +252,12 @@ Qwen2.5 7B is not production-approved after Milestone 9's critical failures.
 Production will later use an approved OpenAI model through this boundary; OpenAI
 integration is not implemented in this milestone.
 
-### Milestone 11: pgvector and knowledge storage
+### Milestone 11: pgvector and knowledge storage — Complete
 
-* Enable pgvector and add tenant-scoped document and chunk models.
+* Enable pgvector and add tenant-scoped document and chunk models with nullable `vector(1024)` embeddings.
 * Store safe file references, processing state, traceable source metadata, chunk order, and embedding metadata.
 * Add migrations, constraints, and indexes for tenant-safe retrieval.
-* Keep stable unstructured knowledge separate from structured and live operational data.
+* Keep document metadata and chunks separate from `business_knowledge`, profiles, chat history, and live operational data.
 
 ### Milestone 12: Secure document ingestion and chunking
 

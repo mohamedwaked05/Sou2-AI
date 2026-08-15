@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, time
 from enum import StrEnum
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -102,6 +103,13 @@ class AIUsageReservationStatus(StrEnum):
     CHARGED = "charged"
 
 
+class KnowledgeDocumentStatus(StrEnum):
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    READY = "READY"
+    FAILED = "FAILED"
+
+
 account_status_enum = ENUM(
     AccountStatus,
     name="account_status",
@@ -130,6 +138,11 @@ membership_permission_enum = ENUM(
 business_category_enum = ENUM(
     BusinessCategory,
     name="business_category",
+    values_callable=lambda items: [item.value for item in items],
+)
+knowledge_document_status_enum = ENUM(
+    KnowledgeDocumentStatus,
+    name="knowledge_document_status",
     values_callable=lambda items: [item.value for item in items],
 )
 
@@ -537,6 +550,9 @@ class Business(Base):
     )
     ai_allowance_config: Mapped[BusinessAIAllowanceConfig | None] = relationship(
         back_populates="business", passive_deletes=True
+    )
+    knowledge_documents: Mapped[list[KnowledgeDocument]] = relationship(
+        back_populates="business", cascade="all, delete-orphan", passive_deletes=True
     )
 
     @property
@@ -1244,3 +1260,189 @@ class ToolCallLog(Base):
     @validates("tool_name", "error_code")
     def trim_audit_text(self, _key: str, value: str | None) -> str | None:
         return value.strip() if value is not None else None
+
+
+class KnowledgeDocument(Base):
+    """Tenant-owned uploaded-document metadata, separate from owner-chat facts."""
+
+    __tablename__ = "knowledge_documents"
+    __table_args__ = (
+        CheckConstraint(
+            "char_length(btrim(original_filename)) BETWEEN 1 AND 255",
+            name="ck_knowledge_documents_filename",
+        ),
+        CheckConstraint(
+            "original_filename !~ '[/\\\\[:cntrl:]]'",
+            name="ck_knowledge_documents_filename_safe",
+        ),
+        CheckConstraint(
+            "char_length(btrim(mime_type)) BETWEEN 1 AND 255",
+            name="ck_knowledge_documents_mime_type",
+        ),
+        CheckConstraint("file_size_bytes > 0", name="ck_knowledge_documents_file_size"),
+        CheckConstraint(
+            "content_sha256 ~ '^[0-9a-f]{64}$'", name="ck_knowledge_documents_hash"
+        ),
+        CheckConstraint(
+            "char_length(btrim(storage_key)) BETWEEN 1 AND 1024 AND storage_key !~ '(^/|^[A-Za-z]:[/\\\\]|^https?://|(^|/)\\.\\.(/|$)|[[:cntrl:]])'",
+            name="ck_knowledge_documents_storage_key",
+        ),
+        CheckConstraint(
+            "page_count IS NULL OR page_count > 0",
+            name="ck_knowledge_documents_page_count",
+        ),
+        CheckConstraint(
+            "replaces_document_id IS NULL OR replaces_document_id <> id",
+            name="ck_knowledge_documents_not_self_replacement",
+        ),
+        CheckConstraint(
+            "failure_code IS NULL OR (char_length(failure_code) BETWEEN 1 AND 100 AND failure_code ~ '^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)*$')",
+            name="ck_knowledge_documents_failure_code",
+        ),
+        CheckConstraint(
+            "failure_message IS NULL OR (char_length(btrim(failure_message)) BETWEEN 1 AND 1000 AND failure_message !~ '[[:cntrl:]]')",
+            name="ck_knowledge_documents_failure_message",
+        ),
+        CheckConstraint(
+            "(status = 'PENDING' AND processing_started_at IS NULL AND processing_completed_at IS NULL AND failure_code IS NULL AND failure_message IS NULL) OR (status = 'PROCESSING' AND processing_started_at IS NOT NULL AND processing_completed_at IS NULL AND failure_code IS NULL AND failure_message IS NULL) OR (status = 'READY' AND processing_started_at IS NOT NULL AND processing_completed_at IS NOT NULL AND failure_code IS NULL AND failure_message IS NULL) OR (status = 'FAILED' AND processing_started_at IS NOT NULL AND processing_completed_at IS NOT NULL AND failure_code IS NOT NULL)",
+            name="ck_knowledge_documents_processing_metadata",
+        ),
+        UniqueConstraint(
+            "business_id", "content_sha256", name="uq_knowledge_documents_business_hash"
+        ),
+        UniqueConstraint(
+            "id", "business_id", name="uq_knowledge_documents_id_business"
+        ),
+        ForeignKeyConstraint(
+            ["replaces_document_id", "business_id"],
+            ["knowledge_documents.id", "knowledge_documents.business_id"],
+            name="fk_knowledge_documents_replacement_same_business",
+            ondelete="RESTRICT",
+        ),
+        Index(
+            "ix_knowledge_documents_business_status_created",
+            "business_id",
+            "status",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_knowledge_documents_business_updated", "business_id", "updated_at", "id"
+        ),
+        Index("ix_knowledge_documents_replaces", "replaces_document_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    uploaded_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    storage_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    status: Mapped[KnowledgeDocumentStatus] = mapped_column(
+        knowledge_document_status_enum,
+        nullable=False,
+        default=KnowledgeDocumentStatus.PENDING,
+        server_default=text("'PENDING'::knowledge_document_status"),
+    )
+    failure_code: Mapped[str | None] = mapped_column(String(100))
+    failure_message: Mapped[str | None] = mapped_column(String(1000))
+    page_count: Mapped[int | None] = mapped_column(Integer)
+    replaces_document_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    processing_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    processing_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    business: Mapped[Business] = relationship(back_populates="knowledge_documents")
+    chunks: Mapped[list[KnowledgeDocumentChunk]] = relationship(
+        back_populates="document", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+class KnowledgeDocumentChunk(Base):
+    """Traceable normalized text and optional future embedding for one document."""
+
+    __tablename__ = "knowledge_document_chunks"
+    __table_args__ = (
+        CheckConstraint("chunk_index >= 0", name="ck_knowledge_document_chunks_index"),
+        CheckConstraint(
+            "char_length(btrim(content)) BETWEEN 1 AND 100000",
+            name="ck_knowledge_document_chunks_content",
+        ),
+        CheckConstraint(
+            "character_count > 0 AND character_count = char_length(content)",
+            name="ck_knowledge_document_chunks_character_count",
+        ),
+        CheckConstraint(
+            "(page_start IS NULL AND page_end IS NULL) OR (page_start > 0 AND page_end >= page_start)",
+            name="ck_knowledge_document_chunks_pages",
+        ),
+        CheckConstraint(
+            "section_title IS NULL OR char_length(btrim(section_title)) BETWEEN 1 AND 500",
+            name="ck_knowledge_document_chunks_section",
+        ),
+        CheckConstraint(
+            "(embedding IS NULL AND embedding_model IS NULL AND embedded_at IS NULL) OR (embedding IS NOT NULL AND char_length(btrim(embedding_model)) BETWEEN 1 AND 255 AND embedded_at IS NOT NULL)",
+            name="ck_knowledge_document_chunks_embedding_metadata",
+        ),
+        UniqueConstraint(
+            "document_id", "chunk_index", name="uq_knowledge_document_chunks_order"
+        ),
+        ForeignKeyConstraint(
+            ["document_id", "business_id"],
+            ["knowledge_documents.id", "knowledge_documents.business_id"],
+            name="fk_knowledge_document_chunks_document_same_business",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "ix_knowledge_document_chunks_business_document_order",
+            "business_id",
+            "document_id",
+            "chunk_index",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    page_start: Mapped[int | None] = mapped_column(Integer)
+    page_end: Mapped[int | None] = mapped_column(Integer)
+    section_title: Mapped[str | None] = mapped_column(String(500))
+    character_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(1024))
+    embedding_model: Mapped[str | None] = mapped_column(String(255))
+    embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    document: Mapped[KnowledgeDocument] = relationship(back_populates="chunks")

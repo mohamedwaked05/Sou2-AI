@@ -335,7 +335,20 @@ adapters—will write exactly one audit row after business-scope and permission
 checks for every success, error, or denial. That executor and its adapters remain
 out of scope.
 
-## 13.3 API security and AI usage control
+## 13.3 Knowledge-document storage
+
+Knowledge documents are owned by one business and are separate from
+`business_knowledge`, business-profile facts, and chat history. PostgreSQL stores
+safe metadata and provider-neutral storage keys only; file bytes remain outside the
+database. Future development storage is private local storage and production
+storage will be private S3, neither of which is implemented here.
+
+Each chunk carries the owning `business_id` and references its document through a
+same-business composite foreign key. Embeddings are nullable `vector(1024)` values;
+generation and similarity indexing are deferred to Milestone 13. Upload, extraction,
+storage integration, embedding generation, retrieval, and RAG are not implemented.
+
+## 13.4 API security and AI usage control
 
 Every HTTP request receives a server-generated UUID returned as `X-Request-ID`,
 included in every error, and attached to privacy-safe internal logs. The outer

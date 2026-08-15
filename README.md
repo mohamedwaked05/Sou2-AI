@@ -40,6 +40,11 @@ allowance through the API.
 
 The planned architecture is a FastAPI backend, PostgreSQL with pgvector, local Ollama models, and a React frontend. The backend lives in [`backend/`](backend/README.md).
 
+PostgreSQL development uses pgvector. Tenant-owned document metadata and normalized
+chunks are separate from owner-chat `business_knowledge`; PostgreSQL stores only
+provider-neutral storage keys, never file bytes or public URLs. Upload, parsing,
+embeddings, retrieval, and RAG remain future work.
+
 Local development uses deployment-wide Ollama for every business; startup remains
 independent of Ollama. The mock provider is explicit and offline-only for tests or
 offline development—there is no automatic fallback. Milestone 9 found critical
