@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import time as time_module
 import uuid
 from argparse import ArgumentParser
 from collections import defaultdict
@@ -31,6 +32,7 @@ DEFAULT_REPORT_PATH = (
     Path(__file__).parents[2] / "evaluations" / "milestone_14_grounded_rag_result.json"
 )
 TENANT_ID = "evaluation-tenant"
+EVALUATION_REQUEST_INTERVAL_SECONDS = 2
 
 
 def _cosine(left: list[float], right: list[float]) -> float:
@@ -286,7 +288,11 @@ def main() -> None:
         outcomes = {case["id"]: _failure(case, (), exc.code) for case in cases}
     else:
         outcomes: dict[str, dict[str, object]] = {}
-        for case, vector in zip(cases, question_vectors, strict=True):
+        for index, (case, vector) in enumerate(
+            zip(cases, question_vectors, strict=True)
+        ):
+            if index:
+                time_module.sleep(EVALUATION_REQUEST_INTERVAL_SECONDS)
             ranked = sorted(
                 (
                     (_cosine(list(vector), list(item_vector)), document)

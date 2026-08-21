@@ -20,6 +20,14 @@ from app.core.config import Settings, get_settings
 logger = logging.getLogger(__name__)
 
 
+class _GeminiResponseParseError(ValueError):
+    """Internal safe classification for Gemini response parsing failures."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__()
+
+
 class OwnerChatProviderError(Exception):
     """Base class for safe provider failures with optional accounting metadata."""
 
@@ -721,11 +729,10 @@ class GeminiOwnerChatProvider:
             if response.status_code >= 400:
                 raise self._http_error(response.status_code, usage)
             try:
-                text = self._response_text(response_payload)
-                structured = _OllamaStructuredResult.model_validate_json(text)
-            except ValueError:
+                structured, text = self._structured_response(response_payload)
+            except _GeminiResponseParseError as exc:
                 raise OwnerChatProviderInvalidResponse(
-                    reason="invalid_structured_response",
+                    reason=exc.reason,
                     usage=usage,
                     provider_identifier="gemini",
                     model_identifier=self.model,
@@ -837,10 +844,13 @@ class GeminiOwnerChatProvider:
                 for message in request.messages
             ],
             "generationConfig": {
-                "temperature": 0,
                 "maxOutputTokens": request.max_output_tokens,
                 "responseMimeType": "application/json",
                 "responseJsonSchema": _OllamaStructuredResult.model_json_schema(),
+                "thinkingConfig": {
+                    "thinkingLevel": "LOW",
+                    "includeThoughts": False,
+                },
             },
         }
 
@@ -852,29 +862,74 @@ class GeminiOwnerChatProvider:
             return None
 
     @staticmethod
-    def _response_text(payload: object | None) -> str:
+    def _structured_response(
+        payload: object | None,
+    ) -> tuple[_OllamaStructuredResult, str]:
+        if GeminiOwnerChatProvider._is_blocked(payload, None):
+            raise _GeminiResponseParseError("response_blocked")
+        candidate = GeminiOwnerChatProvider._candidate(payload)
+        finish_reason = candidate.get("finishReason")
+        if finish_reason == "MAX_TOKENS":
+            raise _GeminiResponseParseError("output_truncated")
+        if GeminiOwnerChatProvider._is_blocked(payload, finish_reason):
+            raise _GeminiResponseParseError("response_blocked")
+        try:
+            text = GeminiOwnerChatProvider._response_text(candidate)
+            decoded = json.loads(text)
+        except json.JSONDecodeError:
+            raise _GeminiResponseParseError("invalid_json") from None
+        try:
+            return _OllamaStructuredResult.model_validate(decoded), text
+        except ValueError:
+            raise _GeminiResponseParseError("schema_validation_failed") from None
+
+    @staticmethod
+    def _candidate(payload: object | None) -> dict[str, object]:
         if not isinstance(payload, dict):
-            raise ValueError("invalid Gemini response")
+            raise _GeminiResponseParseError("missing_candidate")
         candidates = payload.get("candidates")
-        if not isinstance(candidates, list) or len(candidates) != 1:
-            raise ValueError("invalid Gemini candidates")
+        if not isinstance(candidates, list) or not candidates:
+            raise _GeminiResponseParseError("missing_candidate")
         candidate = candidates[0]
         if not isinstance(candidate, dict):
-            raise ValueError("invalid Gemini candidate")
+            raise _GeminiResponseParseError("missing_candidate")
+        return candidate
+
+    @staticmethod
+    def _is_blocked(payload: object | None, finish_reason: object) -> bool:
+        if (
+            isinstance(payload, dict)
+            and isinstance(feedback := payload.get("promptFeedback"), dict)
+            and feedback.get("blockReason")
+        ):
+            return True
+        return finish_reason in {
+            "SAFETY",
+            "RECITATION",
+            "BLOCKLIST",
+            "PROHIBITED_CONTENT",
+            "SPII",
+            "IMAGE_SAFETY",
+            "MODEL_ARMOR",
+        }
+
+    @staticmethod
+    def _response_text(candidate: dict[str, object]) -> str:
         content = candidate.get("content")
         if not isinstance(content, dict):
-            raise ValueError("invalid Gemini content")
+            raise _GeminiResponseParseError("missing_final_text")
         parts = content.get("parts")
         if not isinstance(parts, list):
-            raise ValueError("invalid Gemini parts")
+            raise _GeminiResponseParseError("missing_final_text")
         final_parts = [
             part.get("text")
             for part in parts
             if isinstance(part, dict) and part.get("thought") is not True
         ]
-        if len(final_parts) != 1 or not isinstance(final_parts[0], str):
-            raise ValueError("invalid Gemini text")
-        return final_parts[0]
+        text_parts = [part for part in final_parts if isinstance(part, str)]
+        if not text_parts:
+            raise _GeminiResponseParseError("missing_final_text")
+        return "".join(text_parts)
 
     @staticmethod
     def _authoritative_usage(payload: object | None) -> TokenUsage | None:

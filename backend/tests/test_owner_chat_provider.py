@@ -913,6 +913,13 @@ def test_gemini_sends_key_only_in_header_and_never_logs_it(
     assert request.headers["x-goog-api-key"] == "test-key-not-production"
     assert b"test-key-not-production" not in request.content
     assert "test-key-not-production" not in str(request.url)
+    payload = json.loads(request.content)
+    generation_config = payload["generationConfig"]
+    assert "temperature" not in generation_config
+    assert generation_config["thinkingConfig"] == {
+        "thinkingLevel": "LOW",
+        "includeThoughts": False,
+    }
     assert logged == []
 
 
@@ -986,6 +993,31 @@ def test_gemini_uses_only_the_final_non_thought_part() -> None:
     assert result.reply == "Safe reply."
 
 
+def test_gemini_joins_split_final_json_parts() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"text": '{"reply":"Safe '},
+                                {"text": 'reply.","cited_source_ids":[],'},
+                                {"text": '"proposed_knowledge":[]}'},
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+    )
+
+    result = gemini_provider(transport).generate(provider_request())
+
+    assert result.reply == "Safe reply."
+
+
 @pytest.mark.parametrize(
     "metadata",
     [
@@ -1008,23 +1040,64 @@ def test_gemini_malformed_usage_metadata_is_not_authoritative(
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("payload", "reason"),
     [
-        {"candidates": [{"content": {"parts": [{"text": "not-json"}]}}]},
-        {
-            "candidates": [
-                {"content": {"parts": [{"text": json.dumps({"reply": "x"})}]}}
-            ]
-        },
+        (
+            {
+                "candidates": [
+                    {"content": {"parts": [{"text": "private provider body"}]}}
+                ],
+            },
+            "invalid_json",
+        ),
+        (
+            {
+                "candidates": [
+                    {"content": {"parts": [{"text": json.dumps({"reply": "x"})}]}}
+                ]
+            },
+            "schema_validation_failed",
+        ),
     ],
 )
-def test_gemini_malformed_or_missing_structured_fields_are_safe(
-    payload: dict[str, object],
+def test_gemini_invalid_json_or_schema_is_safe(
+    payload: dict[str, object], reason: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logged: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        owner_chat_provider.logger,
+        "warning",
+        lambda *arguments: logged.append(arguments),
+    )
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+    with pytest.raises(OwnerChatProviderInvalidResponse) as raised:
+        gemini_provider(transport).generate(provider_request())
+    assert raised.value.reason == reason
+    assert "test-key-not-production" not in repr(raised.value)
+    assert "private provider body" not in repr(raised.value)
+    assert logged == []
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        ({}, "missing_candidate"),
+        (
+            {"candidates": [{"content": {"parts": [{"thought": True}]}}]},
+            "missing_final_text",
+        ),
+        ({"candidates": [{"finishReason": "MAX_TOKENS"}]}, "output_truncated"),
+        ({"candidates": [{"finishReason": "SAFETY"}]}, "response_blocked"),
+        ({"promptFeedback": {"blockReason": "SAFETY"}}, "response_blocked"),
+    ],
+)
+def test_gemini_safe_response_failures_are_classified(
+    payload: dict[str, object], reason: str
 ) -> None:
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
     with pytest.raises(OwnerChatProviderInvalidResponse) as raised:
         gemini_provider(transport).generate(provider_request())
-    assert raised.value.reason == "invalid_structured_response"
+    assert raised.value.reason == reason
     assert "test-key-not-production" not in repr(raised.value)
 
 
