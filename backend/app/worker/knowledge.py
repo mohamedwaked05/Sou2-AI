@@ -21,7 +21,7 @@ from app.rag.document_processing import (
     chunk_text,
     validate_and_extract,
 )
-from app.storage.knowledge import LocalKnowledgeStorage
+from app.storage.knowledge import get_knowledge_storage
 
 PERMANENT = {
     "unsupported_document_type",
@@ -67,7 +67,7 @@ def process_document(document_id: str) -> None:
         document.processing_attempts += 1
         session.commit()
     try:
-        storage = LocalKnowledgeStorage(settings.knowledge_storage_root)
+        storage = get_knowledge_storage(settings)
         with storage.open(
             document.business_id, document.id, document.storage_key
         ) as source:
@@ -114,11 +114,12 @@ def process_document(document_id: str) -> None:
     except DocumentProcessingError as exc:
         _fail(identifier, exc.code)
     except Exception:
-        _fail(identifier, "processing_unavailable")
-        raise
+        retry = _fail(identifier, "processing_unavailable")
+        if retry:
+            raise
 
 
-def _fail(identifier: uuid.UUID, code: str) -> None:
+def _fail(identifier: uuid.UUID, code: str) -> bool:
     with get_session_factory()() as session:
         document = session.scalar(
             select(KnowledgeDocument)
@@ -129,13 +130,20 @@ def _fail(identifier: uuid.UUID, code: str) -> None:
             document is None
             or document.status is not KnowledgeDocumentStatus.PROCESSING
         ):
-            return
+            return False
         session.execute(
             delete(KnowledgeDocumentChunk).where(
                 KnowledgeDocumentChunk.document_id == identifier
             )
         )
-        document.status = KnowledgeDocumentStatus.FAILED
-        document.failure_code = code
-        document.processing_completed_at = utc_now()
+        retry = code not in PERMANENT and document.processing_attempts < 3
+        if retry:
+            document.status = KnowledgeDocumentStatus.PENDING
+            document.processing_started_at = None
+            document.processing_completed_at = None
+        else:
+            document.status = KnowledgeDocumentStatus.FAILED
+            document.failure_code = code
+            document.processing_completed_at = utc_now()
         session.commit()
+        return retry

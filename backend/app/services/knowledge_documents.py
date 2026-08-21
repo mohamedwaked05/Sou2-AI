@@ -15,15 +15,22 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.core.exceptions import ApplicationError
+from app.core.security import utc_now
 from app.database.models import (
     BusinessStatus,
     KnowledgeDocument,
     KnowledgeDocumentStatus,
     User,
 )
-from app.rag.document_processing import DocumentProcessingError, validate_and_extract
 from app.services.businesses import load_full_access_business
-from app.storage.knowledge import LocalKnowledgeStorage
+from app.storage.knowledge import get_knowledge_storage
+
+RETRYABLE_FAILURE_CODES = {
+    "queue_unavailable",
+    "processing_unavailable",
+    "storage_unavailable",
+    "processing_timeout",
+}
 
 
 def _error(code: str, status_code: int = 422) -> ApplicationError:
@@ -98,17 +105,23 @@ def upload(
     filename = _filename(file.filename)
     temporary, size, digest = _read_upload(file, settings)
     try:
-        data = temporary.read_bytes()
-        try:
-            inspected = validate_and_extract(
-                data,
-                filename,
-                file.content_type or "",
-                settings.knowledge_max_pdf_pages,
-                settings.knowledge_max_text_characters,
-            )
-        except DocumentProcessingError as exc:
-            raise _error(exc.code) from None
+        # Deep parsing deliberately belongs to the worker.  The API only checks
+        # extension/signature cheaply before durable enqueueing.
+        if (
+            filename.lower().endswith(".pdf")
+            and not temporary.read_bytes()[:5] == b"%PDF-"
+        ):
+            raise _error("document_content_mismatch")
+        inspected_mime = {
+            ".pdf": "application/pdf",
+            ".docx": (
+                "application/vnd.openxmlformats-officedocument.wordprocessingml."
+                "document"
+            ),
+            ".txt": "text/plain",
+        }.get(Path(filename).suffix.lower())
+        if inspected_mime is None:
+            raise _error("unsupported_document_type")
         if replaces is not None:
             source = _document(session, business_id, replaces, locked=True)
             if source.status in {
@@ -133,13 +146,13 @@ def upload(
             business_id=business_id,
             uploaded_by_user_id=user.id,
             original_filename=filename,
-            mime_type=inspected.mime_type,
+            mime_type=inspected_mime,
             file_size_bytes=size,
             content_sha256=digest,
             storage_key="pending",
             replaces_document_id=replaces,
         )
-        storage = LocalKnowledgeStorage(settings.knowledge_storage_root)
+        storage = get_knowledge_storage(settings)
         document.storage_key = storage.store(
             business_id, document.id, temporary.open("rb")
         )
@@ -161,7 +174,20 @@ def upload(
                 error_code="duplicate_document",
                 details={"document_id": str(existing.id)} if existing else None,
             ) from None
-        _queue(document.id, settings)
+        try:
+            _queue(document.id, settings)
+        except ApplicationError:
+            document.status = KnowledgeDocumentStatus.FAILED
+            document.failure_code = "queue_unavailable"
+            document.processing_started_at = utc_now()
+            document.processing_completed_at = utc_now()
+            session.commit()
+            raise ApplicationError(
+                "Document processing is temporarily unavailable.",
+                status_code=503,
+                error_code="queue_unavailable",
+                details={"document_id": str(document.id)},
+            ) from None
         return document
     finally:
         temporary.unlink(missing_ok=True)
@@ -212,7 +238,10 @@ def retry(
 ) -> KnowledgeDocument:
     _active(session, user, business_id)
     document = _document(session, business_id, document_id, True)
-    if document.status is not KnowledgeDocumentStatus.FAILED:
+    if (
+        document.status is not KnowledgeDocumentStatus.FAILED
+        or document.failure_code not in RETRYABLE_FAILURE_CODES
+    ):
         raise _error("document_not_retryable", 409)
     document.status = KnowledgeDocumentStatus.PENDING
     document.processing_started_at = None
@@ -221,7 +250,20 @@ def retry(
     document.failure_message = None
     document.processing_attempts = 0
     session.commit()
-    _queue(document.id, settings)
+    try:
+        _queue(document.id, settings)
+    except ApplicationError:
+        document.status = KnowledgeDocumentStatus.FAILED
+        document.processing_started_at = utc_now()
+        document.processing_completed_at = utc_now()
+        document.failure_code = "queue_unavailable"
+        session.commit()
+        raise ApplicationError(
+            "Document processing is temporarily unavailable.",
+            status_code=503,
+            error_code="queue_unavailable",
+            details={"document_id": str(document.id)},
+        ) from None
     return document
 
 
@@ -234,10 +276,25 @@ def remove(
 ) -> None:
     _active(session, user, business_id)
     document = _document(session, business_id, document_id, True)
-    storage = LocalKnowledgeStorage(settings.knowledge_storage_root)
+    if session.scalar(
+        select(KnowledgeDocument.id).where(
+            KnowledgeDocument.replaces_document_id == document.id
+        )
+    ):
+        raise _error("document_has_replacement", 409)
+    storage = get_knowledge_storage(settings)
     try:
-        storage.delete(business_id, document.id, document.storage_key)
+        staged = storage.stage_delete(business_id, document.id, document.storage_key)
     except OSError:
         raise _error("document_storage_unavailable", 503) from None
-    session.delete(document)
-    session.commit()
+    try:
+        session.delete(document)
+        session.commit()
+    except Exception:
+        session.rollback()
+        storage.restore(staged)
+        raise _error("document_delete_failed", 503) from None
+    try:
+        storage.finalize_delete(staged)
+    except OSError:
+        pass

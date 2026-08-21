@@ -19,6 +19,11 @@ class KnowledgeStorage(Protocol):
     def delete(
         self, business_id: uuid.UUID, document_id: uuid.UUID, key: str
     ) -> None: ...
+    def stage_delete(
+        self, business_id: uuid.UUID, document_id: uuid.UUID, key: str
+    ) -> object: ...
+    def restore(self, staged: object) -> None: ...
+    def finalize_delete(self, staged: object) -> None: ...
 
 
 class LocalKnowledgeStorage:
@@ -64,3 +69,24 @@ class LocalKnowledgeStorage:
 
     def delete(self, business_id: uuid.UUID, document_id: uuid.UUID, key: str) -> None:
         self._path(business_id, document_id, key).unlink(missing_ok=True)
+
+    def stage_delete(
+        self, business_id: uuid.UUID, document_id: uuid.UUID, key: str
+    ) -> Path:
+        path = self._path(business_id, document_id, key)
+        staged = path.with_name(f".{path.name}.{uuid.uuid4().hex}.deleting")
+        if path.exists():
+            os.replace(path, staged)
+        return staged
+
+    def restore(self, staged: object) -> None:
+        path = Path(staged)
+        if path.exists():
+            os.replace(path, path.with_name("source"))
+
+    def finalize_delete(self, staged: object) -> None:
+        Path(staged).unlink(missing_ok=True)
+
+
+def get_knowledge_storage(settings: object) -> KnowledgeStorage:
+    return LocalKnowledgeStorage(settings.knowledge_storage_root)  # type: ignore[attr-defined]

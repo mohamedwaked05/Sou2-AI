@@ -6,17 +6,22 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - sou2ai_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
   worker:
     build:
       context: ./backend
-    command: python -m rq worker knowledge --url redis://redis:6379/0 --worker-class rq.worker.SimpleWorker
+    command: python -m rq worker knowledge --url ${REDIS_URL:-redis://redis:6379/0}
     environment:
       REDIS_URL: redis://redis:6379/0
       KNOWLEDGE_STORAGE_ROOT: /app/data/knowledge
-      POSTGRESQL_DATABASE_URL: postgresql+psycopg://sou2ai_runtime_login:sou2ai_runtime_local@postgres:5432/sou2ai_dev
+      POSTGRESQL_DATABASE_URL: postgresql+psycopg://${POSTGRES_RUNTIME_USER:-sou2ai_runtime_login}:${POSTGRES_RUNTIME_PASSWORD:-sou2ai_runtime_local}@postgres:5432/${POSTGRES_DEV_DB:-sou2ai_dev}
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
       postgres:
         condition: service_healthy
     volumes:
