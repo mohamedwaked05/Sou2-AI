@@ -635,7 +635,7 @@ def test_lifecycle_update_and_audit_insert_are_atomic(
 
 
 def test_lifecycle_schema_has_one_head_and_no_legacy_active_column(
-    database_engine: Engine, alembic_config: Config
+    database_engine: Engine, migration_engine: Engine, alembic_config: Config
 ) -> None:
     inspector = inspect(database_engine)
     assert "business_lifecycle_history" in inspector.get_table_names()
@@ -643,7 +643,12 @@ def test_lifecycle_schema_has_one_head_and_no_legacy_active_column(
         column["name"] for column in inspector.get_columns("businesses")
     }
     heads = ScriptDirectory.from_config(alembic_config).get_heads()
-    assert heads == [MIGRATION_REVISION]
+    assert len(heads) == 1
+    with migration_engine.connect() as connection:
+        assert (
+            connection.scalar(text("SELECT version_num FROM alembic_version"))
+            == heads[0]
+        )
     with database_engine.connect() as connection:
         assert (
             connection.scalar(

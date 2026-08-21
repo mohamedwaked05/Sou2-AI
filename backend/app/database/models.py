@@ -1307,6 +1307,10 @@ class KnowledgeDocument(Base):
             "(status = 'PENDING' AND processing_started_at IS NULL AND processing_completed_at IS NULL AND failure_code IS NULL AND failure_message IS NULL) OR (status = 'PROCESSING' AND processing_started_at IS NOT NULL AND processing_completed_at IS NULL AND failure_code IS NULL AND failure_message IS NULL) OR (status = 'READY' AND processing_started_at IS NOT NULL AND processing_completed_at IS NOT NULL AND failure_code IS NULL AND failure_message IS NULL) OR (status = 'FAILED' AND processing_started_at IS NOT NULL AND processing_completed_at IS NOT NULL AND failure_code IS NOT NULL)",
             name="ck_knowledge_documents_processing_metadata",
         ),
+        CheckConstraint(
+            "processing_attempts BETWEEN 0 AND 3",
+            name="knowledge_documents_processing_attempts_check",
+        ),
         UniqueConstraint(
             "business_id", "content_sha256", name="uq_knowledge_documents_business_hash"
         ),
@@ -1330,6 +1334,12 @@ class KnowledgeDocument(Base):
             "ix_knowledge_documents_business_updated", "business_id", "updated_at", "id"
         ),
         Index("ix_knowledge_documents_replaces", "replaces_document_id"),
+        Index(
+            "uq_knowledge_documents_single_replacement",
+            "replaces_document_id",
+            unique=True,
+            postgresql_where=text("replaces_document_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
