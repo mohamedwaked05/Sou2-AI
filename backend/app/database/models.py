@@ -1133,6 +1133,59 @@ class OwnerChatMessage(Base):
     reply_to_message: Mapped[OwnerChatMessage | None] = relationship(
         remote_side=[id], foreign_keys=[reply_to_message_id]
     )
+    citations: Mapped[list[OwnerChatCitation]] = relationship(
+        back_populates="assistant_message", cascade="all, delete-orphan"
+    )
+
+
+class OwnerChatCitation(Base):
+    """Safe source snapshot used by one assistant message."""
+
+    __tablename__ = "owner_chat_citations"
+    __table_args__ = (
+        CheckConstraint("citation_order >= 0", name="ck_owner_chat_citations_order"),
+        CheckConstraint(
+            "label ~ '^S[1-9][0-9]*$'", name="ck_owner_chat_citations_label"
+        ),
+        UniqueConstraint(
+            "assistant_message_id",
+            "citation_order",
+            name="uq_owner_chat_citation_order",
+        ),
+        UniqueConstraint(
+            "assistant_message_id", "label", name="uq_owner_chat_citation_label"
+        ),
+        Index(
+            "ix_owner_chat_citations_business", "business_id", "assistant_message_id"
+        ),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    assistant_message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("owner_chat_messages.id", ondelete="CASCADE"), nullable=False
+    )
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("knowledge_documents.id", ondelete="SET NULL")
+    )
+    chunk_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("knowledge_document_chunks.id", ondelete="SET NULL")
+    )
+    citation_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    label: Mapped[str] = mapped_column(String(20), nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    page_start: Mapped[int | None] = mapped_column(Integer)
+    page_end: Mapped[int | None] = mapped_column(Integer)
+    section_title: Mapped[str | None] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    assistant_message: Mapped[OwnerChatMessage] = relationship(
+        back_populates="citations"
+    )
 
 
 class BusinessKnowledge(Base):

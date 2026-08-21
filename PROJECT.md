@@ -274,7 +274,7 @@ integration is not implemented in this milestone.
   Lebanese Arabic, Franco-Arabic, and mixed-language questions (98.3% overall),
   zero execution failures, and zero PostgreSQL-backed cross-tenant leakage.
 
-### Milestone 14: Complete RAG question-answering flow
+### Milestone 14: In Progress — RAG question-answering flow
 
 * Authenticate the user and authorize the selected business.
 * Retrieve relevant chunks and combine them with trusted business-profile facts.

@@ -59,6 +59,17 @@ class ChatMessageResponse(BaseModel):
     role: ChatMessageRole
     content: str
     created_at: datetime
+    sources: list[CitationResponse] = []
+
+
+class CitationResponse(BaseModel):
+    label: str
+    document_id: uuid.UUID | None
+    filename: str
+    page_start: int | None
+    page_end: int | None
+    section_title: str | None
+    available: bool
 
 
 class OwnerTurnResponse(BaseModel):

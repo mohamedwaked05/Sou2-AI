@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -24,6 +25,7 @@ from app.agent.owner_chat_provider import (
     ProviderBusinessProfile,
     ProviderKnowledge,
     ProviderMessage,
+    ProviderSource,
     ProviderWorkingDay,
     ProviderWorkingShift,
     TokenUsage,
@@ -39,10 +41,13 @@ from app.database.models import (
     BusinessStatus,
     ChatGenerationState,
     ChatMessageRole,
+    OwnerChatCitation,
     OwnerChatMessage,
     OwnerConversation,
     User,
 )
+from app.rag.embeddings import create_embedding_provider
+from app.rag.retrieval import retrieve
 from app.schemas.owner_chat import (
     ChatMessageResponse,
     ConversationHistoryResponse,
@@ -184,18 +189,40 @@ def _create_or_reuse_owner_message(
 
 
 def _message_response(message: OwnerChatMessage) -> ChatMessageResponse:
-    return ChatMessageResponse.model_validate(message, from_attributes=True)
+    return ChatMessageResponse(
+        id=message.id,
+        sequence_number=message.sequence_number,
+        role=message.role,
+        content=message.content,
+        created_at=message.created_at,
+        sources=[
+            {
+                "label": citation.label,
+                "document_id": citation.document_id,
+                "filename": citation.filename,
+                "page_start": citation.page_start,
+                "page_end": citation.page_end,
+                "section_title": citation.section_title,
+                "available": citation.document_id is not None,
+            }
+            for citation in sorted(
+                message.citations, key=lambda item: item.citation_order
+            )
+        ],
+    )
 
 
 def _completed_turn(
     session: Session, owner_message: OwnerChatMessage, replayed: bool
 ) -> OwnerTurnResponse | None:
     assistant = session.scalar(
-        select(OwnerChatMessage).where(
+        select(OwnerChatMessage)
+        .where(
             OwnerChatMessage.conversation_id == owner_message.conversation_id,
             OwnerChatMessage.reply_to_message_id == owner_message.id,
             OwnerChatMessage.role == ChatMessageRole.ASSISTANT,
         )
+        .options(selectinload(OwnerChatMessage.citations))
     )
     if assistant is None:
         return None
@@ -283,6 +310,7 @@ def _select_relevant_knowledge(
 
 def _build_provider_request(
     session: Session,
+    user: User,
     business_id: uuid.UUID,
     owner_message_id: uuid.UUID,
     settings: Settings,
@@ -321,6 +349,15 @@ def _build_provider_request(
         .order_by(BusinessKnowledge.updated_at.desc(), BusinessKnowledge.id.desc())
         .limit(settings.owner_chat_knowledge_context_limit)
     ).all()
+    retrieved = retrieve(
+        session,
+        user,
+        business_id,
+        owner_message.content,
+        create_embedding_provider(settings),
+        settings,
+    )
+    sources = _select_sources(retrieved.chunks, settings)
     request = OwnerChatRequest(
         profile=ProviderBusinessProfile(
             name=business.name,
@@ -349,6 +386,7 @@ def _build_provider_request(
             ),
         ),
         knowledge=_select_relevant_knowledge(knowledge, owner_message.content),
+        sources=sources,
         messages=tuple(
             ProviderMessage(role=str(message.role), content=message.content)
             for message in messages
@@ -358,6 +396,109 @@ def _build_provider_request(
     )
     session.commit()
     return request, business
+
+
+def _select_sources(
+    chunks: tuple[object, ...], settings: Settings
+) -> tuple[ProviderSource, ...]:
+    selected: list[ProviderSource] = []
+    seen: set[str] = set()
+    used = 0
+    for chunk in chunks:
+        content = str(chunk.content)
+        normalized = " ".join(content.split()).casefold()
+        tokens = estimate_utf8_tokens(content)
+        if (
+            normalized in seen
+            or _is_unsafe_source_content(content)
+            or len(selected) >= settings.rag_context_max_chunks
+        ):
+            continue
+        if used + tokens > settings.rag_context_max_tokens:
+            continue
+        seen.add(normalized)
+        used += tokens
+        selected.append(
+            ProviderSource(
+                label=f"S{len(selected) + 1}",
+                document_id=str(chunk.document_id),
+                filename=str(chunk.document_filename),
+                chunk_id=str(chunk.chunk_id),
+                content=content,
+                page_start=chunk.page_start,
+                page_end=chunk.page_end,
+                section_title=chunk.section_title,
+            )
+        )
+    return tuple(selected)
+
+
+def _normalized_safety_text(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _is_unsafe_source_content(content: str) -> bool:
+    """Exclude clear document instructions without changing stored source text."""
+    text = _normalized_safety_text(content)
+    override = (
+        "ignore all previous instructions",
+        "ignore previous instructions",
+        "replace system instructions",
+        "ignore system prompt",
+        "تجاهل التعليمات",
+        "تجاهل كل التعليمات",
+    )
+    sensitive = (
+        "system prompt",
+        "api key",
+        "password",
+        "token",
+        "credential",
+        "storage key",
+        "\u0645\u0641\u062a\u0627\u062d \u0627\u0644\u062a\u062e\u0632\u064a\u0646",
+        "كشف التعليمات",
+        "كلمة المرور",
+        "مفتاح التخزين",
+    )
+    action = (
+        "reveal",
+        "show me",
+        "expose",
+        "access another business",
+        "execute code",
+        "run sql",
+        "call tools",
+        "external request",
+        "اكشف",
+        "اعرض",
+        "نفذ",
+    )
+    return any(phrase in text for phrase in override) or (
+        any(phrase in text for phrase in action)
+        and any(phrase in text for phrase in sensitive)
+    )
+
+
+def _is_unsafe_reply(reply: str) -> bool:
+    text = _normalized_safety_text(reply)
+    sensitive_disclosure = (
+        "system prompt",
+        "storage key",
+        "api key",
+        "password is",
+        "token is",
+        "كلمة المرور هي",
+        "مفتاح التخزين",
+    )
+    follows_malicious_instruction = (
+        "i will follow the instructions",
+        "ignore all previous instructions",
+        "\u0627\u062a\u0628\u0639",
+        "سأتبع التعليمات",
+    )
+    return any(phrase in text for phrase in sensitive_disclosure) or any(
+        phrase in text for phrase in follows_malicious_instruction
+    )
 
 
 def _mark_failed(
@@ -413,14 +554,16 @@ def _undo_pre_provider_admission(
         raise RuntimeError("Owner generation admission could not be safely undone.")
 
 
-def _validate_result(result: object) -> OwnerChatResult:
+def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResult:
     if not isinstance(result, OwnerChatResult):
         raise OwnerChatProviderInvalidResponse
     if (
         not isinstance(result.reply, str)
         or not 1 <= len(result.reply.strip()) <= 14_000
     ):
-        raise OwnerChatProviderInvalidResponse
+        raise OwnerChatProviderInvalidResponse(reason="invalid_citations")
+    if _is_unsafe_reply(result.reply):
+        raise OwnerChatProviderInvalidResponse(reason="unsafe_output")
     if not isinstance(result.proposed_knowledge, tuple) or not all(
         hasattr(item, "subject_key")
         and hasattr(item, "content")
@@ -430,6 +573,16 @@ def _validate_result(result: object) -> OwnerChatResult:
     ):
         raise OwnerChatProviderInvalidResponse
     if result.usage is not None and result.usage.output_tokens < 0:
+        raise OwnerChatProviderInvalidResponse
+    labels = {source.label for source in request.sources}
+    if (
+        not isinstance(result.cited_source_ids, tuple)
+        or len(set(result.cited_source_ids)) != len(result.cited_source_ids)
+        or any(
+            not isinstance(label, str) or label not in labels
+            for label in result.cited_source_ids
+        )
+    ):
         raise OwnerChatProviderInvalidResponse
     return result
 
@@ -441,6 +594,7 @@ def _persist_result(
     result: OwnerChatResult,
     reservation: AIUsageReservationClaim,
     usage: TokenUsage,
+    request: OwnerChatRequest,
 ) -> None:
     owner_message = session.scalar(
         select(OwnerChatMessage)
@@ -463,6 +617,23 @@ def _persist_result(
         reply_to_message_id=owner_message.id,
     )
     session.add(assistant)
+    session.flush()
+    source_by_label = {source.label: source for source in request.sources}
+    session.add_all(
+        OwnerChatCitation(
+            business_id=business_id,
+            assistant_message_id=assistant.id,
+            document_id=uuid.UUID(source_by_label[label].document_id),
+            chunk_id=uuid.UUID(source_by_label[label].chunk_id),
+            citation_order=index,
+            label=label,
+            filename=source_by_label[label].filename,
+            page_start=source_by_label[label].page_start,
+            page_end=source_by_label[label].page_end,
+            section_title=source_by_label[label].section_title,
+        )
+        for index, label in enumerate(result.cited_source_ids)
+    )
     upsert_proposed_knowledge(
         session,
         business_id,
@@ -496,7 +667,7 @@ def _generate_claimed_turn(
     reservation: AIUsageReservationClaim | None = None
     try:
         request, business = _build_provider_request(
-            session, business_id, claim.message_id, settings
+            session, user, business_id, claim.message_id, settings
         )
         owner_message = session.get(OwnerChatMessage, claim.message_id)
         if owner_message is None:
@@ -519,7 +690,7 @@ def _generate_claimed_turn(
                     session, business_id, claim, generation_attempt
                 )
             raise
-        result = _validate_result(provider.generate(request))
+        result = _validate_result(provider.generate(request), request)
         usage = result.usage
         if usage is None:
             input_tokens = provider.estimate_input_tokens(request)
@@ -566,7 +737,9 @@ def _generate_claimed_turn(
         )
         raise _provider_unavailable() from None
     try:
-        _persist_result(session, business_id, claim, result, reservation, usage)
+        _persist_result(
+            session, business_id, claim, result, reservation, usage, request
+        )
     except Exception as exc:
         session.rollback()
         _mark_failed(
@@ -661,8 +834,10 @@ def get_conversation_history(
     )
     if conversation is None:
         return ConversationHistoryResponse(items=[], next_cursor=None)
-    query = select(OwnerChatMessage).where(
-        OwnerChatMessage.conversation_id == conversation.id
+    query = (
+        select(OwnerChatMessage)
+        .where(OwnerChatMessage.conversation_id == conversation.id)
+        .options(selectinload(OwnerChatMessage.citations))
     )
     if cursor is not None:
         sequence, message_id = _decode_cursor(cursor)

@@ -59,6 +59,31 @@ def retrieve(
     if business.status is not BusinessStatus.ACTIVE:
         raise PermissionError("business_not_active")
     try:
+        has_candidates = session.scalar(
+            select(KnowledgeDocumentChunk.id)
+            .join(
+                KnowledgeDocument,
+                KnowledgeDocument.id == KnowledgeDocumentChunk.document_id,
+            )
+            .where(
+                KnowledgeDocumentChunk.business_id == business_id,
+                KnowledgeDocument.status == KnowledgeDocumentStatus.READY,
+                KnowledgeDocumentChunk.embedding.is_not(None),
+                KnowledgeDocumentChunk.embedding_model == settings.embedding_model,
+            )
+            .limit(1)
+        )
+        if has_candidates is None:
+            result = RetrievalResult(status="NO_RELEVANT_KNOWLEDGE", chunks=())
+            _log(
+                request_id,
+                business_id,
+                settings.embedding_model,
+                result,
+                started,
+                "success",
+            )
+            return result
         vector = list(provider.embed([question]).vectors[0])
         distance = KnowledgeDocumentChunk.embedding.cosine_distance(vector)
         similarity = (1 - distance).label("similarity")

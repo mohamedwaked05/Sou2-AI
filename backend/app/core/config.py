@@ -132,15 +132,20 @@ class Settings(BaseSettings):
     hsts_enabled: bool = False
     trusted_https_termination: bool = False
     log_level: str = "INFO"
-    owner_chat_provider: Literal["mock", "ollama"] = "ollama"
+    owner_chat_provider: Literal["mock", "ollama", "gemini"] = "mock"
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_chat_model: str = "qwen2.5:7b"
+    gemini_chat_model: str = "gemini-3-flash-preview"
+    gemini_request_timeout_seconds: int = Field(default=120, ge=1)
+    gemini_api_key: SecretStr | None = None
     ollama_embedding_model: str = "bge-m3"
     embedding_provider: Literal["ollama"] = "ollama"
     embedding_model: str = "bge-m3"
     embedding_batch_size: int = Field(default=16, ge=1, le=128)
     retrieval_candidate_limit: int = Field(default=10, ge=1, le=100)
     retrieval_minimum_similarity: float = Field(default=0.50, ge=-1, le=1)
+    rag_context_max_chunks: int = Field(default=6, ge=1, le=10)
+    rag_context_max_tokens: int = Field(default=2500, ge=1, le=5000)
     ollama_request_timeout_seconds: int = Field(default=120, ge=1)
     postgresql_database_url: str = (
         "postgresql+psycopg://sou2ai_runtime_login:sou2ai_runtime_local@"
@@ -251,15 +256,23 @@ class Settings(BaseSettings):
         """Reject development-only authentication settings in production."""
         if self.refresh_cookie_samesite == "none" and not self.refresh_cookie_secure:
             raise ValueError("SameSite=None requires REFRESH_COOKIE_SECURE=true.")
-        if (
-            self.owner_chat_provider == "ollama"
-            and self.owner_chat_generation_lease_seconds
-            <= self.ollama_request_timeout_seconds
+        timeout_seconds = (
+            self.ollama_request_timeout_seconds
+            if self.owner_chat_provider == "ollama"
+            else self.gemini_request_timeout_seconds
+        )
+        if self.owner_chat_provider in {"ollama", "gemini"} and (
+            self.owner_chat_generation_lease_seconds <= timeout_seconds
         ):
             raise ValueError(
                 "OWNER_CHAT_GENERATION_LEASE_SECONDS must exceed "
-                "OLLAMA_REQUEST_TIMEOUT_SECONDS when using Ollama."
+                "the selected owner-chat provider timeout."
             )
+        if self.owner_chat_provider == "gemini" and (
+            self.gemini_api_key is None
+            or not self.gemini_api_key.get_secret_value().strip()
+        ):
+            raise ValueError("GEMINI_API_KEY is required when using Gemini.")
         if self.environment.lower() != "production":
             if self.hsts_enabled:
                 raise ValueError("HSTS is enabled only in production.")
