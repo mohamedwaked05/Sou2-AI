@@ -12,8 +12,10 @@ request IDs, safe errors, security headers, environment-aware documentation, and
 redacted console/JSON logging. Milestone 6 lifecycle controls and the verified
 mock/local-Ollama owner chat remain intact.
 
+Milestone 13 adds local BGE-M3 embeddings, atomic document embedding, internal
+tenant-scoped exact pgvector retrieval, and an internal re-embedding queue/CLI.
 It does **not** include customer chat, activation/admin APIs, cloud or paid model
-providers, RAG, embeddings, pgvector, documents, operational
+providers, RAG answer generation, public retrieval endpoints, operational
 integrations or analytics, tool execution, payments, frontend code, invitations,
 or additional roles.
 
@@ -467,3 +469,12 @@ knowledge`; one normal RQ worker processes one job at a time.
 the same storage interface but is not implemented. Run focused checks with
 `python -m pytest tests/test_knowledge_documents.py` and the full suite with
 `python -m pytest`.
+
+## Milestone 13 embeddings and retrieval
+
+Ollama embeddings use `POST /api/embed`, `EMBEDDING_PROVIDER=ollama`, and the
+configured `EMBEDDING_MODEL=bge-m3`. Chunk/query content and vectors are never
+logged. Documents become ready only after every deterministic chunk has a valid
+1024-dimension embedding. To queue replacement embeddings without re-reading source
+files, run `python -m app.rag.reembed --business-id <uuid>` or `--all` from
+`backend`; this uses the existing `knowledge` RQ queue.

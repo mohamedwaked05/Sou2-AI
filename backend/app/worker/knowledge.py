@@ -25,6 +25,11 @@ from app.rag.document_processing import (
     chunk_text,
     validate_and_extract,
 )
+from app.rag.embeddings import (
+    EmbeddingProviderError,
+    create_embedding_provider,
+    embed_batched,
+)
 from app.storage.knowledge import get_knowledge_storage
 
 PERMANENT = {
@@ -40,6 +45,12 @@ PERMANENT = {
     "empty_extracted_text",
     "extracted_text_limit_exceeded",
     "chunk_limit_exceeded",
+    "embedding_model_missing",
+    "embedding_invalid_response",
+    "embedding_http_error",
+    "embedding_output_count",
+    "embedding_dimension",
+    "embedding_invalid_values",
 }
 
 
@@ -134,6 +145,9 @@ def process_document(document_id: str) -> None:
         pieces = chunk_text(extracted.text)
         if len(pieces) > settings.knowledge_max_chunks:
             raise DocumentProcessingError("chunk_limit_exceeded")
+        embeddings = embed_batched(
+            create_embedding_provider(settings), pieces, settings.embedding_batch_size
+        )
         with get_session_factory()() as session:
             current = session.scalar(
                 select(KnowledgeDocument)
@@ -169,15 +183,23 @@ def process_document(document_id: str) -> None:
                     chunk_index=index,
                     content=piece,
                     character_count=len(piece),
+                    embedding=embeddings[index],
+                    embedding_model=settings.embedding_model,
+                    embedded_at=utc_now(),
                 )
                 for index, piece in enumerate(pieces)
             )
+            session.flush()
             current.page_count = extracted.page_count
             current.status = KnowledgeDocumentStatus.READY
             current.processing_completed_at = utc_now()
             session.commit()
     except DocumentProcessingError as exc:
         _fail(identifier, exc.code)
+    except EmbeddingProviderError as exc:
+        retry = _fail(identifier, exc.code)
+        if retry and exc.retryable:
+            raise
     except Exception:
         retry = _fail(identifier, "processing_unavailable")
         if retry:

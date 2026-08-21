@@ -344,9 +344,13 @@ database. Future development storage is private local storage and production
 storage will be private S3, neither of which is implemented here.
 
 Each chunk carries the owning `business_id` and references its document through a
-same-business composite foreign key. Embeddings are nullable `vector(1024)` values;
-generation and similarity indexing are deferred to Milestone 13. Upload, extraction,
-storage integration, embedding generation, retrieval, and RAG are not implemented.
+same-business composite foreign key. Embeddings are nullable `vector(1024)` values.
+Milestone 13 creates them through a provider-neutral local Ollama BGE-M3 adapter,
+validates every result, and writes all chunks/vectors atomically before marking a
+document `READY`. Internal exact cosine retrieval always filters by authorized
+business, `READY` documents, and the configured embedding model. It has no public
+endpoint or answer-generation integration. Re-embedding uses the same RQ queue and
+only replaces a complete valid vector set, retaining the prior set on failure.
 
 ## 13.4 API security and AI usage control
 

@@ -136,6 +136,11 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_chat_model: str = "qwen2.5:7b"
     ollama_embedding_model: str = "bge-m3"
+    embedding_provider: Literal["ollama"] = "ollama"
+    embedding_model: str = "bge-m3"
+    embedding_batch_size: int = Field(default=16, ge=1, le=128)
+    retrieval_candidate_limit: int = Field(default=10, ge=1, le=100)
+    retrieval_minimum_similarity: float = Field(default=0.50, ge=-1, le=1)
     ollama_request_timeout_seconds: int = Field(default=120, ge=1)
     postgresql_database_url: str = (
         "postgresql+psycopg://sou2ai_runtime_login:sou2ai_runtime_local@"
