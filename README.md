@@ -54,3 +54,14 @@ later use an approved OpenAI model through this boundary; OpenAI is not implemen
 - [Project specification](PROJECT.md)
 - [System architecture](ARCHITECTURE.md)
 - [Agent development rules](AGENTS.md)
+
+## Milestone 12: knowledge documents
+
+Authenticated full-access members of active businesses can upload private PDF,
+DOCX, and UTF-8 TXT knowledge sources. Redis/RQ runs a separate processing worker;
+the API returns `202` after durable storage and metadata creation. Files are kept
+outside public directories under provider-neutral keys, validated before queuing,
+and normalized into internal chunks only—there are no downloads, embeddings, or
+RAG endpoints. Limits are 5 MiB, 100 PDF pages, 500,000 extracted characters, and
+500 chunks. Failed documents have safe codes and may be retried; a replacement
+keeps the old READY version until its successor is READY. Deletion is permanent.

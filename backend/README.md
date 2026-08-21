@@ -448,3 +448,22 @@ existing conservative estimate is recorded as non-authoritative. Later RAG,
 documents, controlled live tools and analytics, customer channels, and frontend
 work remain planned only.
 Authentication alone never grants business access without membership.
+
+## Milestone 12 knowledge documents
+
+Supported private sources are PDF, DOCX, and UTF-8 TXT. Uploads require a full-
+access member of an `ACTIVE` business and return `202`; document metadata can be
+listed, read, replaced, retried after failure, or permanently deleted at
+`/api/v1/businesses/{business_id}/knowledge/documents`. There are no public files
+or chunk endpoints. Validation checks filename, declared MIME type, signature,
+structure, encryption, scanned PDFs, and limits (5 MiB, 100 pages, 500,000 text
+characters, 500 chunks). Errors use safe stable codes.
+
+Start infrastructure from the repository root with `docker compose up -d redis
+postgres worker`. For Windows local development, run the API normally and, from
+`backend`, run `python -m rq worker knowledge --url redis://127.0.0.1:6379/0
+--worker-class rq.worker.SimpleWorker`; one worker processes one job at a time.
+`KNOWLEDGE_STORAGE_ROOT` is private local development storage. Future S3 will use
+the same storage interface but is not implemented. Run focused checks with
+`python -m pytest tests/test_knowledge_documents.py` and the full suite with
+`python -m pytest`.

@@ -1,4 +1,26 @@
 services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - sou2ai_redis_data:/data
+  worker:
+    build:
+      context: ./backend
+    command: python -m rq worker knowledge --url redis://redis:6379/0 --worker-class rq.worker.SimpleWorker
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      KNOWLEDGE_STORAGE_ROOT: /app/data/knowledge
+      POSTGRESQL_DATABASE_URL: postgresql+psycopg://sou2ai_runtime_login:sou2ai_runtime_local@postgres:5432/sou2ai_dev
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
   postgres:
     image: pgvector/pgvector:0.8.0-pg17
     environment:
@@ -25,3 +47,4 @@ services:
 
 volumes:
   sou2ai_postgres_data:
+  sou2ai_redis_data:

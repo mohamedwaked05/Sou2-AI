@@ -259,14 +259,10 @@ integration is not implemented in this milestone.
 * Add migrations, constraints, and indexes for tenant-safe retrieval.
 * Keep document metadata and chunks separate from `business_knowledge`, profiles, chat history, and live operational data.
 
-### Milestone 12: Secure document ingestion and chunking
+### Milestone 12: Secure document ingestion and chunking — Complete
 
-* Add authenticated and authorized upload endpoints for approved file types.
-* Validate content, MIME type, size, page count, filename, and extraction result.
-* Extract, normalize, and split text into traceable chunks with page or section information.
-* Track pending, processing, ready, and failed states.
-* Add safe replacement and deletion behavior that also removes chunks and embeddings.
-* Test supported, corrupted, unsupported, and cross-tenant files.
+* Private tenant-scoped PDF, DOCX, and UTF-8 TXT uploads use local storage keys, Redis/RQ processing, safe extraction, and deterministic chunks; S3 remains a future provider.
+* Source document APIs require authenticated full access to an ACTIVE business, preserve safe errors, support retry/replacement/deletion, and never expose source files or chunks.
 
 ### Milestone 13: Embeddings and vector retrieval
 

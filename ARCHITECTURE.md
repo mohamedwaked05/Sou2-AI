@@ -472,3 +472,14 @@ limits and AI budgets, and the Milestone 7 HTTP/logging security boundary.
 Cloud-provider connectivity, pgvector, RAG, live tools and analytics, customer
 chat, documents, billing, activation APIs, and frontend functionality remain
 future work.
+
+## 17. Milestone 12 document ingestion
+
+An authenticated full-access member of an `ACTIVE` business submits a PDF, DOCX,
+or UTF-8 TXT source document to the API. The API streams it into a temporary file
+while calculating SHA-256, validates content and resource limits, writes private
+local storage atomically under a generated provider-neutral key, commits metadata,
+then sends only the document ID to Redis/RQ. The worker independently claims the
+tenant document, extracts and normalizes text locally, writes ordered chunks, and
+marks it `READY`; safe failures become `FAILED`. Source bytes and chunks are never
+public. The local storage interface is intentionally the future S3 boundary.

@@ -118,6 +118,16 @@ class Settings(BaseSettings):
     trusted_proxy_cidrs: list[str] = Field(default_factory=list)
     trusted_hosts: list[str] = Field(default_factory=lambda: ["localhost", "127.0.0.1"])
     max_request_body_bytes: int = Field(default=65_536, ge=1)
+    knowledge_upload_max_bytes: int = Field(
+        default=5 * 1024 * 1024, ge=1, le=5 * 1024 * 1024
+    )
+    knowledge_max_pdf_pages: int = Field(default=100, ge=1, le=100)
+    knowledge_max_text_characters: int = Field(default=500_000, ge=1, le=500_000)
+    knowledge_max_chunks: int = Field(default=500, ge=1, le=500)
+    knowledge_storage_root: str = "../data/knowledge"
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    knowledge_queue_name: str = "knowledge"
+    knowledge_worker_timeout_seconds: int = Field(default=120, ge=1, le=120)
     api_docs_enabled: bool | None = None
     hsts_enabled: bool = False
     trusted_https_termination: bool = False

@@ -51,8 +51,13 @@ class RequestSecurityMiddleware:
             name in {b"content-length", b"transfer-encoding"}
             for name, _value in scope.get("headers", [])
         )
+        maximum = self.settings.max_request_body_bytes
+        if scope.get("path", "").startswith(
+            f"{self.settings.api_v1_prefix}/businesses/"
+        ) and "/knowledge/documents" in scope.get("path", ""):
+            maximum = self.settings.knowledge_upload_max_bytes
         body_messages, too_large = (
-            await self._read_limited_body(scope, receive)
+            await self._read_limited_body(scope, receive, maximum)
             if expects_body
             else ([], False)
         )
@@ -103,12 +108,12 @@ class RequestSecurityMiddleware:
             request_id_context.reset(context_token)
 
     async def _read_limited_body(
-        self, scope: Scope, receive: Receive
+        self, scope: Scope, receive: Receive, maximum: int
     ) -> tuple[list[Message], bool]:
         content_length = dict(scope.get("headers", [])).get(b"content-length")
         if content_length is not None:
             try:
-                if int(content_length) > self.settings.max_request_body_bytes:
+                if int(content_length) > maximum:
                     return [], True
             except ValueError:
                 pass
@@ -123,7 +128,7 @@ class RequestSecurityMiddleware:
             if message["type"] != "http.request":
                 continue
             size += len(message.get("body", b""))
-            if size > self.settings.max_request_body_bytes:
+            if size > maximum:
                 return [], True
             if not message.get("more_body", False):
                 return messages, False
