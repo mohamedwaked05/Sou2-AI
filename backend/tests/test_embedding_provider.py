@@ -75,3 +75,34 @@ def test_timeout_is_normalized_retryable() -> None:
     with pytest.raises(EmbeddingProviderError, match="embedding_timeout") as caught:
         _provider(httpx.MockTransport(timeout)).embed(["a"])
     assert caught.value.retryable
+
+
+@pytest.mark.parametrize("status_code", [408, 425, 429, 500, 503])
+def test_temporary_http_failures_are_retryable_even_with_invalid_json(
+    status_code: int,
+) -> None:
+    provider = _provider(
+        httpx.MockTransport(lambda _: httpx.Response(status_code, content=b"not-json"))
+    )
+    with pytest.raises(EmbeddingProviderError, match="embedding_http_error") as caught:
+        provider.embed(["a"])
+    assert caught.value.retryable
+
+
+def test_missing_model_and_other_client_errors_are_not_retryable() -> None:
+    missing = _provider(
+        httpx.MockTransport(
+            lambda _: httpx.Response(404, json={"error": "model not found"})
+        )
+    )
+    with pytest.raises(
+        EmbeddingProviderError, match="embedding_model_missing"
+    ) as caught:
+        missing.embed(["a"])
+    assert not caught.value.retryable
+    invalid_request = _provider(
+        httpx.MockTransport(lambda _: httpx.Response(400, content=b"not-json"))
+    )
+    with pytest.raises(EmbeddingProviderError, match="embedding_http_error") as caught:
+        invalid_request.embed(["a"])
+    assert not caught.value.retryable

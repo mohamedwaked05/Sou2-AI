@@ -74,13 +74,13 @@ class OllamaEmbeddingProvider:
                 "embedding_transport_error", retryable=True
             ) from None
 
-        try:
-            payload = response.json()
-        except ValueError:
-            raise EmbeddingProviderError(
-                "embedding_invalid_response", retryable=False
-            ) from None
         if response.status_code >= 400:
+            if response.status_code in {408, 425, 429} or response.status_code >= 500:
+                raise EmbeddingProviderError("embedding_http_error", retryable=True)
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
             missing = (
                 response.status_code == 404
                 and isinstance(payload, dict)
@@ -90,6 +90,12 @@ class OllamaEmbeddingProvider:
                 "embedding_model_missing" if missing else "embedding_http_error",
                 retryable=False,
             )
+        try:
+            payload = response.json()
+        except ValueError:
+            raise EmbeddingProviderError(
+                "embedding_invalid_response", retryable=False
+            ) from None
         if not isinstance(payload, dict) or not isinstance(
             payload.get("embeddings"), list
         ):

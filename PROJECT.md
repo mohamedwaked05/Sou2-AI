@@ -262,14 +262,16 @@ integration is not implemented in this milestone.
 * Private tenant-scoped PDF, DOCX, and UTF-8 TXT uploads use local storage keys, Redis/RQ processing, safe extraction, and deterministic chunks; S3 remains a future provider.
 * Source document APIs require authenticated full access to an ACTIVE business, preserve safe errors, support retry/replacement/deletion, and never expose source files or chunks.
 
-### Milestone 13: Embeddings and vector retrieval â€” Complete
+### Milestone 13: Embeddings and vector retrieval  Complete
 
 * Connect BGE-M3 locally behind an embedding-provider interface.
 * Generate and store chunk embeddings in pgvector.
 * Implement similarity search that always filters by authorized `business_id`.
 * Configure result count, similarity threshold, and embedding model.
 * Support re-embedding and evaluate retrieval independently from generation.
-* BGE-M3 evaluation recorded 100% Recall@10 in every supported language group,
+* BGE-M3 evaluation recorded Recall@10 of 100% in every language group, Recall@5
+  of 100% in every language group, MRR of 91.7% English and 100% for Arabic,
+  Lebanese Arabic, Franco-Arabic, and mixed-language questions (98.3% overall),
   zero execution failures, and zero PostgreSQL-backed cross-tenant leakage.
 
 ### Milestone 14: Complete RAG question-answering flow

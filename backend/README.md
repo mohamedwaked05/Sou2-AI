@@ -478,3 +478,9 @@ logged. Documents become ready only after every deterministic chunk has a valid
 1024-dimension embedding. To queue replacement embeddings without re-reading source
 files, run `python -m app.rag.reembed --business-id <uuid>` or `--all` from
 `backend`; this uses the existing `knowledge` RQ queue.
+
+The local BGE-M3 evaluation uses a 16-document tenant corpus plus separate-tenant
+leakage distractors and 30 multilingual questions. The repaired recorded result is
+100% Recall@5/Recall@10 for every language group, 98.3% overall MRR, zero execution
+failures, and zero leakage. Run it with `python -m app.rag.evaluate_retrieval`; it
+exits unsuccessfully when a completion gate fails.

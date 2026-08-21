@@ -16,11 +16,12 @@ from app.database.models import (
 )
 from app.rag.embeddings import EmbeddingProviderError, EmbeddingResult
 from app.rag.evaluation import EvaluationCase, metrics
-from app.rag.reembed import process_reembed, reembed_job_id
+from app.rag.reembed import enqueue_needed, process_reembed, reembed_job_id
 from app.rag.retrieval import retrieve
 from app.worker import knowledge
 from sqlalchemy.orm import Session, sessionmaker
 
+from tests.test_business_api import change_business_status
 from tests.test_knowledge_documents import document_values
 from tests.test_owner_chat import active_business
 
@@ -271,6 +272,72 @@ def test_database_evaluation_path_reports_no_cross_tenant_leakage(
         {"fixture": [("owned", chunk.chunk_index) for chunk in retrieved.chunks]},
     )
     fixture = Path(__file__).parents[1] / "evaluations" / "milestone_13_retrieval.json"
-    assert len(__import__("json").loads(fixture.read_text(encoding="utf-8"))) == 30
+    assert (
+        len(__import__("json").loads(fixture.read_text(encoding="utf-8"))["cases"])
+        == 30
+    )
     assert report["english"]["execution_failure_rate"] == 0
     assert all(chunk.content != "foreign" for chunk in retrieved.chunks)
+
+
+def test_reembedding_skips_disabled_businesses_at_selection(
+    api_client, db_session: Session, database_engine, monkeypatch
+) -> None:
+    _, business = active_business(
+        api_client, db_session, email="disabled-select@example.com"
+    )
+    business_id = uuid.UUID(str(business["id"]))
+    document = ready_document(
+        db_session,
+        business_id,
+        digest="3" * 64,
+        chunks=[("outdated", vector(0.2), "old-model")],
+    )
+    change_business_status(db_session, business_id, "DISABLED")
+    from app.rag import reembed
+
+    factory = sessionmaker(bind=database_engine, expire_on_commit=False)
+    queued: list[uuid.UUID] = []
+    monkeypatch.setattr(reembed, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(
+        reembed, "enqueue_reembed", lambda identifier, _: queued.append(identifier)
+    )
+    assert enqueue_needed(None, Settings(_env_file=None)) == 0
+    assert queued == []
+    assert document.id not in queued
+
+
+def test_reembedding_skips_if_business_disables_before_persistence(
+    api_client, db_session: Session, database_engine, monkeypatch
+) -> None:
+    _, business = active_business(
+        api_client, db_session, email="disabled-race@example.com"
+    )
+    business_id = uuid.UUID(str(business["id"]))
+    document = ready_document(
+        db_session,
+        business_id,
+        digest="4" * 64,
+        chunks=[("outdated", vector(0.2), "old-model")],
+    )
+    original = list(document.chunks[0].embedding or [])
+    from app.rag import reembed
+
+    class DisablingProvider(Provider):
+        def embed(self, texts: list[str]) -> EmbeddingResult:
+            result = super().embed(texts)
+            change_business_status(db_session, business_id, "DISABLED")
+            return result
+
+    factory = sessionmaker(bind=database_engine, expire_on_commit=False)
+    monkeypatch.setattr(reembed, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(reembed, "get_settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr(
+        reembed,
+        "create_embedding_provider",
+        lambda _: DisablingProvider([vector(0.8)]),
+    )
+    process_reembed(str(document.id))
+    db_session.refresh(document)
+    assert document.chunks[0].embedding_model == "old-model"
+    assert list(document.chunks[0].embedding or []) == original

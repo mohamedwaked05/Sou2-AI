@@ -13,6 +13,8 @@ from sqlalchemy import or_, select
 from app.core.config import Settings, get_settings
 from app.core.security import utc_now
 from app.database.models import (
+    Business,
+    BusinessStatus,
     KnowledgeDocument,
     KnowledgeDocumentChunk,
     KnowledgeDocumentStatus,
@@ -58,8 +60,10 @@ def enqueue_needed(business_id: uuid.UUID | None, settings: Settings) -> int:
         query = (
             select(KnowledgeDocument.id)
             .join(KnowledgeDocumentChunk)
+            .join(Business, Business.id == KnowledgeDocument.business_id)
             .where(
                 KnowledgeDocument.status == KnowledgeDocumentStatus.READY,
+                Business.status == BusinessStatus.ACTIVE,
                 or_(
                     KnowledgeDocumentChunk.embedding.is_(None),
                     KnowledgeDocumentChunk.embedding_model != settings.embedding_model,
@@ -85,6 +89,13 @@ def process_reembed(document_id: str) -> None:
             .with_for_update()
         )
         if document is None or document.status is not KnowledgeDocumentStatus.READY:
+            return
+        business = session.scalar(
+            select(Business)
+            .where(Business.id == document.business_id)
+            .with_for_update()
+        )
+        if business is None or business.status is not BusinessStatus.ACTIVE:
             return
         chunks = session.scalars(
             select(KnowledgeDocumentChunk)
@@ -113,6 +124,13 @@ def process_reembed(document_id: str) -> None:
             .with_for_update()
         )
         if document is None or document.status is not KnowledgeDocumentStatus.READY:
+            return
+        business = session.scalar(
+            select(Business)
+            .where(Business.id == document.business_id)
+            .with_for_update()
+        )
+        if business is None or business.status is not BusinessStatus.ACTIVE:
             return
         chunks = session.scalars(
             select(KnowledgeDocumentChunk)
