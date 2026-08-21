@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 
 from redis import Redis
 from rq import Queue, Retry
+from rq.job import JobStatus
 from sqlalchemy import delete, select
 
 from app.core.config import Settings, get_settings
 from app.core.security import utc_now
 from app.database.models import (
+    Business,
+    BusinessStatus,
     KnowledgeDocument,
     KnowledgeDocumentChunk,
     KnowledgeDocumentStatus,
@@ -49,8 +53,17 @@ def enqueue_document(document_id: uuid.UUID, settings: Settings) -> None:
         settings.knowledge_queue_name, connection=Redis.from_url(settings.redis_url)
     )
     job_id = document_job_id(document_id)
-    if queue.fetch_job(job_id) is not None:
-        return
+    existing = queue.fetch_job(job_id)
+    active_statuses = {
+        JobStatus.QUEUED,
+        JobStatus.STARTED,
+        JobStatus.DEFERRED,
+        JobStatus.SCHEDULED,
+    }
+    if existing is not None:
+        if existing.get_status(refresh=True) in active_statuses:
+            return
+        existing.delete()
     queue.enqueue(
         process_document,
         str(document_id),
@@ -69,7 +82,38 @@ def process_document(document_id: str) -> None:
             .where(KnowledgeDocument.id == identifier)
             .with_for_update(skip_locked=True)
         )
-        if document is None or document.status is not KnowledgeDocumentStatus.PENDING:
+        if document is None:
+            return
+        if (
+            document.status is KnowledgeDocumentStatus.PROCESSING
+            and document.processing_started_at is not None
+            and document.processing_started_at
+            <= utc_now() - timedelta(seconds=settings.knowledge_worker_timeout_seconds)
+        ):
+            if document.processing_attempts >= 3:
+                document.status = KnowledgeDocumentStatus.FAILED
+                document.failure_code = "processing_timeout"
+                document.processing_completed_at = utc_now()
+                session.commit()
+                return
+            else:
+                session.execute(
+                    delete(KnowledgeDocumentChunk).where(
+                        KnowledgeDocumentChunk.document_id == identifier
+                    )
+                )
+                document.status = KnowledgeDocumentStatus.PENDING
+                document.processing_started_at = None
+            session.flush()
+        if document.status is not KnowledgeDocumentStatus.PENDING:
+            return
+        business = session.get(Business, document.business_id)
+        if business is None or business.status is not BusinessStatus.ACTIVE:
+            document.status = KnowledgeDocumentStatus.FAILED
+            document.failure_code = "business_not_active"
+            document.processing_started_at = utc_now()
+            document.processing_completed_at = utc_now()
+            session.commit()
             return
         document.status = KnowledgeDocumentStatus.PROCESSING
         document.processing_started_at = utc_now()
@@ -100,6 +144,18 @@ def process_document(document_id: str) -> None:
                 current is None
                 or current.status is not KnowledgeDocumentStatus.PROCESSING
             ):
+                return
+            business = session.get(Business, current.business_id)
+            if business is None or business.status is not BusinessStatus.ACTIVE:
+                session.execute(
+                    delete(KnowledgeDocumentChunk).where(
+                        KnowledgeDocumentChunk.document_id == identifier
+                    )
+                )
+                current.status = KnowledgeDocumentStatus.FAILED
+                current.failure_code = "business_not_active"
+                current.processing_completed_at = utc_now()
+                session.commit()
                 return
             session.execute(
                 delete(KnowledgeDocumentChunk).where(
