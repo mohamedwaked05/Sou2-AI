@@ -39,13 +39,22 @@ PERMANENT = {
 }
 
 
+def document_job_id(document_id: uuid.UUID) -> str:
+    """Return the non-secret, deterministic RQ identity for one document."""
+    return f"knowledge-document-{document_id}"
+
+
 def enqueue_document(document_id: uuid.UUID, settings: Settings) -> None:
     queue = Queue(
         settings.knowledge_queue_name, connection=Redis.from_url(settings.redis_url)
     )
+    job_id = document_job_id(document_id)
+    if queue.fetch_job(job_id) is not None:
+        return
     queue.enqueue(
         process_document,
         str(document_id),
+        job_id=job_id,
         job_timeout=settings.knowledge_worker_timeout_seconds,
         retry=Retry(max=2, interval=[2, 8]),
     )
