@@ -461,8 +461,8 @@ characters, 500 chunks). Errors use safe stable codes.
 
 Start infrastructure from the repository root with `docker compose up -d redis
 postgres worker`. For Windows local development, run the API normally and, from
-`backend`, run `python -m rq worker knowledge --url redis://127.0.0.1:6379/0
---worker-class rq.worker.SimpleWorker`; one worker processes one job at a time.
+`backend`, run `.\.venv\Scripts\rq.exe worker --url redis://127.0.0.1:6379/0
+knowledge`; one normal RQ worker processes one job at a time.
 `KNOWLEDGE_STORAGE_ROOT` is private local development storage. Future S3 will use
 the same storage interface but is not implemented. Run focused checks with
 `python -m pytest tests/test_knowledge_documents.py` and the full suite with

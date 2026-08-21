@@ -14,7 +14,7 @@ services:
   worker:
     build:
       context: ./backend
-    command: python -m rq worker knowledge --url ${REDIS_URL:-redis://redis:6379/0}
+    command: rq worker --url ${REDIS_URL:-redis://redis:6379/0} ${KNOWLEDGE_QUEUE_NAME:-knowledge}
     environment:
       REDIS_URL: redis://redis:6379/0
       KNOWLEDGE_STORAGE_ROOT: /app/data/knowledge
