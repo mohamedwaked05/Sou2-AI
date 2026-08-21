@@ -23,6 +23,31 @@ from tests.test_owner_chat import CapturingProvider, active_business, headers, s
 from tests.test_rag_lifecycle import Provider, ready_document, vector
 
 
+def _persisted_citation(
+    api_client, db_session: Session, monkeypatch, email: str
+) -> tuple[uuid.UUID, OwnerChatCitation]:
+    user, business = active_business(api_client, db_session, email=email)
+    business_id = uuid.UUID(str(business["id"]))
+    ready_document(
+        db_session,
+        business_id,
+        digest=uuid.uuid4().hex * 2,
+        chunks=[("Grounded source", vector(1), "bge-m3")],
+    )
+    monkeypatch.setattr(owner_chat, "create_embedding_provider", lambda _: Provider())
+    from app.agent.owner_chat_provider import get_owner_chat_provider
+    from app.main import app
+
+    app.dependency_overrides[get_owner_chat_provider] = lambda: CapturingProvider(
+        OwnerChatResult(reply="Grounded.", cited_source_ids=("S1",))
+    )
+    response = submit(api_client, user, business_id, "question", key=email)
+    assert response.status_code == 200, response.text
+    citation = db_session.scalar(select(OwnerChatCitation))
+    assert citation is not None
+    return business_id, citation
+
+
 def test_grounded_turn_persists_replays_and_histories_safe_citations(
     api_client, db_session: Session, monkeypatch
 ) -> None:
@@ -246,6 +271,64 @@ def test_citation_database_trigger_rejects_foreign_source_and_delete_keeps_safe_
     assert source["filename"] == "catalog.pdf"
     assert db_session.scalar(select(OwnerChatCitation.chunk_id)) is None
     assert foreign_user is not None
+
+
+def test_citation_trigger_rejects_direct_document_nulling(
+    api_client, db_session: Session, monkeypatch
+) -> None:
+    _, citation = _persisted_citation(
+        api_client, db_session, monkeypatch, "citation-direct-null@example.com"
+    )
+    citation.document_id = None
+
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+
+
+def test_citation_trigger_rejects_document_nulling_with_metadata_change(
+    api_client, db_session: Session, monkeypatch
+) -> None:
+    _, citation = _persisted_citation(
+        api_client, db_session, monkeypatch, "citation-metadata-null@example.com"
+    )
+    citation.document_id = None
+    citation.label = "S9"
+
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+
+
+def test_citation_trigger_rejects_cross_business_reassignment(
+    api_client, db_session: Session, monkeypatch
+) -> None:
+    _, citation = _persisted_citation(
+        api_client, db_session, monkeypatch, "citation-business-scope@example.com"
+    )
+    _, foreign_business = active_business(
+        api_client, db_session, email="citation-business-foreign@example.com"
+    )
+    citation.business_id = uuid.UUID(str(foreign_business["id"]))
+
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+
+
+def test_citation_trigger_rejects_mismatched_document_and_chunk(
+    api_client, db_session: Session, monkeypatch
+) -> None:
+    business_id, citation = _persisted_citation(
+        api_client, db_session, monkeypatch, "citation-pair@example.com"
+    )
+    other_document = ready_document(
+        db_session,
+        business_id,
+        digest=uuid.uuid4().hex * 2,
+        chunks=[("Different source", vector(1), "bge-m3")],
+    )
+    citation.chunk_id = other_document.chunks[0].id
+
+    with pytest.raises(IntegrityError):
+        db_session.commit()
 
 
 def test_citation_and_assistant_roll_back_together_on_persistence_failure(

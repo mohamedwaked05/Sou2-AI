@@ -4,6 +4,10 @@ Sou2AI is a local AI assistant planned for small businesses, with future support
 
 ## Current milestone
 
+Milestone 14 is in progress. It adds tenant-scoped grounded owner-chat retrieval,
+safe persisted citations, and Gemini development generation through the existing
+replaceable provider boundary. Local Ollama `bge-m3` remains the embedding model.
+
 Milestone 7 adds PostgreSQL-backed registration and owner-generation limits,
 per-business local-day AI token allowances, leased usage reconciliation, a
 tenant-scoped current-usage endpoint, and controlled allowance administration. It
@@ -138,33 +142,25 @@ uvicorn app.main:app --reload
 
 Open Swagger UI at <http://127.0.0.1:8000/docs>.
 
-### Local Ollama owner chat
+### Gemini owner chat and local embeddings
 
-Local development uses deployment-wide `OWNER_CHAT_PROVIDER=ollama` for every
-business. The deterministic mock is explicit and offline-only for tests or offline
-development; Ollama failure never falls back to it. To use the local
-complete-response provider, install/start Ollama and run:
-
-```powershell
-ollama list
-ollama pull qwen2.5:7b
-ollama run qwen2.5:7b
-```
-
-`ollama list` verifies service availability and installed models; `ollama run`
-provides a quick direct model check. Do not substitute `qwen2.5-coder:7b` for owner
-chat. Configure the backend before starting it:
+Development owner-chat generation uses deployment-wide
+`OWNER_CHAT_PROVIDER=gemini`. The deterministic mock remains explicit and offline
+for tests or offline development; Gemini failures never fall back to another
+provider. Keep the real `GEMINI_API_KEY` only in the ignored local `.env` file.
+Ollama remains required locally for `bge-m3` document and query embeddings.
+Configure the backend before starting it:
 
 ```powershell
-$env:OWNER_CHAT_PROVIDER = "ollama"
-$env:OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-$env:OLLAMA_CHAT_MODEL = "qwen2.5:7b"
-$env:OLLAMA_REQUEST_TIMEOUT_SECONDS = "120"
+$env:OWNER_CHAT_PROVIDER = "gemini"
+$env:GEMINI_CHAT_MODEL = "gemini-3-flash-preview"
+$env:GEMINI_REQUEST_TIMEOUT_SECONDS = "120"
+$env:OLLAMA_EMBEDDING_MODEL = "bge-m3"
 $env:OWNER_CHAT_GENERATION_LEASE_SECONDS = "150"
 uvicorn app.main:app --reload
 ```
 
-Startup does not contact Ollama. The service is called only for eligible owner-chat
+Startup does not contact Gemini or Ollama. Gemini is called only for eligible owner-chat
 generation, with `stream: false`; the API waits for one complete response. A
 missing model or unavailable service returns the same retryable safe `503` as other
 provider failures. Models are never pulled automatically.
@@ -401,11 +397,11 @@ after a crashed claimant, while `OWNER_CHAT_GENERATION_WAIT_SECONDS` bounds inli
 waiting. This coordinates independent replicas without Redis, workers,
 process-local locks, or holding a pooled connection during provider work.
 
-Provider selection is deployment-wide `OWNER_CHAT_PROVIDER=mock|ollama`; changing
-the provider or model requires a backend restart. Ollama uses the configured base
-URL and model, a 120-second default HTTP timeout, JSON-schema structured output,
-and complete non-streaming responses. Its generation lease defaults to 150 seconds
-and must exceed the HTTP timeout. The application still validates every proposed
+Provider selection is deployment-wide `OWNER_CHAT_PROVIDER=mock|gemini|ollama`;
+changing the provider or model requires a backend restart. Gemini uses the configured
+model, a 120-second default HTTP timeout, JSON-schema structured output, and
+complete non-streaming responses. Its generation lease defaults to 150 seconds and
+must exceed the HTTP timeout. The application still validates every proposed
 fact and remains authoritative for allowed knowledge categories. The provider-neutral
 business profile includes the authoritative seven-day stored schedule, including
 closed days and chronologically ordered local-time shifts. Provider-specific
@@ -441,12 +437,11 @@ scheduler will call the existing retention operation.
 
 ## Implementation boundary
 
-Milestone 10 completes the owner-chat-specific provider boundary. Ollama remains
-the local-development provider using `qwen2.5:7b`, but Milestone 9 found critical
-multilingual failures, so Qwen2.5 7B is not production-approved. Production will
-later use an approved OpenAI model through this boundary; no OpenAI integration is
-implemented here. Authoritative provider token counts are preferred; otherwise the
-existing conservative estimate is recorded as non-authoritative. Later RAG,
+Milestone 10 completes the owner-chat-specific provider boundary. Gemini is the
+temporary development generator; local Ollama `bge-m3` provides embeddings. OpenAI
+remains the planned production replacement through this boundary and is not yet
+implemented. Authoritative provider token counts are preferred; otherwise the existing
+conservative estimate is recorded as non-authoritative. Later RAG,
 documents, controlled live tools and analytics, customer channels, and frontend
 work remain planned only.
 Authentication alone never grants business access without membership.

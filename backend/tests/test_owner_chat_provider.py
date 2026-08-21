@@ -866,6 +866,147 @@ def test_gemini_valid_structured_response_uses_authoritative_usage() -> None:
     assert result.usage.total_tokens == 48
 
 
+def test_gemini_sends_key_only_in_header_and_never_logs_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[httpx.Request] = []
+    logged: list[tuple[object, ...]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": json.dumps(
+                                        {
+                                            "reply": "Safe reply.",
+                                            "cited_source_ids": [],
+                                            "proposed_knowledge": [],
+                                        }
+                                    )
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(
+        owner_chat_provider.logger,
+        "warning",
+        lambda *arguments: logged.append(arguments),
+    )
+    gemini_provider(httpx.MockTransport(handler)).generate(provider_request())
+
+    request = captured[0]
+    assert str(request.url) == (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-3-flash-preview:generateContent"
+    )
+    assert not request.url.params
+    assert request.headers["x-goog-api-key"] == "test-key-not-production"
+    assert b"test-key-not-production" not in request.content
+    assert "test-key-not-production" not in str(request.url)
+    assert logged == []
+
+
+def test_gemini_usage_counts_thoughts_as_billed_output() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": json.dumps(
+                                        {
+                                            "reply": "Safe reply.",
+                                            "cited_source_ids": [],
+                                            "proposed_knowledge": [],
+                                        }
+                                    )
+                                }
+                            ]
+                        }
+                    }
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 40,
+                    "candidatesTokenCount": 8,
+                    "thoughtsTokenCount": 6,
+                    "totalTokenCount": 54,
+                },
+            },
+        )
+    )
+
+    result = gemini_provider(transport).generate(provider_request())
+
+    assert result.usage is not None
+    assert result.usage.authoritative is True
+    assert result.usage.input_tokens == 40
+    assert result.usage.output_tokens == 14
+    assert result.usage.total_tokens == 54
+
+
+def test_gemini_uses_only_the_final_non_thought_part() -> None:
+    response = {
+        "reply": "Safe reply.",
+        "cited_source_ids": [],
+        "proposed_knowledge": [],
+    }
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"thought": True, "text": "private reasoning"},
+                                {"text": json.dumps(response)},
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+    )
+
+    result = gemini_provider(transport).generate(provider_request())
+
+    assert result.reply == "Safe reply."
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"promptTokenCount": 4, "candidatesTokenCount": 2, "totalTokenCount": 3},
+        {
+            "promptTokenCount": 4,
+            "candidatesTokenCount": 2,
+            "thoughtsTokenCount": "bad",
+            "totalTokenCount": 6,
+        },
+    ],
+)
+def test_gemini_malformed_usage_metadata_is_not_authoritative(
+    metadata: dict[str, object],
+) -> None:
+    assert (
+        GeminiOwnerChatProvider._authoritative_usage({"usageMetadata": metadata})
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -924,3 +1065,24 @@ def test_gemini_timeout_and_request_payload_do_not_leak_key() -> None:
     assert "test-key-not-production" not in repr(raised.value)
     assert captured[0].url.path.endswith(":generateContent")
     assert b"test-key-not-production" not in captured[0].content
+
+
+@pytest.mark.parametrize(
+    ("exception", "reason"),
+    [
+        (httpx.ConnectError("private connection detail"), "connection_failure"),
+        (httpx.ProxyError("private proxy detail"), "proxy_tls_failure"),
+        (httpx.RemoteProtocolError("private protocol detail"), "protocol_failure"),
+    ],
+)
+def test_gemini_transport_failures_are_safe_and_do_not_leak_details(
+    exception: httpx.RequestError, reason: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise exception
+
+    with pytest.raises(OwnerChatProviderUnavailable) as raised:
+        gemini_provider(httpx.MockTransport(handler)).generate(provider_request())
+    assert raised.value.reason == reason
+    assert "private" not in repr(raised.value)
+    assert "test-key-not-production" not in repr(raised.value)

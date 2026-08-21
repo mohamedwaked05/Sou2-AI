@@ -710,10 +710,10 @@ class GeminiOwnerChatProvider:
                 base_url="https://generativelanguage.googleapis.com",
                 timeout=self.timeout_seconds,
                 transport=self.transport,
+                headers={"x-goog-api-key": self._api_key},
             ) as client:
                 response = client.post(
                     f"/v1beta/models/{self.model}:generateContent",
-                    params={"key": self._api_key},
                     json=payload,
                 )
             response_payload = self._safe_response_payload(response)
@@ -745,6 +745,24 @@ class GeminiOwnerChatProvider:
         except httpx.TimeoutException:
             raise OwnerChatProviderTimeout(
                 reason="timeout",
+                provider_identifier="gemini",
+                model_identifier=self.model,
+            ) from None
+        except httpx.ProxyError:
+            raise OwnerChatProviderUnavailable(
+                reason="proxy_tls_failure",
+                provider_identifier="gemini",
+                model_identifier=self.model,
+            ) from None
+        except httpx.ProtocolError:
+            raise OwnerChatProviderUnavailable(
+                reason="protocol_failure",
+                provider_identifier="gemini",
+                model_identifier=self.model,
+            ) from None
+        except httpx.ConnectError:
+            raise OwnerChatProviderUnavailable(
+                reason="connection_failure",
                 provider_identifier="gemini",
                 model_identifier=self.model,
             ) from None
@@ -847,12 +865,16 @@ class GeminiOwnerChatProvider:
         if not isinstance(content, dict):
             raise ValueError("invalid Gemini content")
         parts = content.get("parts")
-        if not isinstance(parts, list) or len(parts) != 1:
+        if not isinstance(parts, list):
             raise ValueError("invalid Gemini parts")
-        text = parts[0].get("text") if isinstance(parts[0], dict) else None
-        if not isinstance(text, str):
+        final_parts = [
+            part.get("text")
+            for part in parts
+            if isinstance(part, dict) and part.get("thought") is not True
+        ]
+        if len(final_parts) != 1 or not isinstance(final_parts[0], str):
             raise ValueError("invalid Gemini text")
-        return text
+        return final_parts[0]
 
     @staticmethod
     def _authoritative_usage(payload: object | None) -> TokenUsage | None:
@@ -861,16 +883,21 @@ class GeminiOwnerChatProvider:
         ):
             return None
         input_tokens = metadata.get("promptTokenCount")
-        output_tokens = metadata.get("candidatesTokenCount")
+        candidates_tokens = metadata.get("candidatesTokenCount")
+        thoughts_tokens = metadata.get("thoughtsTokenCount", 0)
         total_tokens = metadata.get("totalTokenCount")
-        values = (input_tokens, output_tokens, total_tokens)
+        values = (input_tokens, candidates_tokens, thoughts_tokens, total_tokens)
         if any(
             not isinstance(value, int) or isinstance(value, bool) or value < 0
             for value in values
         ):
             return None
-        if total_tokens != input_tokens + output_tokens:
+        if (
+            total_tokens < input_tokens
+            or total_tokens - input_tokens < candidates_tokens
+        ):
             return None
+        output_tokens = total_tokens - input_tokens
         return TokenUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
