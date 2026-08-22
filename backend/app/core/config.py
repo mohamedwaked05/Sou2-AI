@@ -146,6 +146,7 @@ class Settings(BaseSettings):
     retrieval_minimum_similarity: float = Field(default=0.50, ge=-1, le=1)
     rag_context_max_chunks: int = Field(default=6, ge=1, le=10)
     rag_context_max_tokens: int = Field(default=2500, ge=1, le=5000)
+    grounded_evaluation_request_interval_seconds: float = Field(default=22, ge=0)
     ollama_request_timeout_seconds: int = Field(default=120, ge=1)
     postgresql_database_url: str = (
         "postgresql+psycopg://sou2ai_runtime_login:sou2ai_runtime_local@"

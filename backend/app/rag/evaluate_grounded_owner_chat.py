@@ -6,8 +6,9 @@ import json
 import math
 import time as time_module
 import uuid
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 from collections import defaultdict
+from collections.abc import Callable
 from datetime import UTC, datetime, time
 from pathlib import Path
 
@@ -32,7 +33,7 @@ DEFAULT_REPORT_PATH = (
     Path(__file__).parents[2] / "evaluations" / "milestone_14_grounded_rag_result.json"
 )
 TENANT_ID = "evaluation-tenant"
-EVALUATION_REQUEST_INTERVAL_SECONDS = 2
+DEFAULT_EVALUATION_REQUEST_INTERVAL_SECONDS = 22
 
 
 def _cosine(left: list[float], right: list[float]) -> float:
@@ -93,16 +94,6 @@ def _failure(
         violated_rule="provider_contract_failure",
     )
     return diagnostic
-
-
-def _safe_reply(reply: str) -> str | None:
-    text = _normalized_safety_text(reply)
-    if any(
-        item in text
-        for item in ("system prompt", "storage key", "api key", "password", "token")
-    ):
-        return None
-    return reply
 
 
 def _score(
@@ -195,7 +186,7 @@ def _score(
         violated_rule = "language_quality"
     diagnostic.update(
         pass_rules=rules,
-        reply=_safe_reply(reply),
+        reply=None,
         cited_source_ids=list(labels),
         citations_valid=citations_valid,
         success=success,
@@ -208,33 +199,126 @@ def _score(
 
 
 def _report(
-    cases: list[dict[str, str]], outcomes: dict[str, dict[str, object]]
+    cases: list[dict[str, str]],
+    outcomes: dict[str, dict[str, object]],
+    aborted: dict[str, str] | None = None,
 ) -> dict[str, object]:
     groups: dict[str, list[dict[str, object]]] = defaultdict(list)
     for case in cases:
-        groups[case["language"]].append(outcomes[case["id"]])
+        if case["id"] in outcomes:
+            groups[case["language"]].append(outcomes[case["id"]])
     report: dict[str, object] = {
+        "status": "incomplete" if aborted is not None else "complete",
         "cross_tenant_leakage_count": 0,
         "fabricated_citation_count": 0,
     }
-    for language, items in groups.items():
+    for language in dict.fromkeys(case["language"] for case in cases):
+        items = groups[language]
         count = len(items)
         report[language] = {
-            "grounded_answer_success_rate": sum(bool(i["success"]) for i in items)
-            / count,
-            "citation_validity_accuracy": sum(bool(i["citations_valid"]) for i in items)
-            / count,
+            "grounded_answer_success_rate": (
+                sum(bool(i["success"]) for i in items) / count if count else None
+            ),
+            "citation_validity_accuracy": (
+                sum(bool(i["citations_valid"]) for i in items) / count
+                if count
+                else None
+            ),
             "critical_failure_count": sum(bool(i["critical"]) for i in items),
-            "critical_failure_rate": sum(bool(i["critical"]) for i in items) / count,
+            "critical_failure_rate": (
+                sum(bool(i["critical"]) for i in items) / count if count else None
+            ),
             "execution_failure_count": sum(bool(i["execution_failure"]) for i in items),
-            "execution_failure_rate": sum(bool(i["execution_failure"]) for i in items)
-            / count,
+            "execution_failure_rate": (
+                sum(bool(i["execution_failure"]) for i in items) / count
+                if count
+                else None
+            ),
         }
         report["cross_tenant_leakage_count"] += sum(bool(i["leakage"]) for i in items)
         report["fabricated_citation_count"] += sum(
             bool(i["fabricated_citation"]) for i in items
         )
+    if aborted is not None:
+        report["aborted"] = aborted
     return report
+
+
+def _non_negative_interval(value: str) -> float:
+    try:
+        interval = float(value)
+    except ValueError as exc:
+        raise ArgumentTypeError(
+            "Request interval must be a non-negative number."
+        ) from exc
+    if interval < 0:
+        raise ArgumentTypeError("Request interval must be non-negative.")
+    return interval
+
+
+def _resolve_request_interval(cli_value: float | None, settings) -> float:
+    return (
+        settings.grounded_evaluation_request_interval_seconds
+        if cli_value is None
+        else cli_value
+    )
+
+
+def _generate_outcomes(
+    *,
+    cases: list[dict[str, str]],
+    question_vectors: list[object],
+    documents: list[dict[str, str]],
+    document_vectors: list[object],
+    chat: GeminiOwnerChatProvider,
+    settings,
+    request_interval_seconds: float,
+    sleep: Callable[[float], None] = time_module.sleep,
+) -> tuple[dict[str, dict[str, object]], dict[str, str] | None]:
+    outcomes: dict[str, dict[str, object]] = {}
+    for index, (case, vector) in enumerate(zip(cases, question_vectors, strict=True)):
+        if index:
+            sleep(request_interval_seconds)
+        ranked = sorted(
+            (
+                (_cosine(list(vector), list(item_vector)), document)
+                for document, item_vector in zip(
+                    documents, document_vectors, strict=True
+                )
+                if document["tenant_id"] == TENANT_ID
+            ),
+            key=lambda item: (-item[0], item[1]["id"]),
+        )
+        sources = _select_sources(
+            tuple(
+                _chunk(document, score)
+                for score, document in ranked[: settings.retrieval_candidate_limit]
+                if score >= settings.retrieval_minimum_similarity
+            ),
+            settings,
+        )
+        try:
+            result = chat.generate(
+                OwnerChatRequest(
+                    profile=_profile(),
+                    knowledge=(),
+                    messages=(ProviderMessage(role="owner", content=case["question"]),),
+                    requested_at=datetime.now(UTC),
+                    sources=sources,
+                    max_output_tokens=settings.owner_chat_max_output_tokens,
+                )
+            )
+            outcomes[case["id"]] = _score(
+                case, result.reply, result.cited_source_ids, sources
+            )
+        except OwnerChatProviderError as exc:
+            reason = exc.reason or "provider_failure"
+            outcomes[case["id"]] = _failure(case, sources, reason)
+            if reason == "rate_limited":
+                return outcomes, {"reason": "rate_limited", "scenario_id": case["id"]}
+        except Exception:
+            outcomes[case["id"]] = _failure(case, sources, "unexpected_failure")
+    return outcomes, None
 
 
 def _chunk(document: dict[str, str], score: float):
@@ -257,9 +341,13 @@ def main() -> None:
     parser = ArgumentParser()
     parser.add_argument("--scenario", action="append", default=[])
     parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT_PATH)
+    parser.add_argument("--request-interval-seconds", type=_non_negative_interval)
     arguments = parser.parse_args()
     selected_ids = set(arguments.scenario)
     settings = get_settings()
+    request_interval_seconds = _resolve_request_interval(
+        arguments.request_interval_seconds, settings
+    )
     payload = json.loads(DATASET_PATH.read_text(encoding="utf-8"))
     documents: list[dict[str, str]] = payload["documents"]
     cases: list[dict[str, str]] = payload["cases"]
@@ -286,60 +374,28 @@ def main() -> None:
         ).vectors
     except EmbeddingProviderError as exc:
         outcomes = {case["id"]: _failure(case, (), exc.code) for case in cases}
+        aborted = None
     else:
-        outcomes: dict[str, dict[str, object]] = {}
-        for index, (case, vector) in enumerate(
-            zip(cases, question_vectors, strict=True)
-        ):
-            if index:
-                time_module.sleep(EVALUATION_REQUEST_INTERVAL_SECONDS)
-            ranked = sorted(
-                (
-                    (_cosine(list(vector), list(item_vector)), document)
-                    for document, item_vector in zip(
-                        documents, document_vectors, strict=True
-                    )
-                    if document["tenant_id"] == TENANT_ID
-                ),
-                key=lambda item: (-item[0], item[1]["id"]),
-            )
-            sources = _select_sources(
-                tuple(
-                    _chunk(document, score)
-                    for score, document in ranked[: settings.retrieval_candidate_limit]
-                    if score >= settings.retrieval_minimum_similarity
-                ),
-                settings,
-            )
-            try:
-                result = chat.generate(
-                    OwnerChatRequest(
-                        profile=_profile(),
-                        knowledge=(),
-                        messages=(
-                            ProviderMessage(role="owner", content=case["question"]),
-                        ),
-                        requested_at=datetime.now(UTC),
-                        sources=sources,
-                        max_output_tokens=settings.owner_chat_max_output_tokens,
-                    )
-                )
-                outcomes[case["id"]] = _score(
-                    case, result.reply, result.cited_source_ids, sources
-                )
-            except OwnerChatProviderError as exc:
-                outcomes[case["id"]] = _failure(
-                    case, sources, exc.reason or "provider_failure"
-                )
-            except Exception:
-                outcomes[case["id"]] = _failure(case, sources, "unexpected_failure")
-    report = _report(cases, outcomes)
-    report["scenarios"] = [outcomes[case["id"]] for case in cases]
+        outcomes, aborted = _generate_outcomes(
+            cases=cases,
+            question_vectors=question_vectors,
+            documents=documents,
+            document_vectors=document_vectors,
+            chat=chat,
+            settings=settings,
+            request_interval_seconds=request_interval_seconds,
+        )
+    report = _report(cases, outcomes, aborted)
+    report["scenarios"] = [
+        outcomes[case["id"]] for case in cases if case["id"] in outcomes
+    ]
     arguments.report_path.write_text(
         json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     print(json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True))
+    if aborted is not None:
+        raise SystemExit(1)
     reports = [report[case["language"]] for case in cases]
     if not (
         all(item["grounded_answer_success_rate"] >= 0.85 for item in reports)

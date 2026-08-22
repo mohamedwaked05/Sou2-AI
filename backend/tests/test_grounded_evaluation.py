@@ -1,7 +1,105 @@
 """Regression coverage for safe grounded-evaluation diagnostics."""
 
-from app.agent.owner_chat_provider import ProviderSource
-from app.rag.evaluate_grounded_owner_chat import _score
+from argparse import ArgumentTypeError
+
+import pytest
+from app.agent.owner_chat_provider import (
+    OwnerChatProviderUnavailable,
+    OwnerChatResult,
+    ProviderSource,
+)
+from app.core.config import Settings
+from app.rag.evaluate_grounded_owner_chat import (
+    DEFAULT_EVALUATION_REQUEST_INTERVAL_SECONDS,
+    _generate_outcomes,
+    _non_negative_interval,
+    _resolve_request_interval,
+    _score,
+)
+
+
+class _EvaluationChat:
+    def __init__(self, failure_reason: str | None = None) -> None:
+        self.calls = 0
+        self.failure_reason = failure_reason
+
+    def generate(self, request):
+        self.calls += 1
+        if self.failure_reason is not None:
+            raise OwnerChatProviderUnavailable(
+                reason=self.failure_reason,
+                provider_identifier="gemini",
+                model_identifier="test-model",
+            )
+        return OwnerChatResult(reply="Knowledge is unavailable.")
+
+
+def _cases() -> list[dict[str, str]]:
+    return [
+        {"id": "one", "language": "english", "case": "missing", "question": "one"},
+        {"id": "two", "language": "english", "case": "missing", "question": "two"},
+    ]
+
+
+def _run_generated_outcomes(
+    chat: _EvaluationChat, sleeps: list[float], interval: float
+):
+    return _generate_outcomes(
+        cases=_cases(),
+        question_vectors=[[1.0], [1.0]],
+        documents=[],
+        document_vectors=[],
+        chat=chat,  # type: ignore[arg-type]
+        settings=Settings(_env_file=None),
+        request_interval_seconds=interval,
+        sleep=sleeps.append,
+    )
+
+
+def test_evaluation_default_pacing_is_twenty_two_seconds() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.grounded_evaluation_request_interval_seconds == (
+        DEFAULT_EVALUATION_REQUEST_INTERVAL_SECONDS
+    )
+    assert _resolve_request_interval(None, settings) == 22
+
+
+def test_evaluation_cli_pacing_override_and_negative_rejection() -> None:
+    settings = Settings(_env_file=None)
+
+    assert _resolve_request_interval(7.5, settings) == 7.5
+    with pytest.raises(ArgumentTypeError):
+        _non_negative_interval("-0.1")
+
+
+def test_evaluation_waits_only_between_requests_without_retries() -> None:
+    chat = _EvaluationChat()
+    sleeps: list[float] = []
+
+    outcomes, aborted = _run_generated_outcomes(chat, sleeps, 22)
+
+    assert list(outcomes) == ["one", "two"]
+    assert aborted is None
+    assert chat.calls == 2
+    assert sleeps == [22]
+
+
+def test_evaluation_aborts_immediately_on_rate_limiting_without_secret_leakage() -> (
+    None
+):
+    chat = _EvaluationChat("rate_limited")
+    sleeps: list[float] = []
+
+    outcomes, aborted = _run_generated_outcomes(chat, sleeps, 22)
+
+    assert list(outcomes) == ["one"]
+    assert outcomes["one"]["provider_failure_code"] == "rate_limited"
+    assert aborted == {"reason": "rate_limited", "scenario_id": "one"}
+    assert chat.calls == 1
+    assert sleeps == []
+    assert "test-key-not-production" not in repr((outcomes, aborted))
+    assert "private provider body" not in repr((outcomes, aborted))
 
 
 def test_arabic_live_refusal_is_safe_and_not_critical() -> None:
@@ -59,3 +157,15 @@ def test_live_value_counterexample_remains_critical() -> None:
     assert result["success"] is False
     assert result["critical"] is True
     assert result["violated_rule"] == "fabricated_live_operational_value"
+
+
+def test_evaluation_diagnostics_never_retain_provider_reply_text() -> None:
+    result = _score(
+        {"id": "en-missing", "language": "english", "case": "missing"},
+        "private provider response",
+        (),
+        (),
+    )
+
+    assert result["reply"] is None
+    assert "private provider response" not in repr(result)
