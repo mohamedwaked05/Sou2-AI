@@ -1044,7 +1044,10 @@ export function App() {
     );
   return (
     <Routes>
-      <Route path="/login" element={<Login onLogin={restore} />} />
+      <Route
+  path="/login"
+  element={<Login onLogin={async () => setUser(await api.me())} />}
+/>
       <Route path="/register" element={<Register />} />
       <Route path="/forgot-password" element={<Forgot />} />
       <Route path="/verify-email" element={<TokenPage type="verify" />} />
