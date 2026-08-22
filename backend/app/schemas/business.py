@@ -6,7 +6,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from app.database.models import BusinessCategory, BusinessStatus
+from app.database.models import BusinessCategory, BusinessStatus, DefaultLanguage
 from app.services.lebanese_locations import LOCATION_HIERARCHY
 
 
@@ -64,6 +64,7 @@ class BusinessUpdateRequest(BaseModel):
     description: str | None = None
     category: BusinessCategory | None = None
     custom_category: str | None = None
+    default_language: DefaultLanguage | None = None
     governorate: str | None = None
     district: str | None = None
     city: str | None = None
@@ -138,6 +139,7 @@ class BusinessResponse(BaseModel):
     description: str | None
     category: BusinessCategory | None
     custom_category: str | None
+    default_language: DefaultLanguage | None
     governorate: str | None
     district: str | None
     city: str | None

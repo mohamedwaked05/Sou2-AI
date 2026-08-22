@@ -4,7 +4,7 @@ Sou2AI is planned as a local AI assistant for small businesses, supporting Engli
 
 ## Status
 
-Milestone 7 is implemented. The backend includes authentication, isolated
+Milestone 15 is implemented. The backend includes authentication, isolated
 multi-business onboarding, database-controlled lifecycle management, and one
 persistent private owner conversation per business. Complete, confirmed active
 businesses use local Ollama with `qwen2.5:7b` in development, retain full
@@ -26,9 +26,11 @@ documentation, and redacted environment-aware logging. Production host and CORS
 checks normalize case, DNS trailing dots, and IPv4/IPv6 loopback representations
 before rejecting local or malformed values.
 
-Customer chat, cloud providers, RAG, embeddings, pgvector,
-documents, live operational integrations and analytics, frontend functionality,
-payments, and activation/admin HTTP endpoints remain future work. Manual lifecycle
+Customer chat, cloud providers, live operational integrations and analytics,
+payments, and activation/admin HTTP endpoints remain future work. The responsive
+React frontend implements authentication, multi-business onboarding and selection,
+owner chat, document management, account settings, and truthful empty states for
+future operational features. Manual lifecycle
 changes use a controlled PostgreSQL function with permanent append-only history.
 The local database uses separate bootstrap, restricted FastAPI runtime, and
 restricted lifecycle-operator roles; the backend never connects as the database
@@ -38,7 +40,7 @@ The restricted operator also changes AI allowances through one controlled
 PostgreSQL function with permanent append-only audit. Owners cannot change their
 allowance through the API.
 
-The planned architecture is a FastAPI backend, PostgreSQL with pgvector, local Ollama models, and a React frontend. The backend lives in [`backend/`](backend/README.md).
+The architecture includes a FastAPI backend, PostgreSQL with pgvector, local Ollama models, and a React frontend. The backend lives in [`backend/`](backend/README.md), and the frontend lives in [`frontend/`](frontend/README.md).
 
 PostgreSQL development uses pgvector. Tenant-owned document metadata and normalized
 chunks are separate from owner-chat `business_knowledge`; PostgreSQL stores only

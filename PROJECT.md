@@ -285,7 +285,7 @@ integration is not implemented in this milestone.
 
 RAG covers relatively stable knowledge such as policies, delivery information, FAQs, warranties, and documents. It is not the source of truth for current stock, today's sales, orders, or other changing facts.
 
-### Milestone 15: React business interface
+### Milestone 15: React business interface — Complete
 
 * Add registration, login, session handling, and multi-business selection.
 * Add business creation, profile editing, onboarding, and working-hours setup.
@@ -293,6 +293,13 @@ RAG covers relatively stable knowledge such as policies, delivery information, F
 * Add document upload, processing status, chat, and answer sources.
 * Show accessible loading, empty, success, and error states.
 * Prevent inactive businesses from using paid AI features.
+
+The `frontend/` Vite application provides the authenticated business interface,
+uses memory-only access tokens with refresh-cookie restoration, and includes the
+responsive light/dark UI, onboarding, owner-chat, knowledge-document, account,
+and truthful future-feature states. The business profile persists the selected
+default language; Alembic revision `20260822_05` restores the database and API
+completion invariant.
 
 ### Milestone 16: Controlled operational integrations
 

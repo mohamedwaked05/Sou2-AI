@@ -84,6 +84,7 @@ def _response(business: Business) -> BusinessResponse:
         description=business.description,
         category=business.category,
         custom_category=business.custom_category,
+        default_language=business.default_language,
         governorate=business.governorate,
         district=business.district,
         city=business.city,

@@ -498,6 +498,9 @@ class Business(Base):
     description: Mapped[str | None] = mapped_column(Text)
     category: Mapped[BusinessCategory | None] = mapped_column(business_category_enum)
     custom_category: Mapped[str | None] = mapped_column(String(100))
+    default_language: Mapped[DefaultLanguage | None] = mapped_column(
+        default_language_enum
+    )
     country: Mapped[str] = mapped_column(
         String(2), nullable=False, default="LB", server_default="LB"
     )

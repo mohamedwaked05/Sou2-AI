@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from app.database.models import Business, BusinessCategory
+from app.database.models import Business, BusinessCategory, DefaultLanguage
 from app.services.lebanese_locations import is_valid_location
 from app.services.opening_hours import (
     DayInput,
@@ -76,6 +76,13 @@ def business_profile_issues(business: Business) -> list[ProfileIssue]:
                 "custom_category",
                 "Only the OTHER category may have a custom category.",
                 "business_details",
+            )
+        )
+
+    if business.default_language not in {DefaultLanguage.AR, DefaultLanguage.EN}:
+        issues.append(
+            ProfileIssue(
+                "default_language", "This field is required.", "business_details"
             )
         )
 

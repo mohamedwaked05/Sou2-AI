@@ -80,6 +80,7 @@ def complete_profile(client: TestClient, user: User, business_id: str) -> object
         json={
             "description": "A neighborhood grocery and household goods market.",
             "category": "GROCERY_SUPERMARKET",
+            "default_language": "en",
             "governorate": "Mount Lebanon",
             "district": "Metn",
             "city": "Antelias",
@@ -138,6 +139,7 @@ def test_creator_membership_and_pending_draft_defaults(
     assert payload["profile_complete"] is False
     assert payload["first_incomplete_section"] == "business_details"
     assert payload["onboarding_submitted_at"] is None
+    assert payload["default_language"] is None
     membership = db_session.scalar(
         select(BusinessMembership).where(
             BusinessMembership.business_id == uuid.UUID(payload["id"])
@@ -349,6 +351,7 @@ def test_sections_are_resumable_and_confirmation_retains_first_timestamp(
         json={
             "description": "A neighborhood grocery and household goods market.",
             "category": "GROCERY_SUPERMARKET",
+            "default_language": "en",
         },
     )
     assert details.status_code == 200

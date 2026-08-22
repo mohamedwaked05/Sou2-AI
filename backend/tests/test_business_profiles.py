@@ -10,6 +10,7 @@ from app.database.models import (
     BusinessOpeningDay,
     BusinessOpeningShift,
     BusinessStatus,
+    DefaultLanguage,
     User,
 )
 from app.services.business_profiles import is_business_profile_complete
@@ -38,6 +39,7 @@ def complete_business(name: str = "Complete Shop") -> Business:
         name=name,
         description="A neighborhood grocery shop",
         category=BusinessCategory.GROCERY_SUPERMARKET,
+        default_language=DefaultLanguage.EN,
         governorate="Beirut",
         district="Beirut",
         city="Beirut",
@@ -92,7 +94,15 @@ def test_incomplete_business_is_allowed_while_disabled(db_session: Session) -> N
 
 @pytest.mark.parametrize(
     "missing_field",
-    ["description", "category", "governorate", "district", "city", "address_line"],
+    [
+        "description",
+        "category",
+        "default_language",
+        "governorate",
+        "district",
+        "city",
+        "address_line",
+    ],
 )
 def test_each_missing_profile_field_is_detected(
     db_session: Session, missing_field: str
