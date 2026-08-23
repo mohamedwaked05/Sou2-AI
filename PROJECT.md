@@ -277,6 +277,14 @@ token reservation. Completion still requires the fixed 35-scenario live Gemini
 evaluation to meet every documented quality and security gate after a successful
 smoke request.
 
+The single paced live evaluation on 2026-08-23 completed without rate limiting or
+execution failures. Citation validity was 100% in every language group, with zero
+fabricated citations and zero cross-tenant leakage. Grounded-answer success was
+85.7% English, 85.7% Arabic, 42.9% Lebanese Arabic, 57.1% Franco-Arabic, and
+71.4% mixed; critical-failure counts were 1, 0, 2, 2, and 0 respectively.
+Because the grounding and critical-failure gates did not pass, Milestone 14
+remains In Progress.
+
 RAG covers relatively stable knowledge such as policies, delivery information, FAQs, warranties, and documents. It is not the source of truth for current stock, today's sales, orders, or other changing facts.
 
 ### Milestone 15: React business interface — Complete

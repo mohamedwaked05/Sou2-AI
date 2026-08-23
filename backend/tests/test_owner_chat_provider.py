@@ -923,6 +923,62 @@ def test_gemini_rejects_unknown_source_identifier() -> None:
     assert raised.value.reason == "invalid_citations"
 
 
+def test_gemini_rejects_identifier_from_source_not_supplied_to_request() -> None:
+    foreign_source = ProviderSource(
+        label="S2",
+        document_id="00000000-0000-0000-0000-000000000010",
+        filename="foreign.pdf",
+        chunk_id="00000000-0000-0000-0000-000000000011",
+        content="Foreign tenant content.",
+        page_start=None,
+        page_end=None,
+        section_title=None,
+    )
+    provider = gemini_provider(
+        gemini_successful_transport(
+            {
+                "reply": "Unsupported foreign citation.",
+                "cited_source_ids": [foreign_source.document_id],
+                "proposed_knowledge": [],
+            }
+        )
+    )
+
+    with pytest.raises(OwnerChatProviderInvalidResponse) as raised:
+        provider.generate(request_with_source())
+
+    assert raised.value.reason == "invalid_citations"
+
+
+def test_gemini_rejects_identifier_ambiguous_across_supplied_sources() -> None:
+    first = request_with_source().sources[0]
+    second = ProviderSource(
+        label="S2",
+        document_id=first.chunk_id,
+        filename="ambiguous.pdf",
+        chunk_id="00000000-0000-0000-0000-000000000003",
+        content="A second supplied source.",
+        page_start=None,
+        page_end=None,
+        section_title=None,
+    )
+    request = replace(provider_request(), sources=(first, second))
+    provider = gemini_provider(
+        gemini_successful_transport(
+            {
+                "reply": "Ambiguous citation.",
+                "cited_source_ids": [first.chunk_id],
+                "proposed_knowledge": [],
+            }
+        )
+    )
+
+    with pytest.raises(OwnerChatProviderInvalidResponse) as raised:
+        provider.generate(request)
+
+    assert raised.value.reason == "invalid_citations"
+
+
 def test_gemini_sends_key_only_in_header_and_never_logs_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
