@@ -56,6 +56,7 @@ AI:
 
 * Ollama
 * Qwen2.5 7B
+* Gemini
 * BGE-M3
 * Custom RAG pipeline
 * Agent tools in later milestones
@@ -72,39 +73,24 @@ Testing and quality:
 
 ## Current status
 
-Milestone 7 is implemented on the authenticated PostgreSQL platform. Each
-business has one authoritative `PENDING`, `ACTIVE`, or `DISABLED` status;
-`is_active` is derived only for response compatibility. Controlled direct
-PostgreSQL administration performs manual activation, disabling, and re-enabling
-with permanent append-only internal history. Owner chat requires a complete,
-confirmed `ACTIVE` business and `FULL_ACCESS` membership. PostgreSQL now enforces
-registration and owner-generation limits plus per-business local-day AI token
-allowances with leased reservations, a protected 25% owner reserve, permanent
-allowance-change audit, and privacy-minimal retained accounting. The API also has
-server request IDs, CIDR-aware proxy trust, trusted hosts, streamed body limits,
-restricted CORS/docs, safe errors, security headers, and environment-aware
-redacted logging. Rate admission and retention are exposed to the restricted
-runtime only through narrow PostgreSQL functions; cleanup uses the database clock
-and cannot be redirected at current records by caller-supplied time.
+Milestones 1–13 and 15 are implemented. The repository includes the authenticated
+PostgreSQL platform, tenant lifecycle and AI-budget controls, private document
+storage and processing, pgvector with local BGE-M3 embeddings, tenant-authorized
+retrieval, replaceable mock/Ollama/Gemini generation providers, grounded owner
+chat with persisted citations, and the React/Vite business interface.
 
-Milestone 8 Ollama owner-chat connectivity was completed early. Much of the
-Milestone 10 provider abstraction, and the usage/cost-control portion of
-Milestone 20, is also present early. Unrelated later roadmap work remains planned
-rather than complete.
+Milestone 14 remains In Progress until its live 35-scenario multilingual quality
+and security evaluation passes. Its implementation and offline coverage include
+trusted profile plus retrieved-chunk grounding, natural missing-knowledge fallback
+instructions, conflict clarification, prompt-injection defenses, cross-tenant
+isolation, citation allowlisting and database scope guards, safe Gemini failure
+normalization, and atomic assistant/citation/usage persistence.
 
-Milestone 9 is complete. Its fixed fictional-business baseline recorded critical
-multilingual failures for Qwen2.5 7B. The completed scoring is accurately
-disclosed as AI-assisted (with human acceptance required), and Qwen2.5 7B is not
-production-approved.
-
-The current repository does not yet contain:
-
-* RAG answer generation
-* Agent tools
-* React functionality
-* WhatsApp integration
-
-Later roadmap milestones remain planned, not implemented.
+Qwen2.5 7B remains an optional local generation provider and is not
+production-approved after Milestone 9's critical multilingual failures. Gemini is
+implemented for grounded-chat development evaluation. Controlled operational
+adapters and agent tool calling remain future Milestones 16–17; customer channels,
+WhatsApp, and unrelated later roadmap work are also not implemented.
 
 ## Development roadmap
 
@@ -247,8 +233,8 @@ This milestone does not add RAG, memory, agent tools, or business-answering logi
   a labelled estimate.
 
 Qwen2.5 7B is not production-approved after Milestone 9's critical failures.
-Production will later use an approved OpenAI model through this boundary; OpenAI
-integration is not implemented in this milestone.
+Gemini is implemented later in Milestone 14 through this boundary for development
+evaluation; production provider approval remains future work.
 
 ### Milestone 11: pgvector and knowledge storage — Complete
 
@@ -282,6 +268,11 @@ integration is not implemented in this milestone.
 * Clarify ambiguous questions and refuse to invent unsupported answers.
 * Defend against document prompt injection and cross-tenant retrieval.
 * Evaluate correct, missing, and conflicting knowledge in all supported languages.
+
+The grounded flow and its offline security, provider-contract, retrieval, and
+atomic-persistence coverage are implemented. Completion still requires the fixed
+35-scenario live Gemini evaluation to meet every documented quality and security
+gate after a successful smoke request.
 
 RAG covers relatively stable knowledge such as policies, delivery information, FAQs, warranties, and documents. It is not the source of truth for current stock, today's sales, orders, or other changing facts.
 

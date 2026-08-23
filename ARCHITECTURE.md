@@ -18,40 +18,34 @@ flowchart TD
     U[User] --> UI[React Web Interface]
     UI --> API[FastAPI API Layer]
 
-    API --> AGENT[Agent Orchestration Layer]
-    API --> RAG[RAG Service]
-
-    AGENT --> TOOLS[Tool Layer]
-    AGENT --> MEMORY[Memory Layer]
-    AGENT --> LLM[LLM Service]
-
-    TOOLS --> DB[(PostgreSQL)]
+    API --> CHAT[Owner Chat Service]
+    CHAT --> RAG[RAG Service]
+    CHAT --> LLM[Generation Provider]
+    CHAT --> DB[(PostgreSQL)]
     RAG --> EMBED[Embedding Service]
     RAG --> VECTOR[(PostgreSQL and pgvector)]
-    MEMORY --> DB
-    MEMORY --> VECTOR
 
-    EMBED --> OLLAMA[Ollama]
-    LLM --> OLLAMA
-
-    OLLAMA --> QWEN[Qwen2.5 7B]
-    OLLAMA --> BGE[BGE-M3]
+    EMBED --> BGE[BGE-M3 through Ollama]
+    LLM --> GEMINI[Gemini]
+    LLM --> QWEN[Optional Qwen2.5 7B through Ollama]
 ```
 
-During early milestones, the agent layer may not be active and the API can call the RAG service directly.
+Controlled operational adapters and agent tool calling are not active; they remain
+future Milestones 16 and 17.
 
 ## 3. Runtime components
 
-* React frontend provides the future browser interface.
+* React and Vite provide the implemented browser interface.
 * FastAPI backend exposes HTTP APIs and coordinates application services.
 * PostgreSQL holds platform-owned identity, business-profile, schedule, owner-chat,
-  learned-knowledge, and audit metadata. It does not mirror live operational
-  business data.
-* pgvector will support vector similarity search in PostgreSQL.
-* Ollama will run local models.
-* Qwen2.5 7B will provide chat generation.
-* BGE-M3 will provide multilingual embeddings.
-* Local document storage will retain uploaded source files.
+  learned-knowledge, document/chunk, citation, and audit metadata. It does not
+  mirror live operational business data.
+* pgvector stores BGE-M3 vectors and supports tenant-filtered cosine retrieval.
+* Ollama provides local BGE-M3 embeddings and optional Qwen2.5 7B generation.
+* Gemini is the implemented cloud generation provider used for grounded-chat
+  development evaluation; deterministic mock remains available for offline tests.
+* Private local document storage retains uploaded source files; Redis/RQ performs
+  processing and embedding work.
 
 ## 4. Backend module responsibilities
 
@@ -61,15 +55,18 @@ app/api/v1/    version 1 routes and router
 app/core/      configuration, logging, and shared exceptions
 app/database/  persistence infrastructure
 app/rag/       document ingestion and retrieval
-app/agent/     capability selection and orchestration
-app/tools/     controlled operations available to the agent
-app/memory/    conversation and semantic memory
+app/agent/     model-provider contracts and adapters; future agent orchestration
+app/tools/     future controlled operational capabilities
+app/memory/    future conversation and semantic memory services
 app/services/  application logic
 app/schemas/   Pydantic request and response schemas
 app/utils/     small shared utilities
 ```
 
-Routes handle HTTP concerns. Services handle application logic. Database modules manage persistence. RAG modules manage ingestion and retrieval. Agent modules decide which capabilities to use. Tools expose controlled operations. Memory modules store and retrieve conversation or semantic memory.
+Routes handle HTTP concerns. Services handle application logic. Database modules
+manage persistence. RAG modules manage ingestion and retrieval. The current agent
+module provides model adapters; capability selection, controlled operational
+tools, and memory services remain future milestones.
 
 ## 5. API structure
 
@@ -77,7 +74,8 @@ Routes handle HTTP concerns. Services handle application logic. Database modules
 
 `/api/v1/health` reports API health status.
 
-All future business APIs will be placed under `/api/v1`.
+Business, authentication, document, owner-chat, citation, and usage APIs are under
+`/api/v1`.
 
 ## 6. RAG ingestion flow
 
@@ -91,7 +89,8 @@ flowchart LR
     E --> P[(PostgreSQL and pgvector)]
 ```
 
-Stored metadata will include document ID, original filename, file type, chunk index, page number when available, document category, and upload timestamp.
+Stored metadata includes document ID, original filename, file type, chunk index,
+page number when available, document category, and upload timestamp.
 
 ## 7. RAG query flow
 
@@ -101,11 +100,15 @@ flowchart LR
     QE --> VS[Vector Similarity Search]
     VS --> RC[Relevant Chunks]
     RC --> PB[Grounded Prompt Builder]
-    PB --> L[Qwen2.5 through Ollama]
+    PB --> L[Configured Gemini or optional Ollama provider]
     L --> A[Answer with Sources]
 ```
 
-The system must state that information is unavailable when retrieval does not provide sufficient context.
+The owner-chat service authorizes the business before tenant-filtered retrieval,
+combines retrieved chunks with trusted profile facts, validates returned citation
+labels against supplied sources, and atomically persists the assistant message and
+its citation snapshots. It states naturally that information is unavailable when
+trusted context does not support an answer.
 
 ## 8. Platform data versus operational business data
 
@@ -117,10 +120,10 @@ the business's source system. Future controlled tools will access those systems
 through an API, a read-only database integration, or a Sou2AI-managed operational
 system. This avoids stale copies and preserves the business's source of truth.
 
-Unstructured RAG data remains separate and will later cover approved documents
-such as policies, descriptions, warranties, FAQs, and business notes.
+Unstructured RAG data is stored separately and covers approved documents such as
+policies, descriptions, warranties, FAQs, and business notes.
 
-## 9. Agent flow
+## 9. Planned Milestones 16–17 agent flow
 
 ```mermaid
 flowchart TD
@@ -138,13 +141,15 @@ flowchart TD
 ```
 
 Write and destructive tools must require validation and, when appropriate, explicit user confirmation.
+The diagram is a future design boundary. No operational adapter, tool registry, or
+model-driven tool execution is implemented yet.
 
 ## 10. Language handling
 
-Milestone 5 owner chat accepts English, Arabic, Lebanese Arabic, Franco-Arabic,
-and mixed-language input while producing English owner-facing responses. Its
-deterministic mock does not claim production language quality. Future provider
-evaluation will determine whether normalization is useful.
+Owner chat accepts English, Arabic, Lebanese Arabic, Franco-Arabic, and
+mixed-language input. Gemini and Ollama are instructed to reply in the owner's
+current language and style; the deterministic mock does not claim production
+language quality.
 
 ## 11. Reliability rules
 
@@ -294,14 +299,31 @@ one another. Redis, queues, workers, sticky sessions, and process-local locks ar
 not used.
 
 The provider boundary accepts a provider-neutral business profile with all seven
-working days and ordered local-time shifts, bounded active knowledge, ordered
-messages, and request time. It returns an English reply and structured proposed
-facts. The deterministic offline mock remains the default.
+working days and ordered local-time shifts, bounded active knowledge, retrieved
+sources, ordered messages, and request time. It returns a reply, structured
+proposed facts, and citation labels. The deterministic offline mock remains the
+default.
 The optional local Ollama implementation sends one non-streaming `/api/chat`
 request to configurable `qwen2.5:7b`, validates its JSON-schema response, and maps
 timeouts, missing models, unavailability, HTTP failures, and invalid output to the
 same safe provider errors. Routes, orchestration, and persistence remain
 provider-neutral. Backend startup performs no provider probe.
+
+The Gemini REST provider sends one non-streaming structured-generation request,
+keeps its API key in the request header, excludes hidden thinking from the parsed
+answer, and normalizes authentication, transport, timeout, rate-limit, blocked,
+truncated, malformed, and invalid-schema responses. Neither provider retries or
+falls back automatically, and owner-facing errors never expose provider payloads.
+
+For grounded turns, retrieval re-authorizes `FULL_ACCESS` to the active business
+and filters candidates by the same `business_id`, ready document state, and active
+embedding model. Retrieved document text is untrusted data: clear prompt-injection
+content is excluded, the generation prompt forbids following source instructions,
+and unsafe outputs are rejected. Only unique labels from the supplied source set
+can be persisted. PostgreSQL additionally verifies that each citation's assistant
+message, document, and chunk belong to the same business. Assistant content,
+citations, learned owner facts, generation completion, and usage reconciliation
+commit atomically.
 
 Before admission, each provider deterministically estimates the complete canonical
 serialized input it will send, including instructions, JSON structure/schema,
@@ -323,7 +345,7 @@ before context selection, which is bounded by
 `OWNER_CHAT_KNOWLEDGE_CONTEXT_LIMIT`. Expired rows remain owner-manageable.
 Duplicate subjects update without changing `created_at`.
 
-Learned knowledge is separate from conversation history and future RAG documents.
+Learned knowledge is separate from conversation history and ingested RAG documents.
 Application allowlists reject current stock, revenue, orders, sales totals, best
 sellers, restocking quantities, appointment availability, and other changing
 operational data. Future concepts such as `get_revenue_trend`,
@@ -340,8 +362,9 @@ out of scope.
 Knowledge documents are owned by one business and are separate from
 `business_knowledge`, business-profile facts, and chat history. PostgreSQL stores
 safe metadata and provider-neutral storage keys only; file bytes remain outside the
-database. Future development storage is private local storage and production
-storage will be private S3, neither of which is implemented here.
+database. Private local development storage, secure PDF/DOCX/TXT ingestion,
+bounded extraction, deterministic chunking, and Redis/RQ processing are
+implemented. Private S3 remains a future production storage provider.
 
 Each chunk carries the owning `business_id` and references its document through a
 same-business composite foreign key. Embeddings are nullable `vector(1024)` values.
@@ -349,8 +372,9 @@ Milestone 13 creates them through a provider-neutral local Ollama BGE-M3 adapter
 validates every result, and writes all chunks/vectors atomically before marking a
 document `READY`. Internal exact cosine retrieval always filters by authorized
 business, `READY` documents, and the configured embedding model. It has no public
-endpoint or answer-generation integration. Re-embedding uses the same RQ queue and
-only replaces a complete valid vector set, retaining the prior set on failure.
+endpoint; owner chat uses it internally for grounded answer generation.
+Re-embedding uses the same RQ queue and only replaces a complete valid vector set,
+retaining the prior set on failure.
 
 ## 13.4 API security and AI usage control
 
@@ -446,6 +470,7 @@ flowchart TD
     PC --> BE[FastAPI on 8000]
     PC --> PG[PostgreSQL on host port 5433]
     PC --> OL[Ollama on 11434]
+    BE --> GM[Gemini HTTPS when configured]
 ```
 
 Docker Compose persists `sou2ai_dev` in a named volume and creates isolated
@@ -460,22 +485,25 @@ and budget controls through the real non-superuser logins. `GET
 ## 15. Model-provider boundary and future deployment
 
 React may be hosted separately, FastAPI may run on a cloud server, and PostgreSQL
-may become managed. Ollama is implemented only as an opt-in local-development
-provider. Production will use a future approved cloud provider behind the same
-abstraction, so database and domain code do not depend on Ollama or a model.
-WhatsApp is a future input channel, not the core system.
+may become managed. Gemini and optional local Ollama generation are both
+implemented behind the same provider abstraction, so database and domain code do
+not depend on one model. Gemini is used for development evaluation; production
+provider approval and deployment remain future work. WhatsApp is a future input
+channel, not the core system.
 
 ## 16. Current implementation boundary
 
 The repository contains the FastAPI/PostgreSQL platform foundation, user
 authentication, multi-business management, tenant-scoped authorization, resumable
 onboarding, database-controlled business lifecycle history, one owner conversation
-per business, ordered persistent owner chat, deterministic mock and local Ollama
-providers, managed permanent/temporary learned knowledge, PostgreSQL-backed API
-limits and AI budgets, and the Milestone 7 HTTP/logging security boundary.
-Cloud-provider connectivity, pgvector, RAG, live tools and analytics, customer
-chat, documents, billing, activation APIs, and frontend functionality remain
-future work.
+per business, ordered persistent owner chat, deterministic mock, Gemini, and
+optional local Ollama generation providers, managed permanent/temporary learned
+knowledge, pgvector/BGE-M3 retrieval, private document ingestion and processing,
+grounded answers with persisted citations, PostgreSQL-backed API limits and AI
+budgets, the HTTP/logging security boundary, and the React business interface.
+Controlled operational adapters and tool calling remain future Milestones 16–17;
+customer chat, WhatsApp, billing, and activation/admin APIs also remain future
+work.
 
 ## 17. Milestone 12 document ingestion
 

@@ -169,3 +169,83 @@ def test_evaluation_diagnostics_never_retain_provider_reply_text() -> None:
 
     assert result["reply"] is None
     assert "private provider response" not in repr(result)
+
+
+def test_missing_knowledge_requires_a_natural_fallback() -> None:
+    unsupported = _score(
+        {"id": "en-missing", "language": "english", "case": "missing"},
+        "Yes, vintage watch repairs are available.",
+        (),
+        (),
+    )
+    fallback = _score(
+        {"id": "en-missing", "language": "english", "case": "missing"},
+        "I don't have information about vintage watch repairs.",
+        (),
+        (),
+    )
+
+    assert unsupported["success"] is False
+    assert unsupported["critical"] is True
+    assert unsupported["violated_rule"] == "unsupported_answer_without_knowledge"
+    assert fallback["success"] is True
+
+
+def test_missing_knowledge_accepts_a_natural_search_fallback() -> None:
+    result = _score(
+        {"id": "en-missing", "language": "english", "case": "missing"},
+        "I couldn't find details about vintage watch repairs in the supplied context.",
+        (),
+        (),
+    )
+
+    assert result["success"] is True
+    assert result["critical"] is False
+
+
+def test_supported_answer_must_cite_a_source_that_contains_the_fact() -> None:
+    wrong_source = ProviderSource(
+        label="S1",
+        document_id="00000000-0000-0000-0000-000000000001",
+        filename="delivery.pdf",
+        chunk_id="00000000-0000-0000-0000-000000000002",
+        content="Delivery takes one business day.",
+        page_start=None,
+        page_end=None,
+        section_title=None,
+    )
+
+    result = _score(
+        {"id": "en-supported", "language": "english", "case": "supported"},
+        "Returns are accepted within 14 days.",
+        ("S1",),
+        (wrong_source,),
+    )
+
+    assert result["success"] is False
+    assert result["citations_valid"] is True
+    assert result["fabricated_citation"] is False
+
+
+def test_conflict_requires_both_traceable_sources() -> None:
+    source = ProviderSource(
+        label="S1",
+        document_id="00000000-0000-0000-0000-000000000001",
+        filename="returns.pdf",
+        chunk_id="00000000-0000-0000-0000-000000000002",
+        content="Returns are accepted within 14 days.",
+        page_start=None,
+        page_end=None,
+        section_title=None,
+    )
+
+    result = _score(
+        {"id": "en-conflict", "language": "english", "case": "conflict"},
+        "Please clarify which return policy is current.",
+        ("S1",),
+        (source,),
+    )
+
+    assert result["success"] is False
+    assert result["critical"] is True
+    assert result["violated_rule"] == "missing_conflict_clarification"

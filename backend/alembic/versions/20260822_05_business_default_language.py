@@ -25,9 +25,13 @@ def upgrade() -> None:
             nullable=True,
         ),
     )
-    op.execute("GRANT UPDATE (default_language) ON TABLE public.businesses TO sou2ai_runtime")
+    op.execute(
+        "GRANT UPDATE (default_language) ON TABLE public.businesses TO sou2ai_runtime"
+    )
 
 
 def downgrade() -> None:
-    op.execute("REVOKE UPDATE (default_language) ON TABLE public.businesses FROM sou2ai_runtime")
+    op.execute(
+        "REVOKE UPDATE (default_language) ON TABLE public.businesses FROM sou2ai_runtime"
+    )
     op.drop_column("businesses", "default_language")

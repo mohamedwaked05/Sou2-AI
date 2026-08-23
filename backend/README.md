@@ -1,6 +1,7 @@
 # Sou2AI backend
 
-Sou2AI is a local AI assistant planned for small businesses, with future support for English, Arabic, Lebanese Arabic, Franco-Arabic, and mixed-language conversations.
+Sou2AI is an AI assistant for small businesses with English, Arabic, Lebanese
+Arabic, Franco-Arabic, and mixed-language owner conversations.
 
 ## Current milestone
 
@@ -18,10 +19,10 @@ mock/local-Ollama owner chat remain intact.
 
 Milestone 13 adds local BGE-M3 embeddings, atomic document embedding, internal
 tenant-scoped exact pgvector retrieval, and an internal re-embedding queue/CLI.
-It does **not** include customer chat, activation/admin APIs, cloud or paid model
-providers, RAG answer generation, public retrieval endpoints, operational
-integrations or analytics, tool execution, payments, frontend code, invitations,
-or additional roles.
+Milestone 14 connects that retrieval to grounded owner chat and Gemini; Milestone
+15 provides the React interface. Customer chat, activation/admin APIs,
+operational integrations and analytics, tool execution, payments, invitations,
+and additional roles remain outside the current implementation boundary.
 
 ## Requirements
 
@@ -39,7 +40,9 @@ python -m pip install -e ".[dev]"
 Copy-Item .env.example .env
 ```
 
-Edit `.env` only for local configuration. Do not commit it. The default CORS origins target a future local React development server. In production, set `ALLOWED_CORS_ORIGINS` to explicit trusted origins; wildcard origins are rejected.
+Edit `.env` only for local configuration. Do not commit it. The default CORS
+origins target the local React development server. In production, set
+`ALLOWED_CORS_ORIGINS` to explicit trusted origins; wildcard origins are rejected.
 
 The API's `POSTGRESQL_DATABASE_URL` must use the restricted runtime login. Keep
 `MIGRATION_POSTGRESQL_DATABASE_URL` and lifecycle-operator credentials out of the
@@ -82,10 +85,11 @@ request UUID; client request IDs are ignored.
 
 The compose service uses `pgvector/pgvector:0.8.0-pg17`. The Milestone 11
 migration enables `vector` in development and test databases. Documents store
-tenant-scoped metadata and provider-neutral storage keys only; file bytes, upload,
-parsing, embeddings, similarity indexes, retrieval, and RAG are not implemented.
-Migration downgrade intentionally retains the extension because future objects may
-depend on it.
+tenant-scoped metadata and provider-neutral storage keys; private local storage
+holds file bytes. Secure upload, parsing, deterministic chunking, BGE-M3
+embeddings, exact cosine retrieval, grounded generation, and persisted citations
+are implemented. Migration downgrade intentionally retains the extension while
+later objects depend on it.
 
 From the repository root:
 
@@ -441,9 +445,10 @@ Milestone 10 completes the owner-chat-specific provider boundary. Gemini is the
 temporary development generator; local Ollama `bge-m3` provides embeddings. OpenAI
 remains the planned production replacement through this boundary and is not yet
 implemented. Authoritative provider token counts are preferred; otherwise the existing
-conservative estimate is recorded as non-authoritative. Later RAG,
-documents, controlled live tools and analytics, customer channels, and frontend
-work remain planned only.
+conservative estimate is recorded as non-authoritative. Private documents,
+BGE-M3/pgvector retrieval, grounded RAG with citations, and the React frontend are
+implemented. Controlled operational adapters and tool calling remain future
+Milestones 16–17; customer channels also remain planned.
 Authentication alone never grants business access without membership.
 
 ## Milestone 12 knowledge documents
@@ -482,3 +487,20 @@ leakage distractors and 30 multilingual questions. The repaired recorded result 
 100% Recall@5/Recall@10 for every language group, 98.3% overall MRR, zero execution
 failures, and zero leakage. Run it with `python -m app.rag.evaluate_retrieval`; it
 exits unsuccessfully when a completion gate fails.
+
+## Milestone 14 grounded owner chat
+
+Eligible owner turns retrieve only ready chunks for the authenticated active
+business, combine them with trusted profile and learned facts, and send bounded
+untrusted source text to the configured generation provider. Provider citation
+labels must be unique and must match the supplied source set. PostgreSQL verifies
+the assistant, document, chunk, and business scope again; the assistant message,
+citations, accepted owner facts, usage reconciliation, and completion state commit
+atomically.
+
+The fixed 35-scenario multilingual evaluation covers supported, missing,
+conflicting, profile, prompt-injection, cross-tenant, and live-operational cases.
+Run offline tests before any live request. For an approved live run, use
+`python -m app.rag.evaluate_grounded_owner_chat`; requests use the configured
+quota-safe interval, stop immediately on a rate limit, retain no provider reply
+text, and write an ignored local report that must never be committed.
