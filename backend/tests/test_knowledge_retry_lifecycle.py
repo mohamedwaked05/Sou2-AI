@@ -1,9 +1,13 @@
 """Focused unit coverage for queue identity and failure classification."""
 
+import io
 import uuid
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, Mock
 
+import pytest
+from app.core.config import Settings
 from app.database.models import KnowledgeDocument, KnowledgeDocumentStatus
 from app.services.knowledge_documents import RETRYABLE_FAILURE_CODES
 from app.worker.knowledge import PERMANENT, document_job_id, enqueue_document
@@ -84,3 +88,54 @@ def test_stale_processing_is_reclaimed_before_a_real_attempt(
     db_session.refresh(document)
     assert document.status is KnowledgeDocumentStatus.FAILED
     assert document.processing_attempts == 2
+
+
+def test_unexpected_worker_failure_reaches_failed_after_retry_limit(
+    api_client, db_session: Session, database_engine, monkeypatch
+) -> None:
+    from app.worker import knowledge
+
+    from tests.test_owner_chat import active_business
+
+    _, business = active_business(
+        api_client, db_session, email="worker-failure@example.com"
+    )
+    document = KnowledgeDocument(
+        business_id=uuid.UUID(business["id"]),
+        uploaded_by_user_id=None,
+        original_filename="source.txt",
+        mime_type="text/plain",
+        file_size_bytes=1,
+        content_sha256="b" * 64,
+        storage_key=f"businesses/{business['id']}/knowledge/{uuid.uuid4()}/source",
+    )
+    db_session.add(document)
+    db_session.commit()
+    factory = sessionmaker(bind=database_engine, expire_on_commit=False)
+    monkeypatch.setattr(knowledge, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(knowledge, "get_settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr(
+        knowledge,
+        "get_knowledge_storage",
+        lambda _: type(
+            "Storage",
+            (),
+            {"open": lambda *_: nullcontext(io.BytesIO(b"document content"))},
+        )(),
+    )
+    monkeypatch.setattr(
+        knowledge,
+        "validate_and_extract",
+        Mock(side_effect=RuntimeError("unexpected processor failure")),
+    )
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="unexpected processor failure"):
+            knowledge.process_document(str(document.id))
+    knowledge.process_document(str(document.id))
+
+    db_session.refresh(document)
+    assert document.status is KnowledgeDocumentStatus.FAILED
+    assert document.processing_attempts == 3
+    assert document.failure_code == "processing_unavailable"
+    assert document.processing_completed_at is not None

@@ -19,6 +19,7 @@ from app.rag.evaluation import EvaluationCase, metrics
 from app.rag.reembed import enqueue_needed, process_reembed, reembed_job_id
 from app.rag.retrieval import retrieve
 from app.worker import knowledge
+from sqlalchemy import event
 from sqlalchemy.orm import Session, sessionmaker
 
 from tests.test_business_api import change_business_status
@@ -149,6 +150,14 @@ def test_document_worker_persists_all_embeddings_or_none(
     db_session.add(document)
     db_session.commit()
     factory = sessionmaker(bind=database_engine, expire_on_commit=False)
+    statements: list[str] = []
+
+    def record_statement(
+        _connection, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        statements.append(" ".join(statement.lower().split()))
+
+    event.listen(database_engine, "before_cursor_execute", record_statement)
     monkeypatch.setattr(knowledge, "get_session_factory", lambda: factory)
     monkeypatch.setattr(knowledge, "get_settings", lambda: Settings(_env_file=None))
     monkeypatch.setattr(
@@ -159,12 +168,27 @@ def test_document_worker_persists_all_embeddings_or_none(
         )(),
     )
     monkeypatch.setattr(knowledge, "create_embedding_provider", lambda _: Provider())
-    knowledge.process_document(str(document.id))
+    try:
+        knowledge.process_document(str(document.id))
+    finally:
+        event.remove(database_engine, "before_cursor_execute", record_statement)
     db_session.refresh(document)
     assert document.status is KnowledgeDocumentStatus.READY, document.failure_code
     assert len(document.chunks) == 1
     assert document.chunks[0].embedding_model == "bge-m3"
     assert len(document.chunks[0].embedding or []) == 1024
+    chunk_insert = next(
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith("insert into knowledge_document_chunks")
+    )
+    document_updates = [
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith("update knowledge_documents set ")
+    ]
+    assert len(document_updates) == 2
+    assert chunk_insert < document_updates[-1]
 
     failed = KnowledgeDocument(
         **document_values(

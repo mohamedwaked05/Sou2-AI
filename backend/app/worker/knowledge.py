@@ -176,7 +176,7 @@ def process_document(document_id: str) -> None:
                     KnowledgeDocumentChunk.document_id == identifier
                 )
             )
-            session.add_all(
+            persisted_chunks = [
                 KnowledgeDocumentChunk(
                     business_id=current.business_id,
                     document_id=current.id,
@@ -188,8 +188,11 @@ def process_document(document_id: str) -> None:
                     embedded_at=utc_now(),
                 )
                 for index, piece in enumerate(pieces)
-            )
-            session.flush()
+            ]
+            session.add_all(persisted_chunks)
+            # The READY trigger queries the chunk table during the status UPDATE.
+            # Flush this exact replacement set first so the trigger can observe it.
+            session.flush(persisted_chunks)
             current.page_count = extracted.page_count
             current.status = KnowledgeDocumentStatus.READY
             current.processing_completed_at = utc_now()

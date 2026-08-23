@@ -458,10 +458,13 @@ characters, 500 chunks). Errors use safe stable codes.
 
 Start infrastructure from the repository root with `docker compose up -d redis
 postgres worker`. For Windows local development, run the API normally and, from
-`backend`, run `.\.venv\Scripts\rq.exe worker --url redis://127.0.0.1:6379/0
-knowledge`; one normal RQ worker processes one job at a time.
-`KNOWLEDGE_STORAGE_ROOT` is private local development storage. Future S3 will use
-the same storage interface but is not implemented. Run focused checks with
+`backend`, run `.\.venv\Scripts\rq.exe worker --with-scheduler --url
+redis://127.0.0.1:6379/0 knowledge`; one normal RQ worker processes one job at a
+time and promotes delayed retries. The Compose worker shares `./data` with the
+host API and defaults `OLLAMA_BASE_URL` to `http://host.docker.internal:11434`
+so it can use the host's `bge-m3` model. `KNOWLEDGE_STORAGE_ROOT` is private local
+development storage. Future S3 will use the same storage interface but is not
+implemented. Run focused checks with
 `python -m pytest tests/test_knowledge_documents.py` and the full suite with
 `python -m pytest`.
 

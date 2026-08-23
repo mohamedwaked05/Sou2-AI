@@ -14,10 +14,12 @@ services:
   worker:
     build:
       context: ./backend
-    command: rq worker --url ${REDIS_URL:-redis://redis:6379/0} ${KNOWLEDGE_QUEUE_NAME:-knowledge}
+    command: rq worker --with-scheduler --url ${REDIS_URL:-redis://redis:6379/0} ${KNOWLEDGE_QUEUE_NAME:-knowledge}
     environment:
       REDIS_URL: redis://redis:6379/0
       KNOWLEDGE_STORAGE_ROOT: /app/data/knowledge
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
       POSTGRESQL_DATABASE_URL: postgresql+psycopg://${POSTGRES_RUNTIME_USER:-sou2ai_runtime_login}:${POSTGRES_RUNTIME_PASSWORD:-sou2ai_runtime_local}@postgres:5432/${POSTGRES_DEV_DB:-sou2ai_dev}
     depends_on:
       redis:
