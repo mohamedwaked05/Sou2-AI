@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import base64
 import json
+import math
+import re
 import time
 import unicodedata
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from fastapi import status
 from sqlalchemy import and_, or_, select
@@ -69,6 +71,7 @@ from app.services.businesses import load_full_access_business
 
 CHAT_CONTEXT_MESSAGE_LIMIT = 12
 HISTORY_PAGE_SIZE = 50
+HIGH_CONFIDENCE_EVIDENCE_SIMILARITY = 0.65
 PROVIDER_WEEKDAYS = (
     "monday",
     "tuesday",
@@ -84,6 +87,13 @@ PROVIDER_WEEKDAYS = (
 class _Claim:
     message_id: uuid.UUID
     token: uuid.UUID
+
+
+@dataclass(frozen=True)
+class _PreparedTurn:
+    request: OwnerChatRequest
+    business: Business
+    has_usable_evidence: bool
 
 
 def _provider_unavailable() -> ApplicationError:
@@ -134,7 +144,7 @@ def _create_or_reuse_owner_message(
     conversation = session.scalar(
         select(OwnerConversation)
         .where(OwnerConversation.id == conversation_id)
-        .with_for_update()
+        .with_for_update(key_share=True)
     )
     if conversation is None:  # pragma: no cover - business owns the conversation
         raise _provider_unavailable()
@@ -242,7 +252,7 @@ def _claim_oldest_turn(
     session.scalar(
         select(OwnerConversation)
         .where(OwnerConversation.id == conversation_id)
-        .with_for_update()
+        .with_for_update(key_share=True)
     )
     now = utc_now()
     oldest = session.scalar(
@@ -286,17 +296,127 @@ def _claim_oldest_turn(
     return _Claim(message_id=message_id, token=token)
 
 
+def _cosine_similarity(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+    denominator = math.sqrt(sum(value * value for value in left)) * math.sqrt(
+        sum(value * value for value in right)
+    )
+    if denominator == 0:
+        return 0
+    return sum(a * b for a, b in zip(left, right, strict=True)) / denominator
+
+
+def _evidence_terms(value: str) -> set[str]:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = "".join(
+        character for character in normalized if not unicodedata.combining(character)
+    )
+    terms: set[str] = set()
+    for term in re.findall(r"[^\W_]+", normalized, flags=re.UNICODE):
+        if len(term) < 3:
+            continue
+        if term.endswith("ies") and len(term) > 4:
+            term = f"{term[:-3]}y"
+        elif term.endswith("s") and len(term) > 4:
+            term = term[:-1]
+        terms.add(term)
+    return terms
+
+
+def _has_meaningful_overlap(question: str, evidence: str) -> bool:
+    ignored = {
+        "about",
+        "business",
+        "document",
+        "from",
+        "have",
+        "information",
+        "please",
+        "that",
+        "the",
+        "this",
+        "what",
+        "when",
+        "where",
+        "which",
+        "with",
+    }
+    return bool((_evidence_terms(question) - ignored) & _evidence_terms(evidence))
+
+
+def _profile_evidence_texts(profile: ProviderBusinessProfile) -> tuple[str, ...]:
+    identity = (
+        f"Business name: {profile.name}. Description: {profile.description}. "
+        f"Category: {profile.category}. Location: {profile.address_line}, "
+        f"{profile.city}, {profile.district}, {profile.governorate}."
+    )
+    hours: list[str] = []
+    arabic_weekdays = (
+        "الاثنين",
+        "الثلاثاء",
+        "الأربعاء",
+        "الخميس",
+        "الجمعة",
+        "السبت",
+        "الأحد",
+    )
+    lebanese_weekdays = (
+        "التنين",
+        "التلاتا",
+        "الأربعا",
+        "الخميس",
+        "الجمعة",
+        "السبت",
+        "الأحد",
+    )
+    franco_weekdays = (
+        "el tenein",
+        "el telata",
+        "el arb3a",
+        "el khamis",
+        "el jem3a",
+        "el sabet",
+        "el a7ad",
+    )
+    for index, day in enumerate(profile.working_hours):
+        schedule = (
+            "closed"
+            if not day.is_open
+            else ", ".join(
+                f"{shift.start.isoformat(timespec='minutes')} to "
+                f"{shift.end.isoformat(timespec='minutes')}"
+                for shift in day.shifts
+            )
+        )
+        hours.extend(
+            (
+                f"Opening hours: {day.weekday} is {schedule}.",
+                f"ساعات العمل: يوم {arabic_weekdays[index]} هو {schedule}.",
+                f"دوام المحل: نهار {lebanese_weekdays[index]} هو {schedule}.",
+                f"wa2et el 3amal: nhar {franco_weekdays[index]} howwe {schedule}.",
+            )
+        )
+    return (identity, *hours)
+
+
 def _select_relevant_knowledge(
-    records: list[BusinessKnowledge], current_message: str
+    records: list[BusinessKnowledge],
+    current_message: str,
+    similarities: tuple[float, ...],
+    settings: Settings,
 ) -> tuple[ProviderKnowledge, ...]:
-    terms = {term.casefold() for term in current_message.split() if len(term) >= 3}
-
-    def rank(record: BusinessKnowledge) -> tuple[int, datetime, str]:
-        searchable = f"{record.subject_key} {record.content}".casefold()
-        matches = sum(term in searchable for term in terms)
-        return matches, record.updated_at, str(record.id)
-
-    ordered = sorted(records, key=rank, reverse=True)
+    ranked = sorted(
+        zip(records, similarities, strict=True),
+        key=lambda item: (item[1], item[0].updated_at, str(item[0].id)),
+        reverse=True,
+    )
+    ordered = [
+        record
+        for record, similarity in ranked
+        if similarity >= settings.retrieval_minimum_similarity
+        or _has_meaningful_overlap(
+            current_message, f"{record.subject_key} {record.content}"
+        )
+    ]
     return tuple(
         ProviderKnowledge(
             subject_key=record.subject_key,
@@ -314,7 +434,7 @@ def _build_provider_request(
     business_id: uuid.UUID,
     owner_message_id: uuid.UUID,
     settings: Settings,
-) -> tuple[OwnerChatRequest, Business]:
+) -> _PreparedTurn:
     owner_message = session.get(OwnerChatMessage, owner_message_id)
     business = session.scalar(
         select(Business)
@@ -349,43 +469,70 @@ def _build_provider_request(
         .order_by(BusinessKnowledge.updated_at.desc(), BusinessKnowledge.id.desc())
         .limit(settings.owner_chat_knowledge_context_limit)
     ).all()
+    profile = ProviderBusinessProfile(
+        name=business.name,
+        description=business.description or "",
+        category=str(business.category or ""),
+        governorate=business.governorate or "",
+        district=business.district or "",
+        city=business.city or "",
+        address_line=business.address_line or "",
+        timezone=business.timezone,
+        working_hours=tuple(
+            ProviderWorkingDay(
+                weekday=PROVIDER_WEEKDAYS[day.day_of_week],
+                is_open=day.is_open,
+                shifts=tuple(
+                    ProviderWorkingShift(start=shift.opens_at, end=shift.closes_at)
+                    for shift in sorted(day.shifts, key=lambda item: item.opens_at)
+                ),
+            )
+            for day in sorted(business.opening_days, key=lambda item: item.day_of_week)
+        ),
+    )
+    profile_evidence = _profile_evidence_texts(profile)
+    knowledge_evidence = tuple(
+        f"{record.subject_key}: {record.content}" for record in knowledge
+    )
+    embedding_provider = create_embedding_provider(settings)
+    evidence_embeddings = embedding_provider.embed(
+        [owner_message.content, *profile_evidence, *knowledge_evidence]
+    ).vectors
+    question_embedding = evidence_embeddings[0]
+    profile_end = 1 + len(profile_evidence)
+    profile_similarities = tuple(
+        _cosine_similarity(question_embedding, vector)
+        for vector in evidence_embeddings[1:profile_end]
+    )
+    knowledge_similarities = tuple(
+        _cosine_similarity(question_embedding, vector)
+        for vector in evidence_embeddings[profile_end:]
+    )
+    selected_knowledge = _select_relevant_knowledge(
+        knowledge, owner_message.content, knowledge_similarities, settings
+    )
+    has_relevant_profile = any(
+        similarity >= settings.retrieval_minimum_similarity
+        or _has_meaningful_overlap(owner_message.content, evidence)
+        for evidence, similarity in zip(
+            profile_evidence, profile_similarities, strict=True
+        )
+    )
     retrieved = retrieve(
         session,
         user,
         business_id,
         owner_message.content,
-        create_embedding_provider(settings),
+        embedding_provider,
         settings,
+        question_embedding=question_embedding,
     )
-    sources = _select_sources(retrieved.chunks, settings)
+    sources = _select_sources(
+        retrieved.chunks, settings, question=owner_message.content
+    )
     request = OwnerChatRequest(
-        profile=ProviderBusinessProfile(
-            name=business.name,
-            description=business.description or "",
-            category=str(business.category or ""),
-            governorate=business.governorate or "",
-            district=business.district or "",
-            city=business.city or "",
-            address_line=business.address_line or "",
-            timezone=business.timezone,
-            working_hours=tuple(
-                ProviderWorkingDay(
-                    weekday=PROVIDER_WEEKDAYS[day.day_of_week],
-                    is_open=day.is_open,
-                    shifts=tuple(
-                        ProviderWorkingShift(
-                            start=shift.opens_at,
-                            end=shift.closes_at,
-                        )
-                        for shift in sorted(day.shifts, key=lambda item: item.opens_at)
-                    ),
-                )
-                for day in sorted(
-                    business.opening_days, key=lambda item: item.day_of_week
-                )
-            ),
-        ),
-        knowledge=_select_relevant_knowledge(knowledge, owner_message.content),
+        profile=profile,
+        knowledge=selected_knowledge,
         sources=sources,
         messages=tuple(
             ProviderMessage(role=str(message.role), content=message.content)
@@ -395,11 +542,15 @@ def _build_provider_request(
         max_output_tokens=settings.owner_chat_max_output_tokens,
     )
     session.commit()
-    return request, business
+    return _PreparedTurn(
+        request=request,
+        business=business,
+        has_usable_evidence=bool(has_relevant_profile or selected_knowledge or sources),
+    )
 
 
 def _select_sources(
-    chunks: tuple[object, ...], settings: Settings
+    chunks: tuple[object, ...], settings: Settings, *, question: str | None = None
 ) -> tuple[ProviderSource, ...]:
     selected: list[ProviderSource] = []
     seen: set[str] = set()
@@ -411,6 +562,15 @@ def _select_sources(
         if (
             normalized in seen
             or _is_unsafe_source_content(content)
+            or (
+                question is not None
+                and float(chunk.similarity)
+                < max(
+                    settings.retrieval_minimum_similarity,
+                    HIGH_CONFIDENCE_EVIDENCE_SIMILARITY,
+                )
+                and not _has_meaningful_overlap(question, content)
+            )
             or len(selected) >= settings.rag_context_max_chunks
         ):
             continue
@@ -499,6 +659,63 @@ def _is_unsafe_reply(reply: str) -> bool:
     return any(phrase in text for phrase in sensitive_disclosure) or any(
         phrase in text for phrase in follows_malicious_instruction
     )
+
+
+def _fallback_language(message: str, default_language: str) -> str:
+    arabic_count = sum("\u0600" <= character <= "\u06ff" for character in message)
+    latin_count = sum(
+        character.isascii() and character.isalpha() for character in message
+    )
+    if arabic_count and latin_count:
+        return "mixed"
+    if arabic_count:
+        normalized = _normalized_safety_text(message)
+        lebanese_markers = (
+            "بت",
+            "شو",
+            "قديش",
+            "إيمتى",
+            "ايمتى",
+            "هال",
+            "فيني",
+            "فيك",
+            "مش",
+        )
+        return (
+            "lebanese_arabic"
+            if any(marker in normalized for marker in lebanese_markers)
+            else "arabic"
+        )
+    if re.search(r"(?i)(?:[a-z][2356789]|[2356789][a-z])", message):
+        return "franco_arabic"
+    return "arabic" if default_language == "ar" else "english"
+
+
+def _missing_knowledge_reply(message: str, default_language: str) -> str:
+    language = _fallback_language(message, default_language)
+    replies = {
+        "english": (
+            "I don't have information about that yet. You can add it to your "
+            "business profile or knowledge base, and I'll be able to help."
+        ),
+        "arabic": (
+            "لا أملك معلومات عن ذلك بعد. يمكنك إضافتها إلى ملف نشاطك التجاري أو "
+            "قاعدة المعرفة، وسأتمكن من مساعدتك."
+        ),
+        "lebanese_arabic": (
+            "ما عندي معلومات عن هالموضوع بعد. فيك تضيفها ع ملف شغلك أو قاعدة "
+            "المعرفة، وساعتها فيني ساعدك."
+        ),
+        "franco_arabic": (
+            "Ma 3ande ma3loumet 3an hal mawdu3 ba3d. Fik tdifa 3a business "
+            "profile aw knowledge base, w sa3eta fine se3dak."
+        ),
+        "mixed": (
+            "I don't have information عن هالموضوع بعد. You can add it to your "
+            "business profile أو knowledge base، وساعتها فيني ساعدك."
+        ),
+    }
+    return replies[language]
 
 
 def _mark_failed(
@@ -592,8 +809,8 @@ def _persist_result(
     business_id: uuid.UUID,
     claim: _Claim,
     result: OwnerChatResult,
-    reservation: AIUsageReservationClaim,
-    usage: TokenUsage,
+    reservation: AIUsageReservationClaim | None,
+    usage: TokenUsage | None,
     request: OwnerChatRequest,
 ) -> None:
     owner_message = session.scalar(
@@ -644,15 +861,18 @@ def _persist_result(
     owner_message.generation_state = ChatGenerationState.COMPLETED
     owner_message.generation_claim_token = None
     owner_message.generation_claim_expires_at = None
-    reconcile_ai_usage(
-        session,
-        reservation.id,
-        usage=usage,
-        outcome="completed",
-        provider_identifier=result.provider_identifier,
-        model_identifier=result.model_identifier,
-        commit=False,
-    )
+    if reservation is not None:
+        if usage is None:  # pragma: no cover - guarded by generation orchestration
+            raise RuntimeError("Provider usage is required for a reserved turn.")
+        reconcile_ai_usage(
+            session,
+            reservation.id,
+            usage=usage,
+            outcome="completed",
+            provider_identifier=result.provider_identifier,
+            model_identifier=result.model_identifier,
+            commit=False,
+        )
     session.commit()
 
 
@@ -666,9 +886,27 @@ def _generate_claimed_turn(
 ) -> None:
     reservation: AIUsageReservationClaim | None = None
     try:
-        request, business = _build_provider_request(
+        prepared = _build_provider_request(
             session, user, business_id, claim.message_id, settings
         )
+        request = prepared.request
+        business = prepared.business
+        if not prepared.has_usable_evidence:
+            fallback = OwnerChatResult(
+                reply=_missing_knowledge_reply(
+                    request.messages[-1].content, business.default_language
+                )
+            )
+            _persist_result(
+                session,
+                business_id,
+                claim,
+                fallback,
+                None,
+                None,
+                request,
+            )
+            return
         owner_message = session.get(OwnerChatMessage, claim.message_id)
         if owner_message is None:
             raise _provider_unavailable()

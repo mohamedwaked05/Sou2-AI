@@ -1,5 +1,6 @@
 """Focused Milestone 14 grounded owner-chat integration coverage."""
 
+import math
 import uuid
 
 import pytest
@@ -12,15 +13,274 @@ from app.agent.owner_chat_provider import (
 )
 from app.core.config import Settings
 from app.database.models import OwnerChatCitation, OwnerChatMessage
-from app.rag.embeddings import EmbeddingProviderError
+from app.rag.embeddings import EmbeddingProviderError, EmbeddingResult
 from app.rag.retrieval import RetrievedChunk
 from app.services import owner_chat
-from sqlalchemy import func, select
+from sqlalchemy import Engine, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from tests.test_owner_chat import CapturingProvider, active_business, headers, submit
 from tests.test_rag_lifecycle import Provider, ready_document, vector
+
+
+class _MissingEvidenceEmbeddingProvider:
+    model = "bge-m3"
+
+    def embed(self, texts: list[str]) -> EmbeddingResult:
+        question = tuple(vector(1))
+        unrelated = (0.0, 1.0, *([0.0] * 1022))
+        return EmbeddingResult(
+            vectors=(question, *(unrelated for _ in texts[1:])),
+            model=self.model,
+        )
+
+
+def _similarity_vector(similarity: float) -> list[float]:
+    return [similarity, math.sqrt(1 - similarity**2), *([0.0] * 1022)]
+
+
+def test_missing_knowledge_bypasses_provider_persists_and_replays_without_usage(
+    api_client,
+    db_session: Session,
+    migration_engine: Engine,
+    monkeypatch,
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email="missing-evidence@example.com"
+    )
+    provider = CapturingProvider(
+        OwnerChatResult(reply="This response must never be generated.")
+    )
+    monkeypatch.setattr(
+        owner_chat,
+        "create_embedding_provider",
+        lambda _: _MissingEvidenceEmbeddingProvider(),
+    )
+    from app.agent.owner_chat_provider import get_owner_chat_provider
+    from app.main import app
+
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+    first = submit(
+        api_client,
+        user,
+        business["id"],
+        "Do you repair antique clocks?",
+        key="missing-evidence",
+    )
+    replay = submit(
+        api_client,
+        user,
+        business["id"],
+        "Do you repair antique clocks?",
+        key="missing-evidence",
+    )
+
+    assert first.status_code == replay.status_code == 200
+    first_payload = first.json()
+    assert first_payload["assistant_message"]["content"] == (
+        "I don't have information about that yet. You can add it to your business "
+        "profile or knowledge base, and I'll be able to help."
+    )
+    assert first_payload["assistant_message"]["sources"] == []
+    assert (
+        replay.json()["assistant_message"]["id"]
+        == first_payload["assistant_message"]["id"]
+    )
+    assert replay.json()["replayed"] is True
+    assert provider.requests == []
+    owner = db_session.get(
+        OwnerChatMessage, uuid.UUID(first_payload["owner_message"]["id"])
+    )
+    assert owner is not None
+    assert (
+        db_session.scalar(
+            select(func.count())
+            .select_from(OwnerChatMessage)
+            .where(OwnerChatMessage.conversation_id == owner.conversation_id)
+        )
+        == 2
+    )
+    business_id = uuid.UUID(str(business["id"]))
+    with migration_engine.connect() as connection:
+        reservations = connection.scalar(
+            text(
+                "SELECT count(*) FROM ai_usage_reservations "
+                "WHERE business_id = :business_id"
+            ),
+            {"business_id": business_id},
+        )
+        usage_rows = connection.scalar(
+            text(
+                "SELECT count(*) FROM business_ai_usage_daily "
+                "WHERE business_id = :business_id"
+            ),
+            {"business_id": business_id},
+        )
+        assert reservations == usage_rows == 0
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM owner_chat_rate_limit_events "
+                    "WHERE business_id = :business_id"
+                ),
+                {"business_id": business_id},
+            )
+            == 1
+        )
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "هل تقدمون خدمة ترميم اللوحات؟",
+            "لا أملك معلومات عن ذلك بعد. يمكنك إضافتها إلى ملف نشاطك التجاري أو "
+            "قاعدة المعرفة، وسأتمكن من مساعدتك.",
+        ),
+        (
+            "بتعملوا تصليح لوحات قديمة؟",
+            "ما عندي معلومات عن هالموضوع بعد. فيك تضيفها ع ملف شغلك أو قاعدة "
+            "المعرفة، وساعتها فيني ساعدك.",
+        ),
+        (
+            "bt3amlo tasli7 law7at adime?",
+            "Ma 3ande ma3loumet 3an hal mawdu3 ba3d. Fik tdifa 3a business "
+            "profile aw knowledge base, w sa3eta fine se3dak.",
+        ),
+        (
+            "Do you بتعملوا restoration للّوحات؟",
+            "I don't have information عن هالموضوع بعد. You can add it to your "
+            "business profile أو knowledge base، وساعتها فيني ساعدك.",
+        ),
+        (
+            "Do you restore oil paintings?",
+            "I don't have information about that yet. You can add it to your "
+            "business profile or knowledge base, and I'll be able to help.",
+        ),
+    ],
+)
+def test_missing_knowledge_fallback_uses_the_supported_language(
+    message: str, expected: str
+) -> None:
+    assert owner_chat._missing_knowledge_reply(message, "en") == expected
+
+
+def test_foreign_evidence_cannot_prevent_missing_knowledge_fallback(
+    api_client, db_session: Session, monkeypatch
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email="missing-tenant-owner@example.com"
+    )
+    _, foreign_business = active_business(
+        api_client, db_session, email="missing-tenant-foreign@example.com"
+    )
+    ready_document(
+        db_session,
+        uuid.UUID(str(foreign_business["id"])),
+        digest="e" * 64,
+        chunks=[("Private antique clock repairs are available.", vector(1), "bge-m3")],
+    )
+    provider = CapturingProvider()
+    monkeypatch.setattr(
+        owner_chat,
+        "create_embedding_provider",
+        lambda _: _MissingEvidenceEmbeddingProvider(),
+    )
+    from app.agent.owner_chat_provider import get_owner_chat_provider
+    from app.main import app
+
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Do you repair antique clocks?",
+        key="foreign-evidence",
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["assistant_message"]["sources"] == []
+    assert "don't have information" in response.json()["assistant_message"]["content"]
+    assert provider.requests == []
+
+
+def test_irrelevant_retrieved_chunk_does_not_authorize_generation(
+    api_client, db_session: Session, monkeypatch
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email="irrelevant-evidence@example.com"
+    )
+    business_id = uuid.UUID(str(business["id"]))
+    ready_document(
+        db_session,
+        business_id,
+        digest="f" * 64,
+        chunks=[
+            (
+                "Daily inventory quantities change frequently.",
+                _similarity_vector(0.55),
+                "bge-m3",
+            )
+        ],
+    )
+    provider = CapturingProvider()
+    monkeypatch.setattr(
+        owner_chat,
+        "create_embedding_provider",
+        lambda _: _MissingEvidenceEmbeddingProvider(),
+    )
+    from app.agent.owner_chat_provider import get_owner_chat_provider
+    from app.main import app
+
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+    response = submit(
+        api_client,
+        user,
+        business_id,
+        "Do you repair antique clocks?",
+        key="irrelevant-evidence",
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["assistant_message"]["sources"] == []
+    assert provider.requests == []
+
+
+def test_missing_fallback_persistence_remains_atomic(
+    api_client, db_session: Session, monkeypatch
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email="missing-atomic@example.com"
+    )
+    provider = CapturingProvider()
+    monkeypatch.setattr(
+        owner_chat,
+        "create_embedding_provider",
+        lambda _: _MissingEvidenceEmbeddingProvider(),
+    )
+    monkeypatch.setattr(
+        owner_chat,
+        "upsert_proposed_knowledge",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("database failure")),
+    )
+    from app.agent.owner_chat_provider import get_owner_chat_provider
+    from app.main import app
+
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Do you repair antique clocks?",
+        key="missing-atomic",
+    )
+
+    assert response.status_code == 503
+    messages = db_session.scalars(select(OwnerChatMessage)).all()
+    assert len(messages) == 1
+    assert messages[0].generation_state == "failed"
+    assert provider.requests == []
 
 
 def _persisted_citation(

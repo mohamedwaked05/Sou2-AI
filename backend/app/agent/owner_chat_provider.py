@@ -459,6 +459,22 @@ def _source_context(sources: tuple[ProviderSource, ...]) -> list[dict[str, Any]]
     ]
 
 
+def _canonical_citation_labels(
+    citations: list[str], sources: tuple[ProviderSource, ...]
+) -> tuple[str, ...]:
+    labels_by_identifier: dict[str, set[str]] = {}
+    for source in sources:
+        for identifier in (source.label, source.document_id, source.chunk_id):
+            labels_by_identifier.setdefault(identifier, set()).add(source.label)
+    canonical: list[str] = []
+    for citation in citations:
+        labels = labels_by_identifier.get(citation, set())
+        if len(labels) != 1:
+            raise ValueError("Citation does not identify exactly one supplied source.")
+        canonical.append(next(iter(labels)))
+    return tuple(canonical)
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(
         value,
@@ -547,6 +563,18 @@ class OllamaOwnerChatProvider:
                     model_identifier=self.model,
                     usage_uncertain=True,
                 )
+            try:
+                cited_source_ids = _canonical_citation_labels(
+                    structured.cited_source_ids, request.sources
+                )
+            except ValueError:
+                raise OwnerChatProviderInvalidResponse(
+                    reason="invalid_citations",
+                    usage=usage,
+                    provider_identifier="ollama",
+                    model_identifier=self.model,
+                    usage_uncertain=True,
+                ) from None
         except OwnerChatProviderError:
             raise
         except httpx.TimeoutException:
@@ -590,7 +618,7 @@ class OllamaOwnerChatProvider:
 
         return OwnerChatResult(
             reply=structured.reply,
-            cited_source_ids=tuple(structured.cited_source_ids),
+            cited_source_ids=cited_source_ids,
             proposed_knowledge=tuple(
                 ProposedKnowledge(
                     subject_key=fact.subject_key,
@@ -750,6 +778,17 @@ class GeminiOwnerChatProvider:
                     provider_identifier="gemini",
                     model_identifier=self.model,
                 )
+            try:
+                cited_source_ids = _canonical_citation_labels(
+                    structured.cited_source_ids, request.sources
+                )
+            except ValueError:
+                raise OwnerChatProviderInvalidResponse(
+                    reason="invalid_citations",
+                    usage=usage,
+                    provider_identifier="gemini",
+                    model_identifier=self.model,
+                ) from None
         except OwnerChatProviderError:
             raise
         except httpx.TimeoutException:
@@ -801,7 +840,7 @@ class GeminiOwnerChatProvider:
             )
         return OwnerChatResult(
             reply=structured.reply,
-            cited_source_ids=tuple(structured.cited_source_ids),
+            cited_source_ids=cited_source_ids,
             proposed_knowledge=tuple(
                 ProposedKnowledge(
                     subject_key=fact.subject_key,

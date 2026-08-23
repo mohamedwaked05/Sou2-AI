@@ -24,7 +24,13 @@ from app.agent.owner_chat_provider import (
 )
 from app.core.config import get_settings
 from app.rag.embeddings import EmbeddingProviderError, create_embedding_provider
-from app.services.owner_chat import _normalized_safety_text, _select_sources
+from app.services.owner_chat import (
+    _has_meaningful_overlap,
+    _missing_knowledge_reply,
+    _normalized_safety_text,
+    _profile_evidence_texts,
+    _select_sources,
+)
 
 DATASET_PATH = (
     Path(__file__).parents[2] / "evaluations" / "milestone_14_grounded_rag.json"
@@ -377,15 +383,17 @@ def _generate_outcomes(
     question_vectors: list[object],
     documents: list[dict[str, str]],
     document_vectors: list[object],
+    profile_vectors: list[object] | tuple[object, ...],
     chat: GeminiOwnerChatProvider,
     settings,
     request_interval_seconds: float,
     sleep: Callable[[float], None] = time_module.sleep,
-) -> tuple[dict[str, dict[str, object]], dict[str, str] | None]:
+) -> tuple[dict[str, dict[str, object]], dict[str, str] | None, int]:
     outcomes: dict[str, dict[str, object]] = {}
-    for index, (case, vector) in enumerate(zip(cases, question_vectors, strict=True)):
-        if index:
-            sleep(request_interval_seconds)
+    profile = _profile()
+    profile_evidence = _profile_evidence_texts(profile)
+    provider_calls = 0
+    for case, vector in zip(cases, question_vectors, strict=True):
         ranked = sorted(
             (
                 (_cosine(list(vector), list(item_vector)), document)
@@ -403,11 +411,27 @@ def _generate_outcomes(
                 if score >= settings.retrieval_minimum_similarity
             ),
             settings,
+            question=case["question"],
         )
+        has_profile_evidence = any(
+            _cosine(list(vector), list(profile_vector))
+            >= settings.retrieval_minimum_similarity
+            or _has_meaningful_overlap(case["question"], evidence)
+            for evidence, profile_vector in zip(
+                profile_evidence, profile_vectors, strict=True
+            )
+        )
+        if not sources and not has_profile_evidence:
+            fallback = _missing_knowledge_reply(case["question"], "en")
+            outcomes[case["id"]] = _score(case, fallback, (), ())
+            continue
+        if provider_calls:
+            sleep(request_interval_seconds)
+        provider_calls += 1
         try:
             result = chat.generate(
                 OwnerChatRequest(
-                    profile=_profile(),
+                    profile=profile,
                     knowledge=(),
                     messages=(ProviderMessage(role="owner", content=case["question"]),),
                     requested_at=datetime.now(UTC),
@@ -422,10 +446,14 @@ def _generate_outcomes(
             reason = exc.reason or "provider_failure"
             outcomes[case["id"]] = _failure(case, sources, reason)
             if reason == "rate_limited":
-                return outcomes, {"reason": "rate_limited", "scenario_id": case["id"]}
+                return (
+                    outcomes,
+                    {"reason": "rate_limited", "scenario_id": case["id"]},
+                    provider_calls,
+                )
         except Exception:
             outcomes[case["id"]] = _failure(case, sources, "unexpected_failure")
-    return outcomes, None
+    return outcomes, None, provider_calls
 
 
 def _chunk(document: dict[str, str], score: float):
@@ -476,23 +504,29 @@ def main() -> None:
         document_vectors = embeddings.embed(
             [item["content"] for item in documents]
         ).vectors
+        profile_vectors = embeddings.embed(
+            list(_profile_evidence_texts(_profile()))
+        ).vectors
         question_vectors = embeddings.embed(
             [case["question"] for case in cases]
         ).vectors
     except EmbeddingProviderError as exc:
         outcomes = {case["id"]: _failure(case, (), exc.code) for case in cases}
         aborted = None
+        provider_calls = 0
     else:
-        outcomes, aborted = _generate_outcomes(
+        outcomes, aborted, provider_calls = _generate_outcomes(
             cases=cases,
             question_vectors=question_vectors,
             documents=documents,
             document_vectors=document_vectors,
+            profile_vectors=profile_vectors,
             chat=chat,
             settings=settings,
             request_interval_seconds=request_interval_seconds,
         )
     report = _report(cases, outcomes, aborted)
+    report["provider_request_count"] = provider_calls
     report["scenarios"] = [
         outcomes[case["id"]] for case in cases if case["id"] in outcomes
     ]

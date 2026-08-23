@@ -21,6 +21,7 @@ from app.agent.owner_chat_provider import (
     ProviderBusinessProfile,
     ProviderKnowledge,
     ProviderMessage,
+    ProviderSource,
     ProviderWorkingDay,
     ProviderWorkingShift,
     create_owner_chat_provider,
@@ -94,6 +95,24 @@ def provider_request() -> OwnerChatRequest:
             ProviderMessage(role="owner", content="Please remind me again."),
         ),
         requested_at=datetime(2026, 8, 13, 10, tzinfo=UTC),
+    )
+
+
+def request_with_source() -> OwnerChatRequest:
+    return replace(
+        provider_request(),
+        sources=(
+            ProviderSource(
+                label="S1",
+                document_id="00000000-0000-0000-0000-000000000001",
+                filename="returns.pdf",
+                chunk_id="00000000-0000-0000-0000-000000000002",
+                content="Returns are accepted within 14 days.",
+                page_start=None,
+                page_end=None,
+                section_title=None,
+            ),
+        ),
     )
 
 
@@ -857,13 +876,51 @@ def test_gemini_valid_structured_response_uses_authoritative_usage() -> None:
                 "proposed_knowledge": [],
             }
         )
-    ).generate(provider_request())
+    ).generate(request_with_source())
 
     assert result.reply == "Returns are accepted within 14 days."
     assert result.cited_source_ids == ("S1",)
     assert result.usage is not None
     assert result.usage.authoritative is True
     assert result.usage.total_tokens == 48
+
+
+@pytest.mark.parametrize(
+    "citation",
+    [
+        "00000000-0000-0000-0000-000000000001",
+        "00000000-0000-0000-0000-000000000002",
+    ],
+)
+def test_gemini_canonicalizes_traceable_source_identifiers(citation: str) -> None:
+    result = gemini_provider(
+        gemini_successful_transport(
+            {
+                "reply": "Returns are accepted within 14 days.",
+                "cited_source_ids": [citation],
+                "proposed_knowledge": [],
+            }
+        )
+    ).generate(request_with_source())
+
+    assert result.cited_source_ids == ("S1",)
+
+
+def test_gemini_rejects_unknown_source_identifier() -> None:
+    provider = gemini_provider(
+        gemini_successful_transport(
+            {
+                "reply": "Unsupported citation.",
+                "cited_source_ids": ["00000000-0000-0000-0000-000000000099"],
+                "proposed_knowledge": [],
+            }
+        )
+    )
+
+    with pytest.raises(OwnerChatProviderInvalidResponse) as raised:
+        provider.generate(request_with_source())
+
+    assert raised.value.reason == "invalid_citations"
 
 
 def test_gemini_sends_key_only_in_header_and_never_logs_it(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from sqlalchemy import select
@@ -52,6 +53,7 @@ def retrieve(
     settings: Settings,
     *,
     request_id: str | None = None,
+    question_embedding: Sequence[float] | None = None,
 ) -> RetrievalResult:
     """Embed and exactly rank only current-model chunks for an authorized tenant."""
     started = time.monotonic()
@@ -84,7 +86,11 @@ def retrieve(
                 "success",
             )
             return result
-        vector = list(provider.embed([question]).vectors[0])
+        vector = list(
+            question_embedding
+            if question_embedding is not None
+            else provider.embed([question]).vectors[0]
+        )
         distance = KnowledgeDocumentChunk.embedding.cosine_distance(vector)
         similarity = (1 - distance).label("similarity")
         rows = session.execute(

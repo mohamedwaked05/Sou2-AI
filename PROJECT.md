@@ -81,10 +81,11 @@ chat with persisted citations, and the React/Vite business interface.
 
 Milestone 14 remains In Progress until its live 35-scenario multilingual quality
 and security evaluation passes. Its implementation and offline coverage include
-trusted profile plus retrieved-chunk grounding, natural missing-knowledge fallback
-instructions, conflict clarification, prompt-injection defenses, cross-tenant
-isolation, citation allowlisting and database scope guards, safe Gemini failure
-normalization, and atomic assistant/citation/usage persistence.
+trusted profile plus retrieved-chunk grounding, a deterministic missing-knowledge
+gate that bypasses generation and token charging, conflict clarification,
+prompt-injection defenses, cross-tenant isolation, traceable citation
+canonicalization plus database scope guards, safe Gemini failure normalization,
+and atomic assistant/citation/usage persistence.
 
 Qwen2.5 7B remains an optional local generation provider and is not
 production-approved after Milestone 9's critical multilingual failures. Gemini is
@@ -270,9 +271,11 @@ evaluation; production provider approval remains future work.
 * Evaluate correct, missing, and conflicting knowledge in all supported languages.
 
 The grounded flow and its offline security, provider-contract, retrieval, and
-atomic-persistence coverage are implemented. Completion still requires the fixed
-35-scenario live Gemini evaluation to meet every documented quality and security
-gate after a successful smoke request.
+atomic-persistence coverage are implemented. Unsupported questions now return a
+language-appropriate persisted fallback with no citations, provider request, or AI
+token reservation. Completion still requires the fixed 35-scenario live Gemini
+evaluation to meet every documented quality and security gate after a successful
+smoke request.
 
 RAG covers relatively stable knowledge such as policies, delivery information, FAQs, warranties, and documents. It is not the source of truth for current stock, today's sales, orders, or other changing facts.
 

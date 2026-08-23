@@ -16,6 +16,8 @@ from app.agent.owner_chat_provider import (
 from app.core.config import Settings, get_settings
 from app.database.session import ensure_test_database_url, get_db_session
 from app.main import app
+from app.rag.embeddings import EmbeddingResult
+from app.services import owner_chat
 from app.services.email import get_email_service
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, create_engine, text
@@ -151,6 +153,17 @@ class MockEmailService:
         self.password_reset_messages.append((recipient, token))
 
 
+class MockEmbeddingProvider:
+    model = "bge-m3"
+
+    def embed(self, texts: list[str]) -> EmbeddingResult:
+        vector = (1.0, *([0.0] * 1023))
+        return EmbeddingResult(
+            vectors=tuple(vector for _ in texts),
+            model=self.model,
+        )
+
+
 @pytest.fixture
 def email_service() -> MockEmailService:
     return MockEmailService()
@@ -158,7 +171,9 @@ def email_service() -> MockEmailService:
 
 @pytest.fixture
 def api_client(
-    db_session: Session, email_service: MockEmailService
+    db_session: Session,
+    email_service: MockEmailService,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> Generator[TestClient]:
     def override_session() -> Generator[Session]:
         yield db_session
@@ -167,6 +182,9 @@ def api_client(
     app.dependency_overrides[get_email_service] = lambda: email_service
     app.dependency_overrides[get_owner_chat_provider] = (
         DeterministicMockOwnerChatProvider
+    )
+    monkeypatch.setattr(
+        owner_chat, "create_embedding_provider", lambda _: MockEmbeddingProvider()
     )
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
         yield client

@@ -42,13 +42,22 @@ def _cases() -> list[dict[str, str]]:
 
 
 def _run_generated_outcomes(
-    chat: _EvaluationChat, sleeps: list[float], interval: float
+    chat: _EvaluationChat,
+    sleeps: list[float],
+    interval: float,
+    *,
+    relevant_profile: bool = True,
 ):
+    from app.rag.evaluate_grounded_owner_chat import _profile
+    from app.services.owner_chat import _profile_evidence_texts
+
+    profile_score = 1.0 if relevant_profile else -1.0
     return _generate_outcomes(
         cases=_cases(),
         question_vectors=[[1.0], [1.0]],
         documents=[],
         document_vectors=[],
+        profile_vectors=[[profile_score] for _ in _profile_evidence_texts(_profile())],
         chat=chat,  # type: ignore[arg-type]
         settings=Settings(_env_file=None),
         request_interval_seconds=interval,
@@ -77,12 +86,28 @@ def test_evaluation_waits_only_between_requests_without_retries() -> None:
     chat = _EvaluationChat()
     sleeps: list[float] = []
 
-    outcomes, aborted = _run_generated_outcomes(chat, sleeps, 22)
+    outcomes, aborted, provider_calls = _run_generated_outcomes(chat, sleeps, 22)
 
     assert list(outcomes) == ["one", "two"]
     assert aborted is None
+    assert provider_calls == 2
     assert chat.calls == 2
     assert sleeps == [22]
+
+
+def test_evaluation_bypasses_provider_when_no_trusted_evidence_exists() -> None:
+    chat = _EvaluationChat()
+    sleeps: list[float] = []
+
+    outcomes, aborted, provider_calls = _run_generated_outcomes(
+        chat, sleeps, 22, relevant_profile=False
+    )
+
+    assert aborted is None
+    assert provider_calls == 0
+    assert chat.calls == 0
+    assert sleeps == []
+    assert all(outcome["success"] for outcome in outcomes.values())
 
 
 def test_evaluation_aborts_immediately_on_rate_limiting_without_secret_leakage() -> (
@@ -91,11 +116,12 @@ def test_evaluation_aborts_immediately_on_rate_limiting_without_secret_leakage()
     chat = _EvaluationChat("rate_limited")
     sleeps: list[float] = []
 
-    outcomes, aborted = _run_generated_outcomes(chat, sleeps, 22)
+    outcomes, aborted, provider_calls = _run_generated_outcomes(chat, sleeps, 22)
 
     assert list(outcomes) == ["one"]
     assert outcomes["one"]["provider_failure_code"] == "rate_limited"
     assert aborted == {"reason": "rate_limited", "scenario_id": "one"}
+    assert provider_calls == 1
     assert chat.calls == 1
     assert sleeps == []
     assert "test-key-not-production" not in repr((outcomes, aborted))
