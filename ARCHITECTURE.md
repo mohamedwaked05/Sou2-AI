@@ -21,6 +21,8 @@ flowchart TD
     API --> CHAT[Owner Chat Service]
     CHAT --> RAG[RAG Service]
     CHAT --> LLM[Generation Provider]
+    CHAT --> EXEC[Central Tool Executor]
+    EXEC --> OI
     CHAT --> DB[(Sou2AI PostgreSQL)]
     RAG --> EMBED[Embedding Service]
     RAG --> VECTOR[(PostgreSQL and pgvector)]
@@ -32,8 +34,9 @@ flowchart TD
 ```
 
 Milestone 16 adds authenticated management routes for tenant-owned, non-secret
-connection metadata and a Data Sources UI. It does not expose adapter query
-operations to an agent; controlled tool calling remains future Milestone 17.
+connection metadata and a Data Sources UI. Milestone 17 connects exactly four
+approved read operations to owner chat through a bounded provider-neutral loop and
+one centralized executor; it adds no write tools or public query endpoint.
 
 ## 3. Runtime components
 
@@ -57,9 +60,9 @@ app/api/v1/    version 1 routes and router
 app/core/      configuration, logging, and shared exceptions
 app/database/  persistence infrastructure
 app/rag/       document ingestion and retrieval
-app/agent/     model-provider contracts and adapters; future agent orchestration
+app/agent/     model-provider contracts and adapters
 app/integrations/ provider-neutral operational contracts and source adapters
-app/tools/     future controlled operational capabilities
+app/tools/     fixed tool registry and centralized operational executor
 app/memory/    future conversation and semantic memory services
 app/services/  application logic
 app/schemas/   Pydantic request and response schemas
@@ -67,9 +70,9 @@ app/utils/     small shared utilities
 ```
 
 Routes handle HTTP concerns. Services handle application logic. Database modules
-manage persistence. RAG modules manage ingestion and retrieval. The current agent
-module provides model adapters; capability selection, controlled operational
-tools, and memory services remain future milestones.
+manage persistence. RAG modules manage ingestion and retrieval. The agent module
+keeps provider-specific formats behind the provider-neutral owner-chat contract;
+the tools module owns approved operation lookup and execution.
 
 ## 5. API structure
 
@@ -120,7 +123,7 @@ value or polarity, the final answer must identify the conflict, ask for
 clarification, and cite exactly every involved source; ordinary complementary
 sources do not trigger that path.
 
-Owner chat routes each claimed turn in a fixed order: unavailable live operations;
+Owner chat routes each claimed turn in a fixed order: controlled live operations;
 clearly business-related questions, which use tenant-scoped trusted profile and
 retrieval evidence or the localized missing-information fallback; then casual or
 general conversation. Conversational turns use one provider call through the same
@@ -130,6 +133,15 @@ business or live operational facts. The structured conversational result can sig
 that business knowledge is actually required; orchestration then discards its reply
 and persists the deterministic localized missing-information fallback.
 
+For a recognized operational question, owner chat first requires an authenticated
+full-access member, an `ACTIVE` business, a configured `ACTIVE` source, a healthy
+mapping, and a nonblank server-side audit HMAC secret. If any prerequisite is
+missing, the existing localized unavailable response is persisted without a
+provider call, tool audit, rate admission, reservation, or charge. Otherwise the
+provider receives only fixed tool descriptions and strict schemas. It may return a
+final response, request one approved structured tool, or report the capability
+unavailable; names and arguments are always validated outside the model.
+
 ## 8. Platform data versus operational business data
 
 Sou2AI PostgreSQL stores data the platform owns: users, business profiles,
@@ -138,8 +150,9 @@ tool-call audit metadata. Products,
 inventory, orders, sales, revenue, customers, appointments, and billing remain in
 the business's source system. The Milestone 16 PostgreSQL adapter proves a
 read-only integration boundary against a separate demonstration source. The
-platform persists only tenant-owned profile keys and lifecycle metadata. Future
-controlled tools may use that boundary or other approved API/database adapters.
+platform persists only tenant-owned profile keys and lifecycle metadata. The
+controlled tool layer uses only this provider-neutral boundary and normalized
+contracts; it does not import or understand source tables or PostgreSQL SQL.
 This avoids stale copies and preserves the business's source of truth.
 
 Operational callers receive strict Sou2AI contracts rather than source table or
@@ -170,32 +183,35 @@ the meantime. Management states are `CONFIGURED`, `VALIDATED`, `ACTIVE`,
 Unstructured RAG data is stored separately and covers approved documents such as
 policies, descriptions, warranties, FAQs, and business notes.
 
-Until the future operational adapters exist, owner chat detects requests for
-current inventory, sales, orders, revenue, best sellers, restocking, and
-appointment availability before retrieval. It persists a localized
-live-data-unavailable reply with no citations, provider request, AI-token
-reservation, or charge, even if a document appears to contain such a value.
+Owner chat detects requests for current inventory, sales, revenue, best sellers,
+and restocking before retrieval. An active healthy source enables the four
+approved reads; unsupported orders, appointments, unavailable capabilities, and
+missing/unhealthy sources retain the localized live-data-unavailable reply with no
+citations, provider request, AI-token reservation, or charge, even if a document
+or previous message appears to contain a value.
 
-## 9. Planned Milestones 16–17 agent flow
+## 9. Controlled operational agent flow
 
 ```mermaid
 flowchart TD
     R[User Request] --> A[Sou2AI Agent]
-    A --> D{Required capability}
-    D -->|Knowledge| RAG[Search Documents]
-    D -->|Read business facts| READ[Database Read Tool]
-    D -->|Change business data| WRITE[Controlled Write Tool]
-    D -->|Conversation context| MEM[Memory Retrieval]
-    RAG --> FINAL[Grounded Final Response]
-    READ --> FINAL
-    WRITE --> CONFIRM{Confirmation required?}
-    CONFIRM --> FINAL
-    MEM --> FINAL
+    A --> CHECK{Active healthy source?}
+    CHECK -->|No| SAFE[Safe unavailable response]
+    CHECK -->|Yes| P[Provider decision]
+    P -->|Approved request| E[Central executor]
+    E --> V[Authorize and validate]
+    V --> O[Normalized operational result]
+    O --> P
+    P -->|Final answer| FINAL[Persist assistant response]
 ```
 
-Write and destructive tools must require validation and, when appropriate, explicit user confirmation.
-The diagram is a future design boundary. No operational adapter, tool registry, or
-model-driven tool execution is implemented yet.
+The registry contains only `current_inventory`, `sales_summary`,
+`best_selling_products`, and `restocking_recommendations`. A turn permits at most
+two executions and three provider calls, rejects an identical repeated request,
+and treats returned records as untrusted data rather than instructions. Current
+operational data takes precedence over history, documents, profile text, and model
+assumptions and produces no document citations. Write and destructive tools remain
+unimplemented future work and would require a separate confirmation design.
 
 ## 10. Language handling
 
@@ -411,10 +427,12 @@ operational data. Future concepts such as `get_revenue_trend`,
 `get_top_selling_items`, and `compare_sales` will use controlled tenant-scoped live
 adapters; they are not implemented and the model must not guess their results.
 
-A future centralized tool-execution service—not the model and not individual
-adapters—will write exactly one audit row after business-scope and permission
-checks for every success, error, or denial. That executor and its adapters remain
-out of scope.
+The centralized tool-execution service—not the model, provider adapter, or source
+adapter—writes exactly one audit row after business-scope and permission checks for
+each attempted success, error, denial, or timeout. It stores only business/user
+scope, stable tool name, HMAC argument digest, status, safe error code, non-negative
+latency, and timestamp. Audit persistence must succeed before execution can be
+reported as successfully audited; raw arguments and results are never stored.
 
 ## 13.3 Knowledge-document storage
 
@@ -574,10 +592,10 @@ knowledge, pgvector/BGE-M3 retrieval, private document ingestion and processing,
 grounded answers with persisted citations, PostgreSQL-backed API limits and AI
 budgets, the HTTP/logging security boundary, the React business interface, and
 Milestone 16's provider-neutral contracts, fake-store PostgreSQL adapter,
-tenant-scoped lifecycle API, and responsive Data Sources UI. Controlled agent tool
-calling remains future Milestone 17;
-customer chat, WhatsApp, billing, and activation/admin APIs also remain future
-work.
+tenant-scoped lifecycle API, and responsive Data Sources UI, plus Milestone 17's
+four-tool read-only registry, centralized executor, bounded owner-chat loop, and
+privacy-minimal tool auditing. Customer chat, WhatsApp, operational writes,
+billing, and activation/admin APIs remain future work.
 
 ## 17. Milestone 12 document ingestion
 

@@ -11,6 +11,10 @@ from app.api.dependencies import get_current_user, run_security_record_cleanup
 from app.core.config import Settings, get_settings
 from app.database.models import User
 from app.database.session import get_db_session
+from app.integrations.profiles import (
+    ConnectionProfileRegistry,
+    get_connection_profile_registry,
+)
 from app.schemas.owner_chat import (
     ConversationHistoryResponse,
     KnowledgeResponse,
@@ -30,6 +34,9 @@ DatabaseSession = Annotated[Session, Depends(get_db_session)]
 AuthenticatedUser = Annotated[User, Depends(get_current_user)]
 ChatProvider = Annotated[OwnerChatProvider, Depends(get_owner_chat_provider)]
 AppSettings = Annotated[Settings, Depends(get_settings)]
+ProfileRegistry = Annotated[
+    ConnectionProfileRegistry, Depends(get_connection_profile_registry)
+]
 
 
 @router.post(
@@ -44,8 +51,11 @@ def submit_message(
     user: AuthenticatedUser,
     provider: ChatProvider,
     settings: AppSettings,
+    profiles: ProfileRegistry,
 ) -> OwnerTurnResponse:
-    return submit_owner_message(session, user, business_id, body, provider, settings)
+    return submit_owner_message(
+        session, user, business_id, body, provider, settings, profiles
+    )
 
 
 @router.get("/owner-chat/messages", response_model=ConversationHistoryResponse)

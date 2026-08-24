@@ -4,7 +4,7 @@ Sou2AI is planned as a local AI assistant for small businesses, supporting Engli
 
 ## Status
 
-Milestone 15 is implemented. The backend includes authentication, isolated
+Milestones 15–17 are implemented. The backend includes authentication, isolated
 multi-business onboarding, database-controlled lifecycle management, and one
 persistent private owner conversation per business. Complete, confirmed active
 businesses use local Ollama with `qwen2.5:7b` in development, retain full
@@ -26,14 +26,17 @@ documentation, and redacted environment-aware logging. Production host and CORS
 checks normalize case, DNS trailing dots, and IPv4/IPv6 loopback representations
 before rejecting local or malformed values.
 
-Milestone 16 provides provider-neutral operational contracts, a read-only adapter
+Milestone 17 adds four controlled read-only owner-chat tools on top of Milestone
+16's provider-neutral operational contracts and read-only adapter
 for a separate deterministic fake-store PostgreSQL source, and tenant-scoped Data
 Sources management. Deployment-managed allowlisted profile keys keep connection
 credentials out of the public API and browser; a versioned semantic mapping must
 validate before activation. The responsive React interface can configure,
 validate, activate, health-check, and disable the demonstration source. Live
 operational records remain in that external database and are never copied into
-Sou2AI. Agent tools, customer chat, additional cloud providers, payments, and
+Sou2AI. The centralized executor strictly validates tool requests, requires an
+active healthy tenant source, bounds results and time, and writes only HMAC-hashed
+privacy-minimal audits. Customer chat, additional cloud providers, payments, and
 activation/admin HTTP endpoints remain future work. Manual lifecycle
 changes use a controlled PostgreSQL function with permanent append-only history.
 The local database uses separate bootstrap, restricted FastAPI runtime, and

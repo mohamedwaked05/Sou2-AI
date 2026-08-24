@@ -9,10 +9,11 @@ Milestone 14 is in progress. It adds tenant-scoped grounded owner-chat retrieval
 safe persisted citations, and Gemini development generation through the existing
 replaceable provider boundary. Local Ollama `bge-m3` remains the embedding model.
 
-Milestone 16 adds strict provider-neutral operational contracts, a predefined
+Milestone 17 adds controlled owner-chat execution of four read-only operations on
+top of Milestone 16's strict provider-neutral operational contracts, a predefined
 read-only PostgreSQL adapter backed by a separate fake Lebanese minimarket source,
 and tenant-scoped connection management through safe deployment profile keys. It
-does not add agent tools, model calls, or public operational-query endpoints.
+does not add public operational-query endpoints or write tools.
 
 Milestone 7 adds PostgreSQL-backed registration and owner-generation limits,
 per-business local-day AI token allowances, leased usage reconciliation, a
@@ -26,7 +27,7 @@ Milestone 13 adds local BGE-M3 embeddings, atomic document embedding, internal
 tenant-scoped exact pgvector retrieval, and an internal re-embedding queue/CLI.
 Milestone 14 connects that retrieval to grounded owner chat and Gemini; Milestone
 15 provides the React interface. Customer chat, activation/admin APIs,
-operational analytics, agent tool execution, payments, invitations, and additional
+operational dashboards, write tools, payments, invitations, and additional
 roles remain outside the current implementation boundary.
 
 ## Requirements
@@ -199,10 +200,12 @@ run without holding a Sou2AI row lock, while the final tenant update rechecks th
 configuration under a lock. The Data Sources UI presents this lifecycle and the
 approved capabilities without accepting database coordinates or credentials.
 
-These management APIs do not execute operational queries for the assistant.
-Milestone 17 will separately expose approved adapter operations through controlled
-agent tools; arbitrary SQL, schema inspection, and model access to credentials
-remain forbidden.
+Owner chat uses these configurations only through the fixed `current_inventory`,
+`sales_summary`, `best_selling_products`, and `restocking_recommendations` tools.
+The centralized executor rechecks full tenant access, `ACTIVE` business and source
+state, live health, mapping capability, strict arguments, timeout, and result
+bounds. Arbitrary SQL, schema inspection, dynamic tools, and model access to
+credentials remain forbidden.
 
 From `backend`, apply or roll back the schema:
 
@@ -516,11 +519,23 @@ Saida and Jezzine; and Nabatieh with Nabatieh, Bint Jbeil, and Marjayoun. Cities
 areas are accepted only under their configured district and governorate; arbitrary
 location text is rejected.
 
-Future tool arguments must be canonicalized and HMAC-SHA-256 signed with the
+Tool arguments are canonicalized and HMAC-SHA-256 signed with the
 server-only `TOOL_CALL_AUDIT_HMAC_SECRET`. Only the digest is stored. Audit rows
 retain no raw arguments, results, prompts, conversations, customer PII, or raw
-errors. `TOOL_CALL_AUDIT_RETENTION_DAYS` defaults to 90; a future external
-scheduler will call the existing retention operation.
+errors. Tool execution fails closed while the secret is blank. One row is committed
+for each attempted success, denial, adapter error, or timeout before a result is
+treated as successful. `TOOL_CALL_AUDIT_RETENTION_DAYS` defaults to 90; a future
+external scheduler will call the existing retention operation.
+
+The operational loop allows at most two tool executions and three provider calls
+within one owner generation turn. It uses one rate admission and one AI usage
+reservation, aggregates provider tokens across calls, and charges no model tokens
+for the database reads themselves. Live results are untrusted structured context,
+take precedence over chat/RAG/profile claims, and do not create document
+citations. Idempotent replay returns the stored assistant response without another
+provider call, tool execution, audit, reservation, or charge. Missing, disabled,
+unhealthy, unsupported, or unauditable sources keep the established safe
+live-data-unavailable response.
 
 ## Implementation boundary
 
@@ -531,8 +546,9 @@ implemented. Authoritative provider token counts are preferred; otherwise the ex
 conservative estimate is recorded as non-authoritative. Private documents,
 BGE-M3/pgvector retrieval, grounded RAG with citations, and the React frontend are
 implemented. Milestone 16's operational contracts, read-only PostgreSQL adapter,
-tenant lifecycle management, and Data Sources UI are implemented; controlled tool
-calling remains future Milestone 17. Customer channels also remain planned.
+tenant lifecycle management, and Data Sources UI are implemented. Milestone 17's
+bounded read-only tool loop and privacy-minimal auditing are implemented. Customer
+channels and operational write tools remain planned.
 Authentication alone never grants business access without membership.
 
 ## Milestone 12 knowledge documents

@@ -1,1 +1,1 @@
-"""Reserved for future agent tools."""
+"""Allowlisted, centrally executed owner-assistant tools."""

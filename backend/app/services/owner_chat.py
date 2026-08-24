@@ -30,6 +30,8 @@ from app.agent.owner_chat_provider import (
     ProviderKnowledge,
     ProviderMessage,
     ProviderSource,
+    ProviderToolDefinition,
+    ProviderToolResult,
     ProviderWorkingDay,
     ProviderWorkingShift,
     TokenUsage,
@@ -50,6 +52,7 @@ from app.database.models import (
     OwnerConversation,
     User,
 )
+from app.integrations.profiles import ConnectionProfileRegistry
 from app.rag.embeddings import create_embedding_provider
 from app.rag.retrieval import retrieve
 from app.schemas.owner_chat import (
@@ -70,8 +73,18 @@ from app.services.api_limits import (
 from app.services.business_knowledge import upsert_proposed_knowledge
 from app.services.business_profiles import is_business_profile_complete
 from app.services.businesses import load_full_access_business
+from app.tools.operational import (
+    BEST_SELLING_PRODUCTS_TOOL,
+    CURRENT_INVENTORY_TOOL,
+    RESTOCKING_RECOMMENDATIONS_TOOL,
+    SALES_SUMMARY_TOOL,
+    OperationalToolExecutor,
+    ToolExecutionError,
+)
 
 CHAT_CONTEXT_MESSAGE_LIMIT = 12
+MAX_OPERATIONAL_TOOL_EXECUTIONS = 2
+MAX_OPERATIONAL_PROVIDER_CALLS = 3
 HISTORY_PAGE_SIZE = 50
 ABANDONED_TURN_RECOVERY_BATCH_SIZE = 100
 HIGH_CONFIDENCE_EVIDENCE_SIMILARITY = 0.65
@@ -97,6 +110,17 @@ class _PreparedTurn:
     request: OwnerChatRequest
     business: Business
     has_usable_evidence: bool
+
+
+def _add_usage(current: TokenUsage | None, added: TokenUsage) -> TokenUsage:
+    if current is None:
+        return added
+    return TokenUsage(
+        input_tokens=current.input_tokens + added.input_tokens,
+        output_tokens=current.output_tokens + added.output_tokens,
+        total_tokens=current.total_tokens + added.total_tokens,
+        authoritative=current.authoritative and added.authoritative,
+    )
 
 
 def _provider_unavailable() -> ApplicationError:
@@ -616,6 +640,22 @@ def _is_live_operational_request(value: str) -> bool:
     return True
 
 
+def _matching_operational_tools(value: str) -> frozenset[str]:
+    """Map deterministic message concepts to the smallest approved tool set."""
+
+    concepts = _query_concepts(value)
+    names: set[str] = set()
+    if "inventory" in concepts:
+        names.add(CURRENT_INVENTORY_TOOL)
+    if concepts & {"sales", "revenue"}:
+        names.add(SALES_SUMMARY_TOOL)
+    if "sales" in concepts:
+        names.add(BEST_SELLING_PRODUCTS_TOOL)
+    if "restocking" in concepts:
+        names.add(RESTOCKING_RECOMMENDATIONS_TOOL)
+    return frozenset(names)
+
+
 def _profile_evidence_texts(profile: ProviderBusinessProfile) -> tuple[str, ...]:
     identity = (
         f"Business name: {profile.name}. Description: {profile.description}. "
@@ -780,6 +820,35 @@ def _build_conversation_request(
         requested_at=utc_now(),
         max_output_tokens=settings.owner_chat_max_output_tokens,
         mode="conversation",
+    )
+    session.commit()
+    return _PreparedTurn(request=request, business=business, has_usable_evidence=True)
+
+
+def _build_operational_request(
+    session: Session,
+    business_id: uuid.UUID,
+    owner_message_id: uuid.UUID,
+    settings: Settings,
+    definitions: tuple[ProviderToolDefinition, ...],
+    results: tuple[ProviderToolResult, ...] = (),
+    *,
+    requested_at: datetime | None = None,
+) -> _PreparedTurn:
+    owner_message = session.get(OwnerChatMessage, owner_message_id)
+    business = _load_provider_business(session, business_id)
+    if owner_message is None or business is None:
+        raise _provider_unavailable()
+    request = OwnerChatRequest(
+        profile=_provider_profile(business),
+        knowledge=(),
+        sources=(),
+        messages=_provider_messages(session, owner_message),
+        requested_at=requested_at or utc_now(),
+        max_output_tokens=settings.owner_chat_max_output_tokens,
+        mode="operational",
+        tools=definitions,
+        tool_results=results,
     )
     session.commit()
     return _PreparedTurn(request=request, business=business, has_usable_evidence=True)
@@ -1301,16 +1370,213 @@ def _undo_pre_provider_admission(
         raise RuntimeError("Owner generation admission could not be safely undone.")
 
 
+def _usage_for_result(
+    provider: OwnerChatProvider,
+    request: OwnerChatRequest,
+    result: OwnerChatResult,
+) -> TokenUsage:
+    if result.usage is not None:
+        return result.usage
+    output = (
+        result.reply
+        if result.decision != "tool"
+        else json.dumps(
+            {"tool_name": result.tool_name, "arguments": result.tool_arguments},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    input_tokens = provider.estimate_input_tokens(request)
+    output_tokens = estimate_utf8_tokens(output)
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+        authoritative=False,
+    )
+
+
+def _operational_result_with_usage(
+    result: OwnerChatResult, usage: TokenUsage
+) -> OwnerChatResult:
+    return OwnerChatResult(
+        reply=result.reply,
+        usage=usage,
+        provider_identifier=result.provider_identifier,
+        model_identifier=result.model_identifier,
+        decision=result.decision,
+    )
+
+
+def _run_operational_loop(
+    session: Session,
+    business_id: uuid.UUID,
+    claim: _Claim,
+    user: User,
+    provider: OwnerChatProvider,
+    settings: Settings,
+    executor: OperationalToolExecutor,
+    definitions: tuple[ProviderToolDefinition, ...],
+) -> tuple[OwnerChatResult, TokenUsage]:
+    tool_results: list[ProviderToolResult] = []
+    call_fingerprints: set[str] = set()
+    aggregate_usage: TokenUsage | None = None
+    requested_at = utc_now()
+
+    for _provider_call in range(1, MAX_OPERATIONAL_PROVIDER_CALLS + 1):
+        prepared = _build_operational_request(
+            session,
+            business_id,
+            claim.message_id,
+            settings,
+            definitions,
+            tuple(tool_results),
+            requested_at=requested_at,
+        )
+        request = prepared.request
+        try:
+            result = _validate_result(provider.generate(request), request)
+        except OwnerChatProviderError as exc:
+            if aggregate_usage is not None and not exc.usage_uncertain:
+                exc.usage = (
+                    _add_usage(aggregate_usage, exc.usage)
+                    if exc.usage is not None
+                    else aggregate_usage
+                )
+            raise
+        call_usage = _usage_for_result(provider, request, result)
+        if call_usage.output_tokens > request.max_output_tokens:
+            raise OwnerChatProviderInvalidResponse(
+                usage=_add_usage(aggregate_usage, call_usage),
+                provider_identifier=result.provider_identifier,
+                model_identifier=result.model_identifier,
+            )
+        aggregate_usage = _add_usage(aggregate_usage, call_usage)
+
+        if result.decision == "unavailable":
+            return _operational_result_with_usage(
+                result, aggregate_usage
+            ), aggregate_usage
+        if result.decision == "final":
+            if not tool_results:
+                unavailable = OwnerChatResult(
+                    reply=_live_operational_reply(
+                        request.messages[-1].content,
+                        prepared.business.default_language,
+                    ),
+                    usage=aggregate_usage,
+                    provider_identifier=result.provider_identifier,
+                    model_identifier=result.model_identifier,
+                    decision="unavailable",
+                )
+                return unavailable, aggregate_usage
+            return _operational_result_with_usage(
+                result, aggregate_usage
+            ), aggregate_usage
+
+        arguments = result.tool_arguments or {}
+        fingerprint = json.dumps(
+            {"name": result.tool_name, "arguments": arguments},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if (
+            fingerprint in call_fingerprints
+            or len(tool_results) >= MAX_OPERATIONAL_TOOL_EXECUTIONS
+        ):
+            try:
+                executor.reject(
+                    user=user,
+                    business_id=business_id,
+                    tool_name=result.tool_name,
+                    arguments=arguments,
+                    code="loop_limit",
+                )
+            except ToolExecutionError:
+                fallback = OwnerChatResult(
+                    reply=_live_operational_reply(
+                        request.messages[-1].content,
+                        prepared.business.default_language,
+                    ),
+                    usage=aggregate_usage,
+                    provider_identifier=result.provider_identifier,
+                    model_identifier=result.model_identifier,
+                    decision="unavailable",
+                )
+                return fallback, aggregate_usage
+        call_fingerprints.add(fingerprint)
+        try:
+            executed = executor.execute(
+                user=user,
+                business_id=business_id,
+                tool_name=result.tool_name,
+                arguments=arguments,
+            )
+        except ToolExecutionError:
+            fallback = OwnerChatResult(
+                reply=_live_operational_reply(
+                    request.messages[-1].content,
+                    prepared.business.default_language,
+                ),
+                usage=aggregate_usage,
+                provider_identifier=result.provider_identifier,
+                model_identifier=result.model_identifier,
+                decision="unavailable",
+            )
+            return fallback, aggregate_usage
+        tool_results.append(
+            ProviderToolResult(
+                tool_name=executed.tool_name,
+                output=executed.output.model_dump(mode="json"),
+            )
+        )
+
+    raise RuntimeError("Operational provider loop exited unexpectedly.")
+
+
 def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResult:
     if not isinstance(result, OwnerChatResult):
         raise OwnerChatProviderInvalidResponse
-    if (
-        not isinstance(result.reply, str)
-        or not 1 <= len(result.reply.strip()) <= 14_000
-    ):
-        raise OwnerChatProviderInvalidResponse(reason="invalid_citations")
-    if _is_unsafe_reply(result.reply):
-        raise OwnerChatProviderInvalidResponse(reason="unsafe_output")
+    if request.mode == "operational":
+        if result.proposed_knowledge or result.cited_source_ids:
+            raise OwnerChatProviderInvalidResponse(
+                reason="invalid_operational_response"
+            )
+        if result.decision == "tool":
+            if (
+                result.reply
+                or not isinstance(result.tool_name, str)
+                or not isinstance(result.tool_arguments, dict)
+            ):
+                raise OwnerChatProviderInvalidResponse(
+                    reason="invalid_operational_response"
+                )
+        elif result.decision in {"final", "unavailable"}:
+            if (
+                not isinstance(result.reply, str)
+                or not 1 <= len(result.reply.strip()) <= 14_000
+                or result.tool_name is not None
+                or result.tool_arguments is not None
+            ):
+                raise OwnerChatProviderInvalidResponse(
+                    reason="invalid_operational_response"
+                )
+            if _is_unsafe_reply(result.reply):
+                raise OwnerChatProviderInvalidResponse(reason="unsafe_output")
+        else:
+            raise OwnerChatProviderInvalidResponse(
+                reason="invalid_operational_response"
+            )
+    else:
+        if (
+            not isinstance(result.reply, str)
+            or not 1 <= len(result.reply.strip()) <= 14_000
+        ):
+            raise OwnerChatProviderInvalidResponse(reason="invalid_citations")
+        if _is_unsafe_reply(result.reply):
+            raise OwnerChatProviderInvalidResponse(reason="unsafe_output")
     if not isinstance(result.proposed_knowledge, tuple) or not all(
         hasattr(item, "subject_key")
         and hasattr(item, "content")
@@ -1421,20 +1687,98 @@ def _generate_claimed_turn(
     user: User,
     provider: OwnerChatProvider,
     settings: Settings,
+    profiles: ConnectionProfileRegistry | None,
 ) -> None:
     reservation: AIUsageReservationClaim | None = None
+    aggregate_usage: TokenUsage | None = None
     try:
         owner_message = session.get(OwnerChatMessage, claim.message_id)
         business = session.get(Business, business_id)
         if owner_message is None or business is None:
             raise _provider_unavailable()
         if _is_live_operational_request(owner_message.content):
-            live_result = OwnerChatResult(
-                reply=_live_operational_reply(
-                    owner_message.content, business.default_language
-                )
+            executor = (
+                OperationalToolExecutor(session, profiles, settings)
+                if profiles is not None
+                else None
             )
-            _persist_result(session, business_id, claim, live_result, None, None, ())
+            available = (
+                executor.available_definitions(user, business_id)
+                if executor is not None
+                else ()
+            )
+            matching_names = _matching_operational_tools(owner_message.content)
+            available = tuple(
+                definition
+                for definition in available
+                if definition.name in matching_names
+            )
+            if not available:
+                live_result = OwnerChatResult(
+                    reply=_live_operational_reply(
+                        owner_message.content, business.default_language
+                    )
+                )
+                _persist_result(
+                    session, business_id, claim, live_result, None, None, ()
+                )
+                return
+            provider_definitions = tuple(
+                ProviderToolDefinition(**definition.provider_schema())
+                for definition in available
+            )
+            initial = _build_operational_request(
+                session,
+                business_id,
+                claim.message_id,
+                settings,
+                provider_definitions,
+            )
+            generation_attempt = _admit_provider_generation(session, business_id, claim)
+            try:
+                reservation = reserve_owner_chat_usage(
+                    session,
+                    business=initial.business,
+                    user=user,
+                    owner_message_id=claim.message_id,
+                    generation_attempt=generation_attempt,
+                    estimated_input_tokens=(
+                        provider.estimate_input_tokens(initial.request)
+                        * MAX_OPERATIONAL_PROVIDER_CALLS
+                    ),
+                    max_output_tokens=(
+                        initial.request.max_output_tokens
+                        * MAX_OPERATIONAL_PROVIDER_CALLS
+                    ),
+                    lease_seconds=settings.owner_chat_generation_lease_seconds,
+                )
+            except Exception:
+                session.rollback()
+                _undo_pre_provider_admission(
+                    session, business_id, claim, generation_attempt
+                )
+                raise
+            if executor is None:  # pragma: no cover - guarded above
+                raise RuntimeError("Operational executor is unavailable.")
+            result, aggregate_usage = _run_operational_loop(
+                session,
+                business_id,
+                claim,
+                user,
+                provider,
+                settings,
+                executor,
+                provider_definitions,
+            )
+            _persist_result(
+                session,
+                business_id,
+                claim,
+                result,
+                reservation,
+                aggregate_usage,
+                (),
+            )
             return
         if _requires_business_evidence(owner_message.content):
             prepared = _build_provider_request(
@@ -1547,6 +1891,22 @@ def _generate_claimed_turn(
             outcome="release" if reservation is not None else None,
         )
         raise
+    except ToolExecutionError:
+        session.rollback()
+        _mark_failed(
+            session,
+            claim,
+            reservation=reservation,
+            usage=aggregate_usage,
+            outcome=(
+                "reported_failure"
+                if reservation is not None and aggregate_usage is not None
+                else "release"
+                if reservation is not None
+                else None
+            ),
+        )
+        raise _provider_unavailable() from None
     except Exception:
         session.rollback()
         _mark_failed(
@@ -1583,6 +1943,7 @@ def submit_owner_message(
     body: OwnerMessageRequest,
     provider: OwnerChatProvider,
     settings: Settings,
+    profiles: ConnectionProfileRegistry | None = None,
 ) -> OwnerTurnResponse:
     """Persist and process only the idempotent owner turn from this request."""
     _eligible_business(session, user, business_id)
@@ -1597,7 +1958,9 @@ def submit_owner_message(
         raise _owner_turn_failed()
 
     if claim is not None:
-        _generate_claimed_turn(session, business_id, claim, user, provider, settings)
+        _generate_claimed_turn(
+            session, business_id, claim, user, provider, settings, profiles
+        )
         session.expire_all()
         refreshed = session.get(OwnerChatMessage, owner_message.id)
         if refreshed is not None:

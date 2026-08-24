@@ -22,6 +22,8 @@ from app.agent.owner_chat_provider import (
     ProviderKnowledge,
     ProviderMessage,
     ProviderSource,
+    ProviderToolDefinition,
+    ProviderToolResult,
     ProviderWorkingDay,
     ProviderWorkingShift,
     create_owner_chat_provider,
@@ -98,6 +100,39 @@ def provider_request() -> OwnerChatRequest:
     )
 
 
+def operational_request(*, with_result: bool = False) -> OwnerChatRequest:
+    return replace(
+        provider_request(),
+        knowledge=(),
+        sources=(),
+        mode="operational",
+        tools=(
+            ProviderToolDefinition(
+                name="current_inventory",
+                description="Retrieve bounded current inventory.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"limit": {"type": "integer"}},
+                    "additionalProperties": False,
+                },
+            ),
+        ),
+        tool_results=(
+            (
+                ProviderToolResult(
+                    tool_name="current_inventory",
+                    output={
+                        "items": [{"available_quantity": "8"}],
+                        "metadata": {"source_timezone": "Asia/Beirut"},
+                    },
+                ),
+            )
+            if with_result
+            else ()
+        ),
+    )
+
+
 def request_with_source() -> OwnerChatRequest:
     return replace(
         provider_request(),
@@ -159,6 +194,91 @@ def gemini_successful_transport(structured: dict[str, object]) -> httpx.MockTran
             },
         )
     )
+
+
+def test_ollama_operational_decision_stays_provider_neutral_and_strict() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "decision": "tool",
+                            "reply": None,
+                            "tool_name": "current_inventory",
+                            "arguments": {"limit": 5},
+                        }
+                    ),
+                },
+                "prompt_eval_count": 20,
+                "eval_count": 5,
+            },
+        )
+
+    result = ollama_provider(httpx.MockTransport(handler)).generate(
+        operational_request()
+    )
+
+    assert result.decision == "tool"
+    assert result.tool_name == "current_inventory"
+    assert result.tool_arguments == {"limit": 5}
+    assert (
+        captured["format"]
+        == owner_chat_provider._OperationalStructuredResult.model_json_schema()
+    )
+    serialized = json.dumps(captured)
+    assert "current_inventory" in serialized
+    assert "database_url" not in serialized
+    assert "retrieved_sources" not in serialized
+
+
+def test_gemini_operational_final_uses_only_normalized_tool_context() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return gemini_successful_transport(
+            {
+                "decision": "final",
+                "reply": "There are 8 available units in the current result.",
+                "tool_name": None,
+                "arguments": None,
+            }
+        ).handle_request(request)
+
+    result = gemini_provider(httpx.MockTransport(handler)).generate(
+        operational_request(with_result=True)
+    )
+
+    assert result.decision == "final"
+    assert result.cited_source_ids == ()
+    assert result.proposed_knowledge == ()
+    serialized = json.dumps(captured)
+    assert "available_quantity" in serialized
+    assert "retrievedSources" not in serialized
+    assert "connection_profile" not in serialized
+
+
+def test_operational_provider_response_rejects_unknown_fields() -> None:
+    provider = ollama_provider(
+        successful_transport(
+            {
+                "decision": "tool",
+                "reply": None,
+                "tool_name": "current_inventory",
+                "arguments": {"limit": 5},
+                "business_id": "00000000-0000-0000-0000-000000000001",
+            }
+        )
+    )
+
+    with pytest.raises(OwnerChatProviderInvalidResponse):
+        provider.generate(operational_request())
 
 
 def maximal_provider_request() -> OwnerChatRequest:

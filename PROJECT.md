@@ -93,8 +93,9 @@ production-approved after Milestone 9's critical multilingual failures. Gemini i
 implemented for grounded-chat development evaluation. Milestone 16's
 provider-neutral contracts, read-only PostgreSQL adapter, tenant connection
 lifecycle, management API, and Data Sources UI are implemented. Agent tool calling
-remains future Milestone 17. Customer channels, WhatsApp, and unrelated later
-roadmap work are also not implemented.
+is implemented by Milestone 17 as a bounded four-tool read-only loop. Customer
+channels, WhatsApp, operational writes, and unrelated later roadmap work are not
+implemented.
 
 ## Development roadmap
 
@@ -349,10 +350,9 @@ allowlisted connection profiles, a versioned semantic mapping, validated lifecyc
 transitions, safe management APIs, and the responsive Data Sources interface. The
 platform persists only profile/mapping keys and privacy-minimal lifecycle metadata;
 credentials and operational records remain outside Sou2AI. Milestone 16 is
-complete. Connecting approved operations to the assistant is separate future
-Milestone 17 work and has not started.
+complete.
 
-### Milestone 17: Agent tool calling
+### Milestone 17: Complete — Agent tool calling
 
 * Add a controlled agent loop with an explicit registry of approved tools.
 * Start with read-only tools for current inventory, sales summaries, best sellers, and restocking recommendations.
@@ -361,6 +361,26 @@ Milestone 17 work and has not started.
 * Apply timeouts and result-size limits; forbid arbitrary SQL, URLs, code, and tool names.
 * Write exactly one privacy-minimal audit record per success, error, denial, or timeout through the centralized executor.
 * Require explicit user confirmation before any future sensitive or destructive write action.
+
+Owner chat now exposes exactly four provider-neutral read operations: current
+inventory, sales summary, best-selling products, and deterministic restocking
+recommendations. One centralized executor revalidates strict arguments, full
+tenant access, active business state, active/healthy source state, mapped
+capability, timeout, and result bounds before returning normalized data. Unknown
+tools, arbitrary SQL/URLs/code/credentials, business identifiers, extra fields,
+malformed values, repeated calls, and limit violations are rejected outside the
+model.
+
+An operational owner turn permits at most two executions and three provider calls.
+Live normalized results are supplied as untrusted structured data and override
+conversation, RAG, profile text, and model assumptions; they never create document
+citations. The full loop uses one rate admission and one AI reservation, aggregates
+all provider usage, and preserves the existing terminal, idempotent, concurrent
+turn lifecycle. Every attempted execution writes one HMAC-hashed privacy-minimal
+`ToolCallLog`; raw arguments, results, prompts, responses, SQL, credentials, and
+operational records are never audited. Without the server-only HMAC secret or an
+active healthy source, the existing safe live-data-unavailable response remains.
+No write tool or confirmation flow is implemented.
 
 ### Milestone 18: Conversation history and memory
 

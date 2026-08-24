@@ -1276,7 +1276,7 @@ class BusinessKnowledge(Base):
 
 
 class ToolCallLog(Base):
-    """Privacy-minimal metadata for a future centralized tool executor."""
+    """Privacy-minimal metadata written by the centralized tool executor."""
 
     __tablename__ = "tool_call_logs"
     __table_args__ = (
