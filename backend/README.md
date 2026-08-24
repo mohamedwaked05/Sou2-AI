@@ -297,6 +297,9 @@ Endpoints:
   `POST /api/v1/businesses/{business_id}/onboarding/confirm`
 - Owner chat: `POST/GET
   /api/v1/businesses/{business_id}/owner-chat/messages`
+- Conversations: `POST/GET /api/v1/businesses/{business_id}/conversations`,
+  `GET /{conversation_id}`, `POST /{conversation_id}/archive`, and `POST/GET
+  /{conversation_id}/messages`
 - Current AI usage: `GET
   /api/v1/businesses/{business_id}/ai-usage/current`
 - Learned knowledge: `GET /api/v1/businesses/{business_id}/knowledge` and
@@ -415,8 +418,9 @@ punctuation. PostgreSQL enforces uniqueness per immutable creator owner.
 
 Every business query joins through current-user membership, and unauthorized or
 unknown business IDs return the same not-found response. Creation commits the
-business, `FULL_ACCESS` creator membership, and its single owner conversation
-atomically. Schedule replacement is transactional, and simultaneous profile
+business, `FULL_ACCESS` creator membership, and an initial private owner
+conversation atomically. Owners may later create additional private web
+conversations. Schedule replacement is transactional, and simultaneous profile
 changes use row-level serialization with intentional last-write-wins behavior.
 PostgreSQL also prevents an active business from ending a transaction with an
 incomplete profile after either profile-field or schedule edits.
@@ -477,14 +481,15 @@ function. PostgreSQL superusers remain trusted bootstrap administrators.
 `POST .../owner-chat/messages` requires a 1-200 character client idempotency key
 and a nonblank owner message of at most 4,000 characters after trimming. Original
 message text is preserved. Assistant messages retain an internal 14,000-character
-database allowance. The key is database-unique within the business's one
-conversation. Replays with identical content reuse the stored result; different
+database allowance. The key is database-unique within its selected conversation.
+Replays with identical content reuse the stored result; different
 content returns a safe conflict. Provider failure retains the owner message and
 returns a retryable `503` without inventing an assistant response.
 
 History stores every message and returns the newest 50 per page through an opaque
 stable cursor. Pages are deterministic by logical sequence and UUID even when
-timestamps match. Only the newest 12 messages enter provider context. Active,
+timestamps match. Provider context contains the latest valid rolling summary, the
+newest 12 eligible messages after its checkpoint, and the current owner message. Active,
 non-expired knowledge candidates are PostgreSQL-filtered, bounded by
 `OWNER_CHAT_KNOWLEDGE_CONTEXT_LIMIT` (100 by default), and deterministically ranked
 for the current message.
@@ -495,6 +500,32 @@ before the provider runs. `OWNER_CHAT_GENERATION_LEASE_SECONDS` allows recovery
 after a crashed claimant, while `OWNER_CHAT_GENERATION_WAIT_SECONDS` bounds inline
 waiting. This coordinates independent replicas without Redis, workers,
 process-local locks, or holding a pooled connection during provider work.
+
+### Multiple conversations and rolling memory
+
+Authenticated full-access members can list/create conversations, retrieve one,
+archive it, page its messages, and submit to a selected conversation under
+`/api/v1/businesses/{business_id}/conversations`. Every lookup checks both the
+route business and conversation ID. Titles are derived from the first owner
+message without an extra model call. Archived conversations stay readable and
+cannot accept new turns; neither archiving nor summarization deletes messages.
+
+After a successful non-replayed owner turn, the existing Redis/RQ queue receives a
+non-secret conversation ID. A worker leases the conversation's single summary
+checkpoint and compresses only ordered complete turns, retaining the latest 12
+messages verbatim. It excludes failed, abandoned, stale, pending, and incomplete
+turns. Summary input/output is bounded, provider-neutral, uses no RAG or tools, and
+is treated as untrusted memory below current operational results, profile data,
+authorized RAG evidence, and the current message. Failures preserve the previous
+summary and checkpoint; concurrent workers cannot advance it twice.
+
+Summary generation uses an independent `conversation_summary` reservation from
+the business's shared (non-owner-reserved) daily allowance and reconciles actual or
+estimated provider tokens once per claimed attempt. It never stores prompts,
+credentials, raw tool arguments, audit hashes, or external operational records.
+Original conversations/messages are retained until business deletion; archiving
+only hides them from the default active list. Customer and WhatsApp identity are
+outside Milestone 18.
 
 Provider selection is deployment-wide `OWNER_CHAT_PROVIDER=mock|gemini|ollama`;
 changing the provider or model requires a backend restart. Gemini uses the configured
@@ -563,7 +594,9 @@ BGE-M3/pgvector retrieval, grounded RAG with citations, and the React frontend a
 implemented. Milestone 16's operational contracts, read-only PostgreSQL adapter,
 tenant lifecycle management, and Data Sources UI are implemented. Milestone 17's
 bounded read-only tool loop and privacy-minimal auditing are implemented. Customer
-channels and operational write tools remain planned.
+channels and operational write tools remain planned. Milestone 18's multiple owner
+conversations, rolling summary worker, and functional Conversations UI are
+implemented.
 Authentication alone never grants business access without membership.
 
 ## Milestone 12 knowledge documents

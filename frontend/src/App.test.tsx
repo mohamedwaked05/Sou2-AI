@@ -10,7 +10,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { App } from "./App";
-import { api, ApiError, ChatMessage } from "./api";
+import { api, ApiError, ChatMessage, Conversation } from "./api";
 
 afterEach(() => {
   cleanup();
@@ -61,6 +61,27 @@ function historyMessage(
     reply_to_message_id: role === "assistant" ? "message-1" : null,
     generation_state: role === "owner" ? "completed" : null,
     sources: [],
+    ...overrides,
+  };
+}
+
+function ownerConversation(
+  id: string,
+  title: string,
+  overrides: Partial<Conversation> = {},
+): Conversation {
+  return {
+    id,
+    creator_user_id: "owner-1",
+    channel: "owner_web",
+    title,
+    next_turn_number: 2,
+    last_message_at: "2026-08-24T08:00:00Z",
+    latest_message_preview: "Hi there!",
+    archived: false,
+    archived_at: null,
+    created_at: "2026-08-24T07:00:00Z",
+    updated_at: "2026-08-24T08:00:00Z",
     ...overrides,
   };
 }
@@ -335,10 +356,18 @@ it("opens AI Chat history at the bottom with existing states and citations", asy
 
 it("opens Conversations history at the bottom", async () => {
   mockScrollMetrics();
-  mockActiveWorkspace([
-    historyMessage("message-1", "owner", "Hello"),
-    historyMessage("message-2", "assistant", "Hi there!"),
-  ]);
+  mockActiveWorkspace([]);
+  vi.spyOn(api, "conversations").mockResolvedValueOnce({
+    items: [ownerConversation("conversation-1", "Hello")],
+    next_cursor: null,
+  });
+  vi.spyOn(api, "conversationMessages").mockResolvedValueOnce({
+    items: [
+      historyMessage("message-1", "owner", "Hello"),
+      historyMessage("message-2", "assistant", "Hi there!"),
+    ],
+    next_cursor: null,
+  });
 
   renderWorkspace("conversations");
 
@@ -346,6 +375,100 @@ it("opens Conversations history at the bottom", async () => {
     name: "Owner conversation history",
   });
   await waitFor(() => expect(history.scrollTop).toBe(1_000));
+  expect(api.conversations).toHaveBeenCalledWith("business-1", true);
+});
+
+it("creates and selects a new private owner conversation", async () => {
+  mockActiveWorkspace([]);
+  vi.spyOn(api, "conversations").mockResolvedValueOnce({
+    items: [],
+    next_cursor: null,
+  });
+  const created = ownerConversation("conversation-new", "New conversation", {
+    next_turn_number: 1,
+    last_message_at: null,
+    latest_message_preview: null,
+  });
+  vi.spyOn(api, "createConversation").mockResolvedValueOnce(created);
+  vi.spyOn(api, "conversationMessages").mockResolvedValueOnce({
+    items: [],
+    next_cursor: null,
+  });
+
+  renderWorkspace("conversations");
+  fireEvent.click(await screen.findByRole("button", { name: "New conversation" }));
+
+  expect(
+    await screen.findByRole("heading", { name: "New conversation" }),
+  ).toBeVisible();
+  expect(screen.getByRole("heading", { name: "No messages yet" })).toBeInTheDocument();
+  expect(api.createConversation).toHaveBeenCalledWith("business-1");
+});
+
+it("confirms archiving and keeps the conversation readable", async () => {
+  mockActiveWorkspace([]);
+  const current = ownerConversation("conversation-1", "Autumn promotion");
+  vi.spyOn(api, "conversations").mockResolvedValueOnce({
+    items: [current],
+    next_cursor: null,
+  });
+  vi.spyOn(api, "conversationMessages").mockResolvedValueOnce({
+    items: [historyMessage("message-1", "owner", "Plan autumn")],
+    next_cursor: null,
+  });
+  vi.spyOn(api, "archiveConversation").mockResolvedValueOnce({
+    ...current,
+    archived: true,
+    archived_at: "2026-08-25T09:00:00Z",
+  });
+
+  renderWorkspace("conversations");
+  fireEvent.click(await screen.findByRole("button", { name: "Archive" }));
+  expect(
+    screen.getByRole("alertdialog", { name: "Archive conversation?" }),
+  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Archive conversation" }));
+
+  await waitFor(() =>
+    expect(api.archiveConversation).toHaveBeenCalledWith(
+      "business-1",
+      "conversation-1",
+    ),
+  );
+  expect(await screen.findByText(/Archived · read-only/)).toBeInTheDocument();
+  expect(screen.getByText("Plan autumn")).toBeInTheDocument();
+});
+
+it("opens a selected archived conversation in read-only AI Chat", async () => {
+  mockActiveWorkspace([]);
+  vi.spyOn(api, "conversation").mockResolvedValueOnce(
+    ownerConversation("conversation-archived", "Supplier decisions", {
+      archived: true,
+      archived_at: "2026-08-25T09:00:00Z",
+    }),
+  );
+  vi.spyOn(api, "conversationMessages").mockResolvedValueOnce({
+    items: [historyMessage("message-1", "owner", "Keep the earlier decision")],
+    next_cursor: null,
+  });
+
+  render(
+    <MemoryRouter
+      initialEntries={[
+        "/businesses/business-1/chat?conversation=conversation-archived",
+      ]}
+    >
+      <App />
+    </MemoryRouter>,
+  );
+
+  expect(await screen.findByText("Keep the earlier decision")).toBeInTheDocument();
+  expect(screen.getByText(/archived and read-only/i)).toBeInTheDocument();
+  expect(screen.getByRole("textbox", { name: "Message Sou2AI" })).toBeDisabled();
+  expect(api.conversationMessages).toHaveBeenCalledWith(
+    "business-1",
+    "conversation-archived",
+  );
 });
 
 it("keeps AI Chat pinned while generating and after a new message loads", async () => {

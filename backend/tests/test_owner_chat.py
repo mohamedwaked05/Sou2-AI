@@ -781,8 +781,8 @@ def test_context_uses_latest_twelve_messages_and_excludes_expired_knowledge(
     )
     assert response.status_code == 200, response.text
     request = provider.requests[0]
-    assert len(request.messages) == 12
-    assert request.messages[0].content == "message-4"
+    assert len(request.messages) == 13
+    assert request.messages[0].content == "message-3"
     assert request.messages[-1].content == "What is our return policy?"
     assert [fact.subject_key for fact in request.knowledge] == ["return_policy"]
 

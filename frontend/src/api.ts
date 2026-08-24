@@ -70,6 +70,20 @@ export interface ChatMessage {
   }[];
 }
 
+export interface Conversation {
+  id: string;
+  creator_user_id: string;
+  channel: "owner_web";
+  title: string;
+  next_turn_number: number;
+  last_message_at: string | null;
+  latest_message_preview: string | null;
+  archived: boolean;
+  archived_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Usage {
   window_start: string;
   window_end: string;
@@ -312,6 +326,35 @@ export const api = {
       method: "POST",
       ...json({ content, idempotency_key: crypto.randomUUID() }),
     }),
+  conversations: (business: string, includeArchived = false, cursor?: string) => {
+    const query = new URLSearchParams();
+    if (includeArchived) query.set("include_archived", "true");
+    if (cursor) query.set("cursor", cursor);
+    const suffix = query.size ? `?${query.toString()}` : "";
+    return request<{ items: Conversation[]; next_cursor: string | null }>(
+      `/businesses/${business}/conversations${suffix}`,
+    );
+  },
+  createConversation: (business: string) =>
+    request<Conversation>(`/businesses/${business}/conversations`, {
+      method: "POST",
+    }),
+  conversation: (business: string, conversation: string) =>
+    request<Conversation>(`/businesses/${business}/conversations/${conversation}`),
+  conversationMessages: (business: string, conversation: string) =>
+    request<{ items: ChatMessage[]; next_cursor: string | null }>(
+      `/businesses/${business}/conversations/${conversation}/messages`,
+    ),
+  sendConversationMessage: (business: string, conversation: string, content: string) =>
+    request(`/businesses/${business}/conversations/${conversation}/messages`, {
+      method: "POST",
+      ...json({ content, idempotency_key: crypto.randomUUID() }),
+    }),
+  archiveConversation: (business: string, conversation: string) =>
+    request<Conversation>(
+      `/businesses/${business}/conversations/${conversation}/archive`,
+      { method: "POST" },
+    ),
   usage: (id: string) => request<Usage>(`/businesses/${id}/ai-usage/current`),
   documents: (id: string) =>
     request<Document[]>(`/businesses/${id}/knowledge/documents`),

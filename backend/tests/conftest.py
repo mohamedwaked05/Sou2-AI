@@ -123,6 +123,7 @@ def db_session(database_engine: Engine, migration_engine: Engine) -> Generator[S
                 "operational_data_sources, "
                 "business_lifecycle_history, knowledge_document_chunks, "
                 "knowledge_documents, business_knowledge, owner_chat_messages, "
+                "owner_conversation_summaries, "
                 "owner_conversations, "
                 "business_opening_shifts, "
                 "business_opening_days, business_memberships, businesses, users CASCADE"

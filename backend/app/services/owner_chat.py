@@ -14,7 +14,6 @@ from datetime import datetime, timedelta
 
 from fastapi import status
 from sqlalchemy import and_, or_, select
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -50,6 +49,7 @@ from app.database.models import (
     OwnerChatCitation,
     OwnerChatMessage,
     OwnerConversation,
+    OwnerConversationSummary,
     User,
 )
 from app.integrations.profiles import ConnectionProfileRegistry
@@ -73,6 +73,7 @@ from app.services.api_limits import (
 from app.services.business_knowledge import upsert_proposed_knowledge
 from app.services.business_profiles import is_business_profile_complete
 from app.services.businesses import load_full_access_business
+from app.services.conversations import get_default_conversation, load_conversation
 from app.tools.operational import (
     BEST_SELLING_PRODUCTS_TOOL,
     CURRENT_INVENTORY_TOOL,
@@ -169,23 +170,6 @@ def _eligible_business(
     return business
 
 
-def _get_or_create_conversation(
-    session: Session, business_id: uuid.UUID
-) -> OwnerConversation:
-    session.execute(
-        insert(OwnerConversation)
-        .values(id=uuid.uuid4(), business_id=business_id, next_turn_number=1)
-        .on_conflict_do_nothing(index_elements=[OwnerConversation.business_id])
-    )
-    session.commit()
-    conversation = session.scalar(
-        select(OwnerConversation).where(OwnerConversation.business_id == business_id)
-    )
-    if conversation is None:  # pragma: no cover - protected by the unique insert
-        raise _provider_unavailable()
-    return conversation
-
-
 def _conversation_busy() -> ApplicationError:
     return ApplicationError(
         "This conversation is already processing a message. Please retry shortly.",
@@ -249,6 +233,12 @@ def _create_or_reuse_owner_message(
     )
     if conversation is None:  # pragma: no cover - business owns the conversation
         raise _provider_unavailable()
+    if conversation.archived:
+        raise ApplicationError(
+            "Archived conversations cannot receive new messages.",
+            status_code=status.HTTP_409_CONFLICT,
+            error_code="conversation_archived",
+        )
     now = utc_now()
     _fail_abandoned_turns(
         session,
@@ -301,6 +291,10 @@ def _create_or_reuse_owner_message(
 
         turn_number = conversation.next_turn_number
         conversation.next_turn_number += 1
+        clean_title = " ".join(body.content.split())[:120]
+        if conversation.title == "New conversation" and clean_title:
+            conversation.title = clean_title
+        conversation.last_message_at = now
         existing = OwnerChatMessage(
             conversation_id=conversation.id,
             sequence_number=turn_number * 2 - 1,
@@ -828,25 +822,35 @@ def _provider_profile(business: Business) -> ProviderBusinessProfile:
     )
 
 
-def _provider_messages(
+def _provider_context(
     session: Session, owner_message: OwnerChatMessage
-) -> tuple[ProviderMessage, ...]:
-    messages = session.scalars(
+) -> tuple[str | None, tuple[ProviderMessage, ...]]:
+    summary = session.scalar(
+        select(OwnerConversationSummary).where(
+            OwnerConversationSummary.conversation_id == owner_message.conversation_id,
+            OwnerConversationSummary.summary_version > 0,
+        )
+    )
+    checkpoint = (
+        summary.summarized_through_sequence_number if summary is not None else 0
+    )
+    prior = session.scalars(
         select(OwnerChatMessage)
         .where(
             OwnerChatMessage.conversation_id == owner_message.conversation_id,
-            OwnerChatMessage.sequence_number <= owner_message.sequence_number,
+            OwnerChatMessage.sequence_number < owner_message.sequence_number,
+            OwnerChatMessage.sequence_number > checkpoint,
             or_(
                 OwnerChatMessage.role == ChatMessageRole.ASSISTANT,
-                OwnerChatMessage.id == owner_message.id,
                 OwnerChatMessage.generation_state == ChatGenerationState.COMPLETED,
             ),
         )
         .order_by(OwnerChatMessage.sequence_number.desc(), OwnerChatMessage.id.desc())
         .limit(CHAT_CONTEXT_MESSAGE_LIMIT)
     ).all()
-    messages.reverse()
-    return tuple(
+    prior.reverse()
+    messages = [*prior, owner_message]
+    return (summary.content if summary is not None else None), tuple(
         ProviderMessage(role=str(message.role), content=message.content)
         for message in messages
     )
@@ -875,11 +879,13 @@ def _build_conversation_request(
     business = _load_provider_business(session, business_id)
     if owner_message is None or business is None:
         raise _provider_unavailable()
+    rolling_summary, messages = _provider_context(session, owner_message)
     request = OwnerChatRequest(
         profile=_provider_profile(business),
         knowledge=(),
         sources=(),
-        messages=_provider_messages(session, owner_message),
+        messages=messages,
+        rolling_summary=rolling_summary,
         requested_at=utc_now(),
         max_output_tokens=settings.owner_chat_max_output_tokens,
         mode="conversation",
@@ -902,11 +908,13 @@ def _build_operational_request(
     business = _load_provider_business(session, business_id)
     if owner_message is None or business is None:
         raise _provider_unavailable()
+    rolling_summary, messages = _provider_context(session, owner_message)
     request = OwnerChatRequest(
         profile=_provider_profile(business),
         knowledge=(),
         sources=(),
-        messages=_provider_messages(session, owner_message),
+        messages=messages,
+        rolling_summary=rolling_summary,
         requested_at=requested_at or utc_now(),
         max_output_tokens=settings.owner_chat_max_output_tokens,
         mode="operational",
@@ -928,6 +936,7 @@ def _build_provider_request(
     business = _load_provider_business(session, business_id)
     if owner_message is None or business is None:
         raise _provider_unavailable()
+    rolling_summary, messages = _provider_context(session, owner_message)
     now = utc_now()
     knowledge = session.scalars(
         select(BusinessKnowledge)
@@ -985,7 +994,8 @@ def _build_provider_request(
         profile=profile,
         knowledge=selected_knowledge,
         sources=sources,
-        messages=_provider_messages(session, owner_message),
+        messages=messages,
+        rolling_summary=rolling_summary,
         requested_at=now,
         max_output_tokens=settings.owner_chat_max_output_tokens,
     )
@@ -1808,6 +1818,9 @@ def _persist_result(
     owner_message.generation_state = ChatGenerationState.COMPLETED
     owner_message.generation_claim_token = None
     owner_message.generation_claim_expires_at = None
+    conversation = session.get(OwnerConversation, owner_message.conversation_id)
+    if conversation is not None:
+        conversation.last_message_at = now
     if reservation is not None:
         if usage is None:  # pragma: no cover - guarded by generation orchestration
             raise RuntimeError("Provider usage is required for a reserved turn.")
@@ -2087,10 +2100,17 @@ def submit_owner_message(
     provider: OwnerChatProvider,
     settings: Settings,
     profiles: ConnectionProfileRegistry | None = None,
+    *,
+    conversation_id: uuid.UUID | None = None,
 ) -> OwnerTurnResponse:
     """Persist and process only the idempotent owner turn from this request."""
     _eligible_business(session, user, business_id)
-    conversation = _get_or_create_conversation(session, business_id)
+    if conversation_id is None:
+        conversation = get_default_conversation(session, user, business_id, create=True)
+        if conversation is None:  # pragma: no cover - create=True
+            raise _provider_unavailable()
+    else:
+        conversation = load_conversation(session, user, business_id, conversation_id)
     owner_message, replayed, claim = _create_or_reuse_owner_message(
         session, conversation.id, body, settings
     )
@@ -2109,6 +2129,7 @@ def submit_owner_message(
         if refreshed is not None:
             completed = _completed_turn(session, refreshed, replayed)
             if completed is not None:
+                _enqueue_summary_safely(conversation.id, settings)
                 return completed
             if refreshed.generation_state == ChatGenerationState.FAILED:
                 raise _owner_turn_failed()
@@ -2155,10 +2176,14 @@ def get_conversation_history(
     user: User,
     business_id: uuid.UUID,
     cursor: str | None,
+    *,
+    conversation_id: uuid.UUID | None = None,
 ) -> ConversationHistoryResponse:
-    _eligible_business(session, user, business_id)
-    conversation = session.scalar(
-        select(OwnerConversation).where(OwnerConversation.business_id == business_id)
+    load_full_access_business(session, user, business_id)
+    conversation = (
+        load_conversation(session, user, business_id, conversation_id)
+        if conversation_id is not None
+        else get_default_conversation(session, user, business_id, create=False)
     )
     if conversation is None:
         return ConversationHistoryResponse(items=[], next_cursor=None)
@@ -2190,3 +2215,13 @@ def get_conversation_history(
         items=[_message_response(message) for message in page],
         next_cursor=next_cursor,
     )
+
+
+def _enqueue_summary_safely(conversation_id: uuid.UUID, settings: Settings) -> None:
+    try:
+        from app.worker.conversation_summary import enqueue_conversation_summary
+
+        enqueue_conversation_summary(conversation_id, settings)
+    except Exception:
+        # Summary memory is asynchronous and must never fail an owner response.
+        return

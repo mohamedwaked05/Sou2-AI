@@ -141,7 +141,8 @@ Authentication identifies the user; it does not by itself grant access to a busi
 
 ### Milestone 5: Owner chat and learned business knowledge — Complete
 
-* Provide exactly one private main owner conversation for every business.
+* Bootstrap one private owner conversation for every business; Milestone 18 later
+  expands this into multiple retained conversations.
 * Persist owner and assistant messages and return stable 50-message cursor pages.
 * Send only the newest 12 messages through a replaceable provider contract, with
   the deterministic offline mock as default and local Ollama as an opt-in provider.
@@ -393,7 +394,7 @@ inventory tool without a classifier provider call. Adapters declare and internal
 enforce a cancellable timeout; PostgreSQL continues to use `statement_timeout`.
 Milestone 17 remains complete after this focused repair.
 
-### Milestone 18: Conversation history and memory
+### Milestone 18: Complete — Conversation history and memory
 
 * Store tenant-scoped conversations and messages with user or channel identity.
 * Define retention, short-term context, and limited approved long-term memory.
@@ -410,6 +411,22 @@ Milestone 17 remains complete after this focused repair.
   knowledge, RAG sources, and live tool results override them.
 * Test summary ordering, concurrency, retry, isolation, and hallucination
   boundaries.
+
+Owners can now create, select, page, and archive multiple private web
+conversations without deleting history. Initial titles come deterministically from
+the first owner message. Archived conversations remain readable and reject new
+messages. Existing owner-chat endpoints remain compatibility wrappers over the
+most recent active conversation.
+
+Each conversation has one tenant-scoped rolling summary checkpoint. Redis/RQ
+summarizes only completed owner/assistant boundaries in ordered batches while the
+latest six complete turns remain verbatim; failed, stale, pending, and abandoned
+turns are excluded. Original messages are never rewritten or deleted, and a failed
+or concurrent attempt cannot replace the last valid checkpoint. Summary generation
+uses its own `conversation_summary` reservation against the shared business
+allowance. Current operational results, profile data, authorized RAG evidence, and
+the current owner message always outrank recent conversation and untrusted summary
+memory. No customer or external-channel conversation work is included.
 
 ### Milestone 19: External customer messaging integrations
 

@@ -1,6 +1,7 @@
 import {
   Activity,
   AlertCircle,
+  Archive,
   BarChart3,
   BookOpen,
   Bot,
@@ -17,6 +18,7 @@ import {
   MessageSquare,
   PanelLeftClose,
   PanelLeftOpen,
+  Plus,
   Send,
   Settings,
   Store,
@@ -40,6 +42,7 @@ import {
   ApiError,
   Business,
   ChatMessage,
+  Conversation,
   Document,
   ownerChatErrorMessage,
   Usage,
@@ -708,7 +711,10 @@ function Metric({
 }
 
 function ChatPage({ business }: { business: Business }) {
+  const location = useLocation();
+  const selectedId = new URLSearchParams(location.search).get("conversation");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [conversation, setConversation] = useState<Conversation | null>(null);
   const [text, setText] = useState("");
   const [loading, setLoading] = useState(business.is_active);
   const [sending, setSending] = useState(false);
@@ -719,13 +725,23 @@ function ChatPage({ business }: { business: Business }) {
   const load = useCallback(async () => {
     if (!business.is_active) return;
     try {
-      setMessages((await api.messages(business.id)).items);
+      if (selectedId) {
+        const [selected, history] = await Promise.all([
+          api.conversation(business.id, selectedId),
+          api.conversationMessages(business.id, selectedId),
+        ]);
+        setConversation(selected);
+        setMessages(history.items);
+      } else {
+        setConversation(null);
+        setMessages((await api.messages(business.id)).items);
+      }
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
       setLoading(false);
     }
-  }, [business.id, business.is_active]);
+  }, [business.id, business.is_active, selectedId]);
   useEffect(() => {
     void load();
   }, [load]);
@@ -735,11 +751,15 @@ function ChatPage({ business }: { business: Business }) {
   async function send(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const content = text.trim();
-    if (!content || sending) return;
+    if (!content || sending || conversation?.archived) return;
     setSending(true);
     setError("");
     try {
-      await api.send(business.id, content);
+      if (selectedId) {
+        await api.sendConversationMessage(business.id, selectedId, content);
+      } else {
+        await api.send(business.id, content);
+      }
       setText("");
       await load();
     } catch (caught) {
@@ -753,7 +773,20 @@ function ChatPage({ business }: { business: Business }) {
     <div className="chat-page">
       <PageHeading
         title="AI Chat"
-        description={`Private owner conversation for ${business.name}.`}
+        description={
+          conversation
+            ? `${conversation.title} · private owner conversation for ${business.name}.`
+            : `Private owner conversation for ${business.name}.`
+        }
+        action={
+          <Link
+            className="btn-secondary"
+            to={`/businesses/${business.id}/conversations`}
+          >
+            <MessageSquare size={18} />
+            All conversations
+          </Link>
+        }
       />
       {!business.is_active ? (
         <Alert tone="info">
@@ -798,6 +831,9 @@ function ChatPage({ business }: { business: Business }) {
           </div>
           <form onSubmit={send} className="composer">
             {error && <Alert>{error}</Alert>}
+            {conversation?.archived && (
+              <Alert tone="info">This conversation is archived and read-only.</Alert>
+            )}
             <label>
               <span className="sr-only">Message Sou2AI</span>
               <textarea
@@ -805,7 +841,7 @@ function ChatPage({ business }: { business: Business }) {
                 name="message"
                 rows={1}
                 maxLength={4000}
-                disabled={sending}
+                disabled={sending || conversation?.archived}
                 value={text}
                 onChange={(event) => setText(event.target.value)}
                 onCompositionStart={() => {
@@ -833,7 +869,7 @@ function ChatPage({ business }: { business: Business }) {
               <button
                 type="submit"
                 className="btn"
-                disabled={sending || !text.trim()}
+                disabled={sending || !text.trim() || conversation?.archived}
                 aria-label="Send message"
               >
                 <Send size={18} />
@@ -888,74 +924,260 @@ function Message({ message }: { message: ChatMessage }) {
 }
 
 function ConversationsPage({ business }: { business: Business }) {
+  const [conversations, setConversations] = useState<Conversation[] | null>(null);
+  const [selected, setSelected] = useState<Conversation | null>(null);
   const [messages, setMessages] = useState<ChatMessage[] | null>(null);
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState<"create" | "archive" | "">("");
+  const [archiveTarget, setArchiveTarget] = useState<Conversation | null>(null);
+  const selectedConversationId = selected?.id ?? null;
   const conversationScroll = usePinnedToBottom(
     messages,
     messages !== null,
-    business.id,
+    selected?.id ?? business.id,
   );
+  const loadConversations = useCallback(async () => {
+    try {
+      const response = await api.conversations(business.id, true);
+      setConversations(response.items);
+      setSelected((current) => {
+        if (current) {
+          return response.items.find((item) => item.id === current.id) ?? null;
+        }
+        return (
+          response.items.find((item) => !item.archived) ?? response.items[0] ?? null
+        );
+      });
+    } catch (caught) {
+      setConversations([]);
+      setError(errorMessage(caught));
+    }
+  }, [business.id]);
   useEffect(() => {
-    if (!business.is_active) {
+    void loadConversations();
+  }, [loadConversations]);
+  useEffect(() => {
+    if (!selectedConversationId) {
       setMessages([]);
       return;
     }
+    setMessages(null);
     api
-      .messages(business.id)
+      .conversationMessages(business.id, selectedConversationId)
       .then((response) => setMessages(response.items))
       .catch((caught) => {
         setMessages([]);
         setError(errorMessage(caught));
       });
-  }, [business.id, business.is_active]);
+  }, [business.id, selectedConversationId]);
+
+  async function createNewConversation() {
+    setBusy("create");
+    setError("");
+    try {
+      const created = await api.createConversation(business.id);
+      setConversations((items) => [created, ...(items ?? [])]);
+      setSelected(created);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function archiveSelected() {
+    if (!archiveTarget) return;
+    setBusy("archive");
+    setError("");
+    try {
+      const archived = await api.archiveConversation(business.id, archiveTarget.id);
+      setConversations(
+        (items) =>
+          items?.map((item) => (item.id === archived.id ? archived : item)) ?? [],
+      );
+      setSelected(archived);
+      setArchiveTarget(null);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBusy("");
+    }
+  }
+
   return (
     <>
       <PageHeading
         title="Conversations"
-        description="Sou2AI currently provides one private owner conversation per business."
+        description="Manage private owner conversation history for this business."
         action={
-          business.is_active ? (
-            <Link className="btn" to={`/businesses/${business.id}/chat`}>
-              <MessageSquare size={18} />
-              Open owner chat
-            </Link>
-          ) : undefined
+          <button
+            type="button"
+            className="btn"
+            disabled={busy === "create"}
+            onClick={() => void createNewConversation()}
+          >
+            {busy === "create" ? (
+              <LoaderCircle className="animate-spin" />
+            ) : (
+              <Plus size={18} />
+            )}
+            New conversation
+          </button>
         }
       />
       {error && <Alert>{error}</Alert>}
-      <section className="panel conversation-history">
-        <div className="panel-heading">
-          <div>
-            <h2>Owner chat history</h2>
-            <p>No customer or external-channel conversations are connected.</p>
-          </div>
-        </div>
-        {messages === null ? (
+      {conversations === null ? (
+        <div className="conversation-workspace">
           <Skeleton className="h-64" />
-        ) : messages.length ? (
-          <div
-            ref={conversationScroll.viewportRef}
-            className="conversation-list"
-            role="log"
-            aria-label="Owner conversation history"
-            onScroll={conversationScroll.onScroll}
-          >
-            {messages.map((message) => (
-              <Message key={message.id} message={message} />
-            ))}
-          </div>
-        ) : (
+          <Skeleton className="h-64" />
+        </div>
+      ) : conversations.length ? (
+        <div className="conversation-workspace">
+          <aside className="panel conversation-index" aria-label="Owner conversations">
+            <div className="panel-heading">
+              <div>
+                <h2>Private owner chats</h2>
+                <p>Archived conversations remain readable.</p>
+              </div>
+              <span className="count-badge">{conversations.length}</span>
+            </div>
+            <div className="conversation-index-list">
+              {conversations.map((conversation) => (
+                <button
+                  type="button"
+                  key={conversation.id}
+                  className={conversation.id === selected?.id ? "selected" : ""}
+                  aria-pressed={conversation.id === selected?.id}
+                  onClick={() => setSelected(conversation)}
+                >
+                  <span>
+                    <strong>{conversation.title}</strong>
+                    {conversation.archived && <em>Archived</em>}
+                  </span>
+                  <p>{conversation.latest_message_preview ?? "No messages yet"}</p>
+                  <time
+                    dateTime={conversation.last_message_at ?? conversation.created_at}
+                  >
+                    {formatDateTime(
+                      conversation.last_message_at ?? conversation.created_at,
+                    )}
+                  </time>
+                </button>
+              ))}
+            </div>
+          </aside>
+          <section className="panel conversation-history">
+            {selected && (
+              <div className="panel-heading conversation-detail-heading">
+                <div>
+                  <h2>{selected.title}</h2>
+                  <p>
+                    {selected.archived
+                      ? "Archived · read-only private owner history"
+                      : "Private owner web conversation"}
+                  </p>
+                </div>
+                <div className="conversation-actions">
+                  {!selected.archived && business.is_active && (
+                    <Link
+                      className="btn"
+                      to={`/businesses/${business.id}/chat?conversation=${selected.id}`}
+                    >
+                      <MessageSquare size={17} />
+                      Open chat
+                    </Link>
+                  )}
+                  {!selected.archived && (
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      onClick={() => setArchiveTarget(selected)}
+                    >
+                      <Archive size={17} />
+                      Archive
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+            {messages === null ? (
+              <Skeleton className="h-64" />
+            ) : messages.length ? (
+              <div
+                ref={conversationScroll.viewportRef}
+                className="conversation-list"
+                role="log"
+                aria-label="Owner conversation history"
+                onScroll={conversationScroll.onScroll}
+              >
+                {messages.map((message) => (
+                  <Message key={message.id} message={message} />
+                ))}
+              </div>
+            ) : (
+              <TruthfulEmpty
+                icon={MessageSquare}
+                title="No messages yet"
+                text={
+                  selected?.archived
+                    ? "This archived conversation has no messages."
+                    : "Open this conversation in AI Chat to send its first message."
+                }
+              />
+            )}
+          </section>
+        </div>
+      ) : (
+        <section className="panel conversation-history">
           <TruthfulEmpty
             icon={MessageSquare}
-            title="No conversation history"
-            text={
-              business.is_active
-                ? "Your messages will appear here after you start the owner chat."
-                : "Owner chat history is available only for active businesses."
-            }
+            title="No conversations yet"
+            text="Create a private owner conversation without replacing earlier history."
           />
-        )}
-      </section>
+        </section>
+      )}
+      {archiveTarget && (
+        <div className="dialog-layer" role="presentation">
+          <button
+            type="button"
+            className="dialog-scrim"
+            aria-label="Cancel archive"
+            onClick={() => setArchiveTarget(null)}
+          />
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="archive-conversation-title"
+            className="dialog"
+          >
+            <span className="dialog-danger">
+              <Archive />
+            </span>
+            <h2 id="archive-conversation-title">Archive conversation?</h2>
+            <p>
+              <strong>{archiveTarget.title}</strong> will remain readable, but it can no
+              longer receive new messages.
+            </p>
+            <div className="form-actions">
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => setArchiveTarget(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn-danger"
+                disabled={busy === "archive"}
+                onClick={() => void archiveSelected()}
+              >
+                <BusyLabel busy={busy === "archive"} idle="Archive conversation" />
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }

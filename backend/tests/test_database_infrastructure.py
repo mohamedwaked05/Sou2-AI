@@ -124,6 +124,17 @@ def test_milestone_7_upgrade_backfills_existing_business_allowance(
             )
             == 1
         )
+        migrated_conversation = connection.execute(
+            text(
+                "SELECT creator_user_id, channel, title, archived "
+                "FROM owner_conversations WHERE id=:conversation_id"
+            ),
+            {"conversation_id": conversation_id},
+        ).one()
+        assert str(migrated_conversation.creator_user_id) == user_id
+        assert migrated_conversation.channel == "owner_web"
+        assert migrated_conversation.title == "New conversation"
+        assert migrated_conversation.archived is False
 
 
 def test_security_hardening_upgrade_preserves_existing_rate_and_usage_data(
@@ -254,4 +265,11 @@ def test_security_hardening_upgrade_preserves_existing_rate_and_usage_data(
                 {"id": reservation_id},
             )
             == 5
+        )
+        assert (
+            connection.scalar(
+                text("SELECT title FROM owner_conversations WHERE id=:id"),
+                {"id": conversation_id},
+            )
+            == "pre-hardening message"
         )

@@ -4,14 +4,21 @@ Sou2AI is planned as a local AI assistant for small businesses, supporting Engli
 
 ## Status
 
-Milestones 15–17 are implemented. The backend includes authentication, isolated
-multi-business onboarding, database-controlled lifecycle management, and one
-persistent private owner conversation per business. Complete, confirmed active
-businesses use local Ollama with `qwen2.5:7b` in development, retain full
-chat history, and learn owner-reviewable permanent or expiring business facts.
+Milestones 15–18 are implemented. The backend includes authentication, isolated
+multi-business onboarding, database-controlled lifecycle management, and multiple
+retained private owner conversations per business. Complete, confirmed active
+businesses use the selected provider, retain full chat history, and learn
+owner-reviewable permanent or expiring business facts.
 Idempotent submissions, PostgreSQL-backed
 turn ordering, cursor pagination, and tenant-scoped knowledge management are
 covered by the integration suite.
+
+Milestone 18 adds deterministic conversation titles, archive-without-delete,
+selected-conversation APIs and UI, and an asynchronous tenant-scoped rolling
+summary. The latest 12 eligible messages remain verbatim; older complete turns are
+summarized through Redis/RQ without modifying originals. Summary usage has a
+separate shared-allowance reservation, and current tools/profile/RAG/current input
+always outrank untrusted conversation memory.
 
 Registration and owner-generation abuse controls, per-business local-day AI
 token allowances, leased usage reconciliation, and the owner usage-summary API

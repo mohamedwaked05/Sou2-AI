@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import UTC, datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
@@ -83,6 +84,25 @@ class OwnerTurnResponse(BaseModel):
 
 class ConversationHistoryResponse(BaseModel):
     items: list[ChatMessageResponse]
+    next_cursor: str | None
+
+
+class ConversationResponse(BaseModel):
+    id: uuid.UUID
+    creator_user_id: uuid.UUID
+    channel: Literal["owner_web"]
+    title: str
+    next_turn_number: int
+    last_message_at: datetime | None
+    latest_message_preview: str | None = None
+    archived: bool
+    archived_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ConversationListResponse(BaseModel):
+    items: list[ConversationResponse]
     next_cursor: str | None
 
 

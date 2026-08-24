@@ -17,6 +17,8 @@ from app.integrations.profiles import (
 )
 from app.schemas.owner_chat import (
     ConversationHistoryResponse,
+    ConversationListResponse,
+    ConversationResponse,
     KnowledgeResponse,
     KnowledgeUpdateRequest,
     OwnerMessageRequest,
@@ -26,6 +28,12 @@ from app.services.business_knowledge import (
     delete_knowledge,
     list_knowledge,
     update_knowledge,
+)
+from app.services.conversations import (
+    archive_conversation,
+    create_conversation,
+    get_conversation,
+    list_conversations,
 )
 from app.services.owner_chat import get_conversation_history, submit_owner_message
 
@@ -66,6 +74,106 @@ def history(
     cursor: Annotated[str | None, Query(max_length=500)] = None,
 ) -> ConversationHistoryResponse:
     return get_conversation_history(session, user, business_id, cursor)
+
+
+@router.get("/conversations", response_model=ConversationListResponse)
+def conversations_list(
+    business_id: uuid.UUID,
+    session: DatabaseSession,
+    user: AuthenticatedUser,
+    cursor: Annotated[str | None, Query(max_length=500)] = None,
+    include_archived: Annotated[bool, Query()] = False,
+) -> ConversationListResponse:
+    return list_conversations(
+        session,
+        user,
+        business_id,
+        cursor,
+        include_archived=include_archived,
+    )
+
+
+@router.post(
+    "/conversations",
+    response_model=ConversationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def conversation_create(
+    business_id: uuid.UUID,
+    session: DatabaseSession,
+    user: AuthenticatedUser,
+) -> ConversationResponse:
+    return create_conversation(session, user, business_id)
+
+
+@router.get("/conversations/{conversation_id}", response_model=ConversationResponse)
+def conversation_get(
+    business_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    session: DatabaseSession,
+    user: AuthenticatedUser,
+) -> ConversationResponse:
+    return get_conversation(session, user, business_id, conversation_id)
+
+
+@router.post(
+    "/conversations/{conversation_id}/archive",
+    response_model=ConversationResponse,
+)
+def conversation_archive(
+    business_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    session: DatabaseSession,
+    user: AuthenticatedUser,
+) -> ConversationResponse:
+    return archive_conversation(session, user, business_id, conversation_id)
+
+
+@router.get(
+    "/conversations/{conversation_id}/messages",
+    response_model=ConversationHistoryResponse,
+)
+def conversation_history(
+    business_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    session: DatabaseSession,
+    user: AuthenticatedUser,
+    cursor: Annotated[str | None, Query(max_length=500)] = None,
+) -> ConversationHistoryResponse:
+    return get_conversation_history(
+        session,
+        user,
+        business_id,
+        cursor,
+        conversation_id=conversation_id,
+    )
+
+
+@router.post(
+    "/conversations/{conversation_id}/messages",
+    response_model=OwnerTurnResponse,
+    dependencies=[Depends(run_security_record_cleanup)],
+)
+def conversation_submit_message(
+    business_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    body: OwnerMessageRequest,
+    session: DatabaseSession,
+    user: AuthenticatedUser,
+    provider: ChatProvider,
+    settings: AppSettings,
+    profiles: ProfileRegistry,
+) -> OwnerTurnResponse:
+    return submit_owner_message(
+        session,
+        user,
+        business_id,
+        body,
+        provider,
+        settings,
+        profiles,
+        conversation_id=conversation_id,
+    )
 
 
 @router.get("/knowledge", response_model=list[KnowledgeResponse])

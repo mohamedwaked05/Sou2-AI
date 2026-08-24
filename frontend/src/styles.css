@@ -1753,6 +1753,80 @@ textarea::placeholder {
 .conversation-history {
   min-height: 460px;
 }
+.conversation-workspace {
+  display: grid;
+  grid-template-columns: minmax(250px, 0.8fr) minmax(0, 2fr);
+  gap: 20px;
+  align-items: stretch;
+}
+.conversation-index {
+  min-width: 0;
+  padding: 16px;
+}
+.conversation-index-list {
+  display: grid;
+  gap: 8px;
+}
+.conversation-index-list > button {
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: transparent;
+  padding: 13px;
+  color: inherit;
+  text-align: left;
+  transition:
+    border-color 150ms ease,
+    background 150ms ease;
+}
+.conversation-index-list > button:hover,
+.conversation-index-list > button.selected {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+}
+.conversation-index-list > button:focus-visible {
+  outline: 3px solid rgba(37, 99, 235, 0.3);
+  outline-offset: 2px;
+}
+.conversation-index-list button > span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.conversation-index-list strong,
+.conversation-index-list p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conversation-index-list em {
+  border-radius: 999px;
+  background: #e2e8f0;
+  padding: 3px 7px;
+  color: #475569;
+  font-size: 0.65rem;
+  font-style: normal;
+}
+.conversation-index-list p {
+  margin-top: 5px;
+  color: #64748b;
+  font-size: 0.8rem;
+}
+.conversation-index-list time {
+  display: block;
+  margin-top: 7px;
+  color: #94a3b8;
+  font-size: 0.68rem;
+}
+.conversation-detail-heading {
+  align-items: flex-start;
+}
+.conversation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
 .conversation-list {
   display: flex;
   max-height: min(65dvh, 720px);
@@ -1788,6 +1862,18 @@ textarea::placeholder {
 .dark .composer {
   border-color: #263246;
   background: #101827;
+}
+.dark .conversation-index-list > button:hover,
+.dark .conversation-index-list > button.selected {
+  border-color: #1d4ed8;
+  background: rgba(37, 99, 235, 0.12);
+}
+.dark .conversation-index-list p {
+  color: #94a3b8;
+}
+.dark .conversation-index-list em {
+  background: #263246;
+  color: #cbd5e1;
 }
 
 .upload-panel {
@@ -2692,6 +2778,28 @@ textarea::placeholder {
 }
 
 @media (max-width: 767px) {
+  .conversation-workspace {
+    grid-template-columns: 1fr;
+  }
+  .conversation-index-list {
+    display: flex;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    scroll-snap-type: x proximity;
+  }
+  .conversation-index-list > button {
+    min-width: min(280px, 82vw);
+    scroll-snap-align: start;
+  }
+  .conversation-detail-heading,
+  .conversation-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .conversation-actions .btn,
+  .conversation-actions .btn-secondary {
+    width: 100%;
+  }
   .auth-page,
   .onboarding-page {
     align-items: start;

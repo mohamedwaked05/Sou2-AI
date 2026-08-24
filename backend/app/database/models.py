@@ -81,6 +81,12 @@ class ChatGenerationState(StrEnum):
     FAILED = "failed"
 
 
+class ConversationSummaryState(StrEnum):
+    IDLE = "idle"
+    PROCESSING = "processing"
+    FAILED = "failed"
+
+
 class KnowledgeKind(StrEnum):
     PERMANENT = "permanent"
     TEMPORARY = "temporary"
@@ -555,7 +561,7 @@ class Business(Base):
     tool_call_logs: Mapped[list[ToolCallLog]] = relationship(
         back_populates="business", passive_deletes=True
     )
-    owner_conversation: Mapped[OwnerConversation | None] = relationship(
+    owner_conversations: Mapped[list[OwnerConversation]] = relationship(
         back_populates="business", cascade="all, delete-orphan", passive_deletes=True
     )
     knowledge: Mapped[list[BusinessKnowledge]] = relationship(
@@ -860,9 +866,22 @@ class AIUsageReservation(Base):
             "generation_attempt",
             name="uq_ai_reservation_message_attempt",
         ),
+        UniqueConstraint(
+            "conversation_summary_id",
+            "generation_attempt",
+            name="uq_ai_reservation_summary_attempt",
+        ),
         CheckConstraint(
-            "channel IN ('owner', 'customer', 'whatsapp')",
+            "channel IN ('owner', 'customer', 'whatsapp', 'system')",
             name="ck_ai_reservation_channel",
+        ),
+        CheckConstraint(
+            "(capability = 'conversation_summary' AND "
+            "conversation_summary_id IS NOT NULL AND owner_message_id IS NULL "
+            "AND channel = 'system') OR "
+            "(capability <> 'conversation_summary' "
+            "AND conversation_summary_id IS NULL)",
+            name="ck_ai_reservation_subject",
         ),
         CheckConstraint(
             "status IN ('reserved', 'completed', 'released', 'charged')",
@@ -921,6 +940,9 @@ class AIUsageReservation(Base):
     )
     owner_message_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("owner_chat_messages.id", ondelete="SET NULL")
+    )
+    conversation_summary_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("owner_conversation_summaries.id", ondelete="SET NULL")
     )
     generation_attempt: Mapped[int] = mapped_column(Integer, nullable=False)
     channel: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -1011,12 +1033,33 @@ class BusinessOpeningShift(Base):
 
 
 class OwnerConversation(Base):
-    """The single private owner conversation for one business."""
+    """One private owner web conversation scoped to a business."""
 
     __tablename__ = "owner_conversations"
     __table_args__ = (
         CheckConstraint(
             "next_turn_number > 0", name="ck_owner_conversations_next_turn_positive"
+        ),
+        CheckConstraint("channel = 'owner_web'", name="ck_owner_conversations_channel"),
+        CheckConstraint(
+            "char_length(btrim(title)) BETWEEN 1 AND 120",
+            name="ck_owner_conversations_title",
+        ),
+        CheckConstraint(
+            "(archived AND archived_at IS NOT NULL) OR "
+            "(NOT archived AND archived_at IS NULL)",
+            name="ck_owner_conversations_archive",
+        ),
+        UniqueConstraint(
+            "id", "business_id", name="uq_owner_conversations_id_business"
+        ),
+        Index(
+            "ix_owner_conversations_business_activity",
+            "business_id",
+            "archived",
+            text("last_message_at DESC NULLS LAST"),
+            text("created_at DESC"),
+            "id",
         ),
     )
 
@@ -1024,11 +1067,28 @@ class OwnerConversation(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     business_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False, unique=True
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    creator_user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), nullable=False
+    )
+    channel: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="owner_web", server_default="owner_web"
+    )
+    title: Mapped[str] = mapped_column(
+        String(120),
+        nullable=False,
+        default="New conversation",
+        server_default="New conversation",
     )
     next_turn_number: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=1, server_default=text("1")
     )
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1039,13 +1099,128 @@ class OwnerConversation(Base):
         onupdate=func.now(),
     )
 
-    business: Mapped[Business] = relationship(back_populates="owner_conversation")
+    business: Mapped[Business] = relationship(back_populates="owner_conversations")
     messages: Mapped[list[OwnerChatMessage]] = relationship(
         back_populates="conversation",
         cascade="all, delete-orphan",
         passive_deletes=True,
         foreign_keys="OwnerChatMessage.conversation_id",
     )
+    summary: Mapped[OwnerConversationSummary | None] = relationship(
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        uselist=False,
+    )
+
+
+class OwnerConversationSummary(Base):
+    """One internal rolling summary and checkpoint for an owner conversation."""
+
+    __tablename__ = "owner_conversation_summaries"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", name="uq_owner_summary_conversation"),
+        ForeignKeyConstraint(
+            ["conversation_id", "business_id"],
+            ["owner_conversations.id", "owner_conversations.business_id"],
+            name="fk_owner_summary_conversation_scope",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "(summary_version = 0 AND content IS NULL "
+            "AND summarized_through_sequence_number = 0) OR "
+            "(summary_version > 0 AND char_length(btrim(content)) BETWEEN 1 AND 2000 "
+            "AND summarized_through_sequence_number > 0)",
+            name="ck_owner_summary_content",
+        ),
+        CheckConstraint(
+            "summary_version >= 0 AND generation_attempts >= 0 "
+            "AND last_charged_through_sequence_number >= "
+            "summarized_through_sequence_number",
+            name="ck_owner_summary_version",
+        ),
+        CheckConstraint(
+            "generation_state IN ('idle', 'processing', 'failed')",
+            name="ck_owner_summary_state",
+        ),
+        CheckConstraint(
+            "(generation_state = 'processing' AND "
+            "pending_through_sequence_number > summarized_through_sequence_number "
+            "AND generation_claim_token IS NOT NULL "
+            "AND generation_claim_expires_at IS NOT NULL) OR "
+            "(generation_state <> 'processing' "
+            "AND pending_through_sequence_number IS NULL "
+            "AND generation_claim_token IS NULL "
+            "AND generation_claim_expires_at IS NULL)",
+            name="ck_owner_summary_claim",
+        ),
+        CheckConstraint(
+            "provider_identifier IS NULL OR char_length(provider_identifier) <= 50",
+            name="ck_owner_summary_provider",
+        ),
+        CheckConstraint(
+            "model_identifier IS NULL OR char_length(model_identifier) <= 100",
+            name="ck_owner_summary_model",
+        ),
+        CheckConstraint(
+            "last_failure_code IS NULL OR (char_length(last_failure_code) BETWEEN 1 "
+            "AND 100 AND last_failure_code ~ '^[a-z][a-z0-9_]*$')",
+            name="ck_owner_summary_failure",
+        ),
+        Index(
+            "ix_owner_summaries_lease",
+            "generation_state",
+            "generation_claim_expires_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False
+    )
+    content: Mapped[str | None] = mapped_column(Text)
+    summarized_through_sequence_number: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    summary_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    last_charged_through_sequence_number: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    generation_state: Mapped[ConversationSummaryState] = mapped_column(
+        String(20),
+        nullable=False,
+        default=ConversationSummaryState.IDLE,
+        server_default="idle",
+    )
+    pending_through_sequence_number: Mapped[int | None] = mapped_column(BigInteger)
+    generation_claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    generation_claim_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    generation_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    provider_identifier: Mapped[str | None] = mapped_column(String(50))
+    model_identifier: Mapped[str | None] = mapped_column(String(100))
+    last_failure_code: Mapped[str | None] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    conversation: Mapped[OwnerConversation] = relationship(back_populates="summary")
 
 
 class OwnerChatMessage(Base):

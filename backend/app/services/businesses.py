@@ -118,9 +118,10 @@ def create_business(session: Session, user: User, name: str) -> BusinessResponse
         business=business,
         permission=MembershipPermission.FULL_ACCESS,
     )
-    conversation = OwnerConversation(business=business)
-    session.add_all([business, membership, conversation])
+    session.add_all([business, membership])
     try:
+        session.flush()
+        session.add(OwnerConversation(business=business, creator_user_id=user.id))
         session.flush()
         session.commit()
     except IntegrityError:
