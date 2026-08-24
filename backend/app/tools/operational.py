@@ -37,8 +37,12 @@ from app.schemas.operational import (
     BestSellersQuery,
     BestSellingProductsResult,
     InventoryQuery,
+    InventoryReadQuery,
     InventoryResult,
+    ProductResolution,
+    ProductResolutionQuery,
     RestockingQuery,
+    RestockingReadQuery,
     RestockingRecommendationsResult,
     SalesQuery,
     SalesSummary,
@@ -135,7 +139,23 @@ class OperationalToolResult:
 
 def _inventory(source: OperationalDataSource, query: BaseModel) -> BaseModel:
     assert isinstance(query, InventoryQuery)
-    return source.get_current_inventory(query)
+    resolution = _resolve_product_filter(source, query.product_filter)
+    if resolution is not None and resolution.status != "resolved":
+        return InventoryResult(
+            items=(), metadata=resolution.metadata, resolution=resolution
+        )
+    read_query = InventoryReadQuery(
+        external_product_id=(
+            resolution.product.external_product_id
+            if resolution is not None and resolution.product is not None
+            else None
+        ),
+        branch_external_id=query.branch_external_id,
+        warehouse_external_id=query.warehouse_external_id,
+        limit=query.limit,
+    )
+    result = source.get_current_inventory(read_query)
+    return result.model_copy(update={"resolution": resolution})
 
 
 def _sales_summary(source: OperationalDataSource, query: BaseModel) -> BaseModel:
@@ -150,7 +170,31 @@ def _best_sellers(source: OperationalDataSource, query: BaseModel) -> BaseModel:
 
 def _restocking(source: OperationalDataSource, query: BaseModel) -> BaseModel:
     assert isinstance(query, RestockingQuery)
-    return source.get_restocking_recommendations(query)
+    resolution = _resolve_product_filter(source, query.product_filter)
+    if resolution is not None and resolution.status != "resolved":
+        return RestockingRecommendationsResult(
+            items=(), metadata=resolution.metadata, resolution=resolution
+        )
+    read_query = RestockingReadQuery(
+        external_product_id=(
+            resolution.product.external_product_id
+            if resolution is not None and resolution.product is not None
+            else None
+        ),
+        branch_external_id=query.branch_external_id,
+        warehouse_external_id=query.warehouse_external_id,
+        limit=query.limit,
+    )
+    result = source.get_restocking_recommendations(read_query)
+    return result.model_copy(update={"resolution": resolution})
+
+
+def _resolve_product_filter(
+    source: OperationalDataSource, product_filter: str | None
+) -> ProductResolution | None:
+    if product_filter is None:
+        return None
+    return source.resolve_product(ProductResolutionQuery(reference=product_filter))
 
 
 def build_operational_tool_registry(
@@ -164,7 +208,9 @@ def build_operational_tool_registry(
             name=CURRENT_INVENTORY_TOOL,
             description=(
                 "Retrieve current product inventory, quantities, reservations, and "
-                "availability for an optional product and one branch or warehouse."
+                "availability for an optional exact ID, SKU, barcode, product name, "
+                "or approved alias and one branch or warehouse. Product resolution "
+                "can explicitly be resolved, ambiguous, or not found."
             ),
             input_schema=CurrentInventoryToolInput,
             output_schema=InventoryResult,
@@ -203,7 +249,9 @@ def build_operational_tool_registry(
             name=RESTOCKING_RECOMMENDATIONS_TOOL,
             description=(
                 "Calculate deterministic replenishment quantities from available "
-                "stock, reorder points, and target stock."
+                "stock, reorder points, and target stock for an optional exact ID, "
+                "SKU, barcode, product name, or approved alias. Product resolution "
+                "can explicitly be resolved, ambiguous, or not found."
             ),
             input_schema=RestockingRecommendationsToolInput,
             output_schema=RestockingRecommendationsResult,
@@ -275,6 +323,9 @@ class OperationalToolExecutor:
                 return ()
             capabilities = self._source_capabilities(source)
             adapter = self._profiles.resolve(source.connection_profile_key)
+            if not self._adapter_timeout_is_acceptable(adapter):
+                self._session.rollback()
+                return ()
             self._session.commit()
             health = adapter.check_health()
             mapping = self._profiles.get_mapping(
@@ -361,6 +412,10 @@ class OperationalToolExecutor:
             source_id = source.id
             source_updated_at = source.updated_at
             adapter = self._profiles.resolve(source.connection_profile_key)
+            if not self._adapter_timeout_is_acceptable(
+                adapter, maximum_seconds=definition.timeout_seconds
+            ):
+                raise ToolExecutionError("integration_unavailable")
             mapping = self._profiles.get_mapping(
                 source.mapping_profile_key, source.mapping_profile_version
             )
@@ -526,3 +581,20 @@ class OperationalToolExecutor:
             raise ToolExecutionError("integration_unavailable")
         mapping.validate_definition()
         return frozenset(mapping.required_capabilities)
+
+    def _adapter_timeout_is_acceptable(
+        self,
+        adapter: OperationalDataSource,
+        *,
+        maximum_seconds: int | None = None,
+    ) -> bool:
+        try:
+            enforced = adapter.enforced_query_timeout_seconds
+        except Exception:
+            return False
+        maximum = maximum_seconds or self._settings.operational_query_timeout_seconds
+        return (
+            isinstance(enforced, int)
+            and not isinstance(enforced, bool)
+            and 1 <= enforced <= maximum
+        )

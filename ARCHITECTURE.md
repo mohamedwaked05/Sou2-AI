@@ -160,6 +160,14 @@ column names. The implemented operations are fixed inventory, sales-summary,
 best-seller, restocking, and health queries. They use parameterized SQL, bounded
 dates and rows, source-local half-open date windows, explicit final-sale/refund
 semantics, statement timeouts, safe errors, and a dedicated unprivileged login.
+Product-scoped inventory and restocking first resolve an exact internal/external
+ID, SKU, barcode, normalized name, or approved external-catalogue alias in that
+order, then consider only bounded partial name/alias candidates. The normalized
+result is explicitly `resolved`, `ambiguous`, or `not_found`; ambiguous candidates
+contain only safe product identifiers and can never trigger an arbitrary stock
+query. Once resolved, reads use the stable external product ID and preserve each
+branch or warehouse row separately. Aliases remain in the source catalogue and
+are never copied into the platform database.
 Active unexpired reservations reduce available stock. Restocking recommends the
 trusted arithmetic difference between target and available stock only when
 available stock is at or below the reorder point. No model, route, or tool can
@@ -212,6 +220,11 @@ and treats returned records as untrusted data rather than instructions. Current
 operational data takes precedence over history, documents, profile text, and model
 assumptions and produces no document citations. Write and destructive tools remain
 unimplemented future work and would require a separate confirmation design.
+Every operational adapter declares the cancellable query timeout it enforces
+internally. The centralized executor rejects adapters whose declaration exceeds
+the tool bound and retains an elapsed-time check as defense in depth. PostgreSQL
+enforces cancellation with `statement_timeout`; future database or HTTP adapters
+must provide their own cancellable timeout before validation and activation.
 
 ## 10. Language handling
 

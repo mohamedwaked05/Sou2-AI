@@ -6,9 +6,11 @@ from app.schemas.operational import (
     BestSellersQuery,
     BestSellingProductsResult,
     IntegrationHealth,
-    InventoryQuery,
+    InventoryReadQuery,
     InventoryResult,
-    RestockingQuery,
+    ProductResolution,
+    ProductResolutionQuery,
+    RestockingReadQuery,
     RestockingRecommendationsResult,
     SalesQuery,
     SalesSummary,
@@ -37,7 +39,14 @@ class OperationalDataInvalid(OperationalIntegrationError):
 class OperationalDataSource(Protocol):
     """Operations supported by a structured live operational source."""
 
-    def get_current_inventory(self, query: InventoryQuery) -> InventoryResult: ...
+    @property
+    def enforced_query_timeout_seconds(self) -> int:
+        """Maximum timeout enforced and cancelled inside the adapter."""
+        ...
+
+    def resolve_product(self, query: ProductResolutionQuery) -> ProductResolution: ...
+
+    def get_current_inventory(self, query: InventoryReadQuery) -> InventoryResult: ...
 
     def get_sales_summary(self, query: SalesQuery) -> SalesSummary: ...
 
@@ -46,7 +55,7 @@ class OperationalDataSource(Protocol):
     ) -> BestSellingProductsResult: ...
 
     def get_restocking_recommendations(
-        self, query: RestockingQuery
+        self, query: RestockingReadQuery
     ) -> RestockingRecommendationsResult: ...
 
     def check_health(self) -> IntegrationHealth: ...

@@ -81,6 +81,47 @@ def test_ordinary_casual_phrases_do_not_require_business_evidence(
     assert owner_chat._requires_business_evidence(message) is False
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "How many Pepsi do we have left?",
+        "Do we have iPad Pro available?",
+        "What is the quantity of P1001?",
+        "How much WATER-1500 remains?",
+        "قديش عنا بيبسي",
+        "كم آيباد باقي",
+        "هل المنتج P1001 متوفر",
+        "قديش باقي من هيدا المنتج",
+        "adde 3anna Pepsi?",
+        "kam iPad ba2e?",
+        "fi P1001 available?",
+        "adde ba2e men WATER-1500?",
+    ],
+)
+def test_multilingual_product_quantity_phrasing_routes_only_to_inventory(
+    message: str,
+) -> None:
+    assert owner_chat._is_live_operational_request(message) is True
+    assert owner_chat._matching_operational_tools(message) == frozenset(
+        {"current_inventory"}
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "How many days do we have left?",
+        "How many employees do we have?",
+        "kam meeting ba2e?",
+        "كم مواعيد باقي",
+    ],
+)
+def test_unrelated_how_many_phrasing_is_not_a_product_inventory_query(
+    message: str,
+) -> None:
+    assert "inventory" not in owner_chat._query_concepts(message)
+
+
 def test_casual_turn_uses_provider_once_and_replays_without_duplicate_usage(
     api_client,
     db_session: Session,

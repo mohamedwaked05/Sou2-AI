@@ -44,12 +44,15 @@ from app.schemas.operational import (
     InventoryResult,
     OperationalResultMetadata,
     Product,
+    ProductResolution,
+    ProductResolutionCandidate,
     ReportingPeriod,
     RestockingRecommendation,
     RestockingRecommendationsResult,
     SalesSummary,
 )
 from app.schemas.owner_chat import OwnerMessageRequest
+from app.services import owner_chat
 from app.services.owner_chat import submit_owner_message
 from app.tools.operational import (
     BEST_SELLING_PRODUCTS_TOOL,
@@ -110,8 +113,26 @@ def inventory_item() -> InventoryItem:
 class StubSource:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.resolution_references: list[str] = []
+        self.last_inventory_query: Any | None = None
+        self.last_restocking_query: Any | None = None
         self.error: Exception | None = None
         self.health_error: Exception | None = None
+        self.timeout_seconds = 2
+        self.resolution = ProductResolution(
+            status="resolved",
+            matched_by="alias",
+            product=inventory_item().product,
+            metadata=metadata(),
+        )
+
+    @property
+    def enforced_query_timeout_seconds(self) -> int:
+        return self.timeout_seconds
+
+    def resolve_product(self, query: object) -> ProductResolution:
+        self.resolution_references.append(cast(Any, query).reference)
+        return self.resolution
 
     def check_health(self) -> IntegrationHealth:
         if self.health_error is not None:
@@ -131,6 +152,7 @@ class StubSource:
 
     def get_current_inventory(self, query: object) -> InventoryResult:
         self._raise_or_record(CURRENT_INVENTORY_TOOL)
+        self.last_inventory_query = query
         limit = cast(Any, query).limit
         return InventoryResult(
             items=(inventory_item(),), metadata=metadata(limit=limit)
@@ -185,6 +207,7 @@ class StubSource:
         self, query: object
     ) -> RestockingRecommendationsResult:
         self._raise_or_record(RESTOCKING_RECOMMENDATIONS_TOOL)
+        self.last_restocking_query = query
         limit = cast(Any, query).limit
         return RestockingRecommendationsResult(
             items=(
@@ -387,6 +410,100 @@ def test_every_approved_tool_executes_normalized_data_and_one_minimal_audit(
     }
 
 
+@pytest.mark.parametrize(
+    "tool_name",
+    [CURRENT_INVENTORY_TOOL, RESTOCKING_RECOMMENDATIONS_TOOL],
+)
+def test_product_scoped_tools_resolve_then_query_the_stable_external_id(
+    api_client: TestClient,
+    db_session: Session,
+    tool_name: str,
+) -> None:
+    user, business, registry, executor = executor_setup(api_client, db_session)
+
+    result = executor.execute(
+        user=user,
+        business_id=business.id,
+        tool_name=tool_name,
+        arguments={"product_filter": "mayyet Nestle", "limit": 5},
+    )
+
+    assert cast(Any, result.output).resolution.status == "resolved"
+    assert registry.source.resolution_references == ["mayyet Nestle"]
+    read_query = (
+        registry.source.last_inventory_query
+        if tool_name == CURRENT_INVENTORY_TOOL
+        else registry.source.last_restocking_query
+    )
+    assert read_query.external_product_id == "P1001"
+    assert not hasattr(read_query, "product_filter")
+
+
+@pytest.mark.parametrize(
+    ("status", "candidate_count"),
+    [("ambiguous", 2), ("not_found", 0)],
+)
+def test_unresolved_products_never_execute_inventory_for_an_arbitrary_candidate(
+    api_client: TestClient,
+    db_session: Session,
+    status: str,
+    candidate_count: int,
+) -> None:
+    user, business, registry, executor = executor_setup(api_client, db_session)
+    candidates = (
+        (
+            ProductResolutionCandidate(
+                external_product_id="P1007", sku="PEPSI-330", name="Pepsi 330 ml"
+            ),
+            ProductResolutionCandidate(
+                external_product_id="P1008",
+                sku="PEPSI-1500",
+                name="Pepsi 1.5 L",
+            ),
+        )
+        if status == "ambiguous"
+        else ()
+    )
+    registry.source.resolution = ProductResolution(
+        status=cast(Any, status),
+        matched_by="partial_name" if status == "ambiguous" else None,
+        candidates=candidates,
+        metadata=metadata(rows=candidate_count),
+    )
+
+    result = executor.execute(
+        user=user,
+        business_id=business.id,
+        tool_name=CURRENT_INVENTORY_TOOL,
+        arguments={"product_filter": "Pepsi", "limit": 5},
+    )
+
+    assert cast(Any, result.output).resolution.status == status
+    assert cast(Any, result.output).items == ()
+    assert registry.source.calls == []
+    assert db_session.scalar(select(ToolCallLog)).status is ToolCallStatus.SUCCESS
+
+
+def test_executor_requires_a_bounded_adapter_enforced_timeout(
+    api_client: TestClient,
+    db_session: Session,
+) -> None:
+    user, business, registry, executor = executor_setup(api_client, db_session)
+    registry.source.timeout_seconds = 3
+
+    assert executor.available_definitions(user, business.id) == ()
+    with pytest.raises(ToolExecutionError) as raised:
+        executor.execute(
+            user=user,
+            business_id=business.id,
+            tool_name=CURRENT_INVENTORY_TOOL,
+            arguments={"limit": 5},
+        )
+
+    assert raised.value.code == "integration_unavailable"
+    assert registry.source.calls == []
+
+
 def test_cross_tenant_timeout_and_missing_audit_secret_fail_safely(
     api_client: TestClient,
     db_session: Session,
@@ -561,6 +678,130 @@ def test_owner_loop_executes_live_tool_aggregates_usage_and_replays_without_work
     assert reservation.input_tokens == 20
     assert reservation.output_tokens == 4
     assert reservation.total_tokens == 24
+
+
+@pytest.mark.parametrize(
+    ("message", "reference"),
+    [
+        ("How many Pepsi do we have left?", "Pepsi"),
+        ("قديش عنا بيبسي", "بيبسي"),
+        ("كم آيباد باقي", "آيباد"),
+        ("adde 3anna Pepsi?", "Pepsi"),
+        ("fi P1001 available?", "P1001"),
+        ("adde ba2e men WATER-1500?", "WATER-1500"),
+    ],
+)
+def test_multilingual_quantity_turn_reaches_inventory_with_product_reference(
+    api_client: TestClient,
+    db_session: Session,
+    message: str,
+    reference: str,
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"quantity-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"product_filter": reference, "limit": 5},
+            ),
+            usage_result(reply="There are 8 available units."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        message,
+        f"quantity-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert [tool.name for tool in provider.requests[0].tools] == [
+        CURRENT_INVENTORY_TOOL
+    ]
+    assert source.resolution_references == [reference]
+    assert source.calls == [CURRENT_INVENTORY_TOOL]
+
+
+@pytest.mark.parametrize("status", ["ambiguous", "not_found"])
+def test_unresolved_product_turn_returns_safe_answer_without_rag_or_guessing(
+    api_client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"resolution-{status}-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    candidates = (
+        (
+            ProductResolutionCandidate(
+                external_product_id="P1007", sku="PEPSI-330", name="Pepsi 330 ml"
+            ),
+            ProductResolutionCandidate(
+                external_product_id="P1008",
+                sku="PEPSI-1500",
+                name="Pepsi 1.5 L",
+            ),
+        )
+        if status == "ambiguous"
+        else ()
+    )
+    source.resolution = ProductResolution(
+        status=cast(Any, status),
+        matched_by="partial_name" if status == "ambiguous" else None,
+        candidates=candidates,
+        metadata=metadata(rows=len(candidates)),
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"product_filter": "Pepsi", "limit": 5},
+            ),
+            usage_result(reply="Use the first product and assume 99 units."),
+        ]
+    )
+    monkeypatch.setattr(
+        owner_chat,
+        "create_embedding_provider",
+        lambda _settings: (_ for _ in ()).throw(
+            AssertionError("product resolution must not fall back to RAG")
+        ),
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "How many Pepsi do we have left?",
+        f"resolution-{status}",
+    )
+
+    assert response.status_code == 200, response.text
+    content = response.json()["assistant_message"]["content"]
+    assert "99" not in content
+    assert response.json()["assistant_message"]["sources"] == []
+    if status == "ambiguous":
+        assert "Which one do you mean?" in content
+        assert "PEPSI-330" in content and "PEPSI-1500" in content
+    else:
+        assert "couldn't find that product" in content
+    assert source.calls == []
+    assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
 
 
 def test_active_source_without_matching_capability_keeps_safe_unavailable_bypass(

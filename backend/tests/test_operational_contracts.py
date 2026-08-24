@@ -19,8 +19,12 @@ from app.schemas.operational import (
     IntegrationHealth,
     InventoryItem,
     InventoryQuery,
+    InventoryReadQuery,
     OperationalResultMetadata,
     Product,
+    ProductResolution,
+    ProductResolutionCandidate,
+    ProductResolutionQuery,
     ReportingPeriod,
     RestockingRecommendation,
     SalesQuery,
@@ -80,6 +84,54 @@ def test_contracts_reject_blank_product_text_and_unknown_fields() -> None:
             external_product_id=" ",
             name="Rice",
             source_table="catalog_items",  # type: ignore[call-arg]
+        )
+
+
+def test_product_resolution_contract_enforces_explicit_safe_states() -> None:
+    resolved = ProductResolution(
+        status="resolved",
+        matched_by="sku",
+        product=product(),
+        metadata=metadata(),
+    )
+    ambiguous = ProductResolution(
+        status="ambiguous",
+        matched_by="partial_name",
+        candidates=(
+            ProductResolutionCandidate(
+                external_product_id="P1007", sku="PEPSI-330", name="Pepsi 330 ml"
+            ),
+            ProductResolutionCandidate(
+                external_product_id="P1008",
+                sku="PEPSI-1500",
+                name="Pepsi 1.5 L",
+            ),
+        ),
+        metadata=metadata(),
+    )
+    not_found = ProductResolution(status="not_found", metadata=metadata())
+
+    assert resolved.product == product()
+    assert len(ambiguous.candidates) == 2
+    assert not_found.product is None
+    with pytest.raises(ValidationError, match="exactly one"):
+        ProductResolution(status="resolved", matched_by="sku", metadata=metadata())
+    with pytest.raises(ValidationError, match="at least two"):
+        ProductResolution(
+            status="ambiguous",
+            matched_by="partial_name",
+            candidates=(ambiguous.candidates[0],),
+            metadata=metadata(),
+        )
+
+
+def test_product_resolution_query_is_strict_and_bounded() -> None:
+    assert ProductResolutionQuery(reference="  Pepsi  ").reference == "Pepsi"
+    with pytest.raises(ValidationError):
+        ProductResolutionQuery(reference="Pepsi", candidate_limit=6)
+    with pytest.raises(ValidationError):
+        ProductResolutionQuery.model_validate(
+            {"reference": "Pepsi", "business_id": "not-allowed"}
         )
 
 
@@ -216,7 +268,7 @@ def test_query_timeout_and_health_errors_do_not_leak_credentials(caplog: Any) ->
     )
 
     with pytest.raises(OperationalQueryTimeout) as raised:
-        adapter.get_current_inventory(InventoryQuery())
+        adapter.get_current_inventory(InventoryReadQuery())
 
     assert str(raised.value) == "Operational source query timed out."
     health = adapter.check_health()

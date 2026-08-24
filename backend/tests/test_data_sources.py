@@ -51,6 +51,11 @@ class StubOperationalSource:
     def __init__(self) -> None:
         self.health = healthy_result()
         self.error: Exception | None = None
+        self.timeout_seconds = 2
+
+    @property
+    def enforced_query_timeout_seconds(self) -> int:
+        return self.timeout_seconds
 
     def check_health(self) -> IntegrationHealth:
         if self.error is not None:
@@ -304,6 +309,26 @@ def test_failed_validation_cannot_activate_and_never_leaks_exception(
     combined_output = validated.text + activated.text + caplog.text
     assert "highly-secret" not in combined_output
     assert "postgresql://" not in combined_output
+
+
+def test_adapter_without_bounded_internal_timeout_cannot_validate_or_activate(
+    api_client: TestClient, db_session: Session
+) -> None:
+    registry = StubRegistry()
+    registry.source.timeout_seconds = 31
+    configure_registry(registry)
+    user, business = create_owner_business(
+        db_session, "invalid-timeout@example.com", "Invalid Timeout Store"
+    )
+    source = create_source(api_client, user, business)
+
+    validated = source_action(api_client, user, business, source["id"], "validate")
+    activated = source_action(api_client, user, business, source["id"], "activate")
+
+    assert validated.status_code == 200
+    assert validated.json()["status"] == "UNHEALTHY"
+    assert validated.json()["failure_code"] == "operational_mapping_invalid"
+    assert activated.status_code == 409
 
 
 def test_validation_activation_and_disable_are_safe_and_idempotent(

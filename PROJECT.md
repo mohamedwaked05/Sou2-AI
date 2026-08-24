@@ -382,6 +382,17 @@ operational records are never audited. Without the server-only HMAC secret or an
 active healthy source, the existing safe live-data-unavailable response remains.
 No write tool or confirmation flow is implemented.
 
+Product-scoped inventory and restocking resolve catalogue references through the
+provider-neutral integration boundary. Exact internal/external IDs, SKUs,
+barcodes, normalized names, and approved source-owned aliases take deterministic
+priority before bounded partial name/alias matching. The adapter returns
+`resolved`, `ambiguous`, or `not_found`; ambiguous answers ask the owner to choose
+from safe candidates and not-found answers never fall back to RAG. Natural English,
+Arabic, Lebanese Arabic, and Franco-Arabic quantity phrasing reaches the same
+inventory tool without a classifier provider call. Adapters declare and internally
+enforce a cancellable timeout; PostgreSQL continues to use `statement_timeout`.
+Milestone 17 remains complete after this focused repair.
+
 ### Milestone 18: Conversation history and memory
 
 * Store tenant-scoped conversations and messages with user or channel identity.

@@ -19,6 +19,7 @@ from pydantic import (
 MAX_OPERATIONAL_ROWS = 100
 MAX_BEST_SELLER_ROWS = 50
 MAX_REPORTING_DAYS = 366
+MAX_PRODUCT_RESOLUTION_CANDIDATES = 5
 
 
 def _validate_source_timezone(value: str) -> str:
@@ -50,6 +51,38 @@ class Product(OperationalContract):
         normalized = value.strip()
         if not normalized:
             raise ValueError("Operational text fields cannot be blank.")
+        return normalized
+
+
+ProductResolutionStatus = Literal["resolved", "ambiguous", "not_found"]
+ProductMatchType = Literal[
+    "internal_id",
+    "external_id",
+    "sku",
+    "barcode",
+    "name",
+    "alias",
+    "partial_name",
+    "partial_alias",
+]
+
+
+class ProductResolutionCandidate(OperationalContract):
+    """Privacy-safe catalogue identifiers offered for owner clarification."""
+
+    external_product_id: str = Field(min_length=1, max_length=128)
+    sku: str | None = Field(default=None, min_length=1, max_length=128)
+    barcode: str | None = Field(default=None, min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=255)
+
+    @field_validator("external_product_id", "sku", "barcode", "name")
+    @classmethod
+    def strip_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Product candidate fields cannot be blank.")
         return normalized
 
 
@@ -122,9 +155,36 @@ class OperationalResultMetadata(OperationalContract):
         return _validate_source_timezone(value)
 
 
+class ProductResolution(OperationalContract):
+    status: ProductResolutionStatus
+    matched_by: ProductMatchType | None = None
+    product: Product | None = None
+    candidates: tuple[ProductResolutionCandidate, ...] = Field(
+        default=(), max_length=MAX_PRODUCT_RESOLUTION_CANDIDATES
+    )
+    metadata: OperationalResultMetadata
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> ProductResolution:
+        if self.status == "resolved":
+            if self.product is None or self.matched_by is None or self.candidates:
+                raise ValueError("Resolved products require exactly one product.")
+        elif self.status == "ambiguous":
+            if self.product is not None or self.matched_by is None:
+                raise ValueError(
+                    "Ambiguous products cannot contain a selected product."
+                )
+            if len(self.candidates) < 2:
+                raise ValueError("Ambiguous products require at least two candidates.")
+        elif self.product is not None or self.matched_by is not None or self.candidates:
+            raise ValueError("Not-found products cannot contain catalogue matches.")
+        return self
+
+
 class InventoryResult(OperationalContract):
     items: tuple[InventoryItem, ...]
     metadata: OperationalResultMetadata
+    resolution: ProductResolution | None = None
 
 
 class SalesSummary(OperationalContract):
@@ -184,6 +244,7 @@ class RestockingRecommendation(OperationalContract):
 class RestockingRecommendationsResult(OperationalContract):
     items: tuple[RestockingRecommendation, ...]
     metadata: OperationalResultMetadata
+    resolution: ProductResolution | None = None
 
 
 class IntegrationHealth(OperationalContract):
@@ -215,7 +276,15 @@ class IntegrationHealth(OperationalContract):
 
 
 class InventoryQuery(OperationalContract):
-    product_filter: str | None = Field(default=None, min_length=1, max_length=80)
+    product_filter: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=80,
+        description=(
+            "Product reference extracted from the owner's question: an exact "
+            "product ID, SKU, barcode, name, or approved alias."
+        ),
+    )
     branch_external_id: str | None = Field(default=None, min_length=1, max_length=128)
     warehouse_external_id: str | None = Field(
         default=None, min_length=1, max_length=128
@@ -234,6 +303,52 @@ class InventoryQuery(OperationalContract):
 
     @model_validator(mode="after")
     def validate_location_filter(self) -> InventoryQuery:
+        if self.branch_external_id and self.warehouse_external_id:
+            raise ValueError("Filter by a branch or a warehouse, not both.")
+        return self
+
+
+class ProductResolutionQuery(OperationalContract):
+    reference: str = Field(min_length=1, max_length=80)
+    candidate_limit: int = Field(
+        default=MAX_PRODUCT_RESOLUTION_CANDIDATES,
+        ge=2,
+        le=MAX_PRODUCT_RESOLUTION_CANDIDATES,
+    )
+
+    @field_validator("reference")
+    @classmethod
+    def strip_reference(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("Product references cannot be blank.")
+        return normalized
+
+
+class InventoryReadQuery(OperationalContract):
+    """Trusted adapter query containing only an exact resolved product ID."""
+
+    external_product_id: str | None = Field(default=None, min_length=1, max_length=128)
+    branch_external_id: str | None = Field(default=None, min_length=1, max_length=128)
+    warehouse_external_id: str | None = Field(
+        default=None, min_length=1, max_length=128
+    )
+    limit: int = Field(default=50, ge=1, le=MAX_OPERATIONAL_ROWS)
+
+    @field_validator(
+        "external_product_id", "branch_external_id", "warehouse_external_id"
+    )
+    @classmethod
+    def strip_filter(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Operational filters cannot be blank.")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_location_filter(self) -> InventoryReadQuery:
         if self.branch_external_id and self.warehouse_external_id:
             raise ValueError("Filter by a branch or a warehouse, not both.")
         return self
@@ -278,4 +393,8 @@ class BestSellersQuery(SalesQuery):
 
 
 class RestockingQuery(InventoryQuery):
+    pass
+
+
+class RestockingReadQuery(InventoryReadQuery):
     pass

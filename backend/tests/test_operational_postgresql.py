@@ -11,8 +11,9 @@ import pytest
 from app.integrations.postgresql import PostgreSQLOperationalAdapter
 from app.schemas.operational import (
     BestSellersQuery,
-    InventoryQuery,
-    RestockingQuery,
+    InventoryReadQuery,
+    ProductResolutionQuery,
+    RestockingReadQuery,
     SalesQuery,
 )
 from sqlalchemy import Engine, create_engine, text
@@ -57,13 +58,116 @@ def test_fake_store_health_is_safe_and_uses_configured_metadata(
     assert health.currency == "LBP"
     assert health.data_timestamp.isoformat() == "2026-08-24T06:00:00+00:00"
     assert "password" not in health.model_dump_json()
+    assert operational_adapter.enforced_query_timeout_seconds == 2
+
+
+@pytest.mark.parametrize(
+    ("reference", "matched_by"),
+    [
+        ("3", "internal_id"),
+        ("P1003", "external_id"),
+        ("WATER-1500", "sku"),
+        ("5280001000035", "barcode"),
+        ("Nestle Pure Life Water 1.5 L", "name"),
+        ("مياه نستله", "alias"),
+        ("مي نستله", "alias"),
+        ("mayyet Nestle", "alias"),
+    ],
+)
+def test_product_resolution_exact_identifiers_names_and_aliases(
+    operational_adapter: PostgreSQLOperationalAdapter,
+    reference: str,
+    matched_by: str,
+) -> None:
+    resolution = operational_adapter.resolve_product(
+        ProductResolutionQuery(reference=reference)
+    )
+
+    assert resolution.status == "resolved"
+    assert resolution.matched_by == matched_by
+    assert resolution.product is not None
+    assert resolution.product.external_product_id == "P1003"
+    assert resolution.candidates == ()
+
+
+def test_exact_resolution_precedes_partial_and_partial_codes_do_not_match(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    exact = operational_adapter.resolve_product(
+        ProductResolutionQuery(reference="Pepsi Can 330 ml")
+    )
+    partial_code = operational_adapter.resolve_product(
+        ProductResolutionQuery(reference="P10")
+    )
+
+    assert exact.status == "resolved"
+    assert exact.matched_by == "name"
+    assert exact.product is not None
+    assert exact.product.external_product_id == "P1007"
+    assert partial_code.status == "not_found"
+
+
+def test_partial_product_name_is_ambiguous_with_bounded_safe_candidates(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    resolution = operational_adapter.resolve_product(
+        ProductResolutionQuery(reference="Pepsi", candidate_limit=2)
+    )
+
+    assert resolution.status == "ambiguous"
+    assert resolution.matched_by == "partial_name"
+    assert [candidate.external_product_id for candidate in resolution.candidates] == [
+        "P1008",
+        "P1007",
+    ]
+    assert all(
+        set(candidate.model_dump(exclude_none=True))
+        <= {"external_product_id", "sku", "barcode", "name"}
+        for candidate in resolution.candidates
+    )
+
+
+def test_unknown_product_is_explicitly_not_found(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    resolution = operational_adapter.resolve_product(
+        ProductResolutionQuery(reference="Does Not Exist")
+    )
+
+    assert resolution.status == "not_found"
+    assert resolution.product is None
+    assert resolution.candidates == ()
+
+
+def test_one_resolved_product_preserves_its_separate_inventory_locations(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    resolution = operational_adapter.resolve_product(
+        ProductResolutionQuery(reference="WATER-1500")
+    )
+    assert resolution.product is not None
+
+    inventory = operational_adapter.get_current_inventory(
+        InventoryReadQuery(
+            external_product_id=resolution.product.external_product_id, limit=10
+        )
+    )
+
+    assert len(inventory.items) == 3
+    assert {item.product.external_product_id for item in inventory.items} == {"P1003"}
+    assert {
+        item.branch_external_id or item.warehouse_external_id
+        for item in inventory.items
+    } == {"BR-BEY", "BR-JBEIL", "WH-BEY"}
 
 
 def test_product_inventory_normalization_and_valid_reservations(
     operational_adapter: PostgreSQLOperationalAdapter,
 ) -> None:
     result = operational_adapter.get_current_inventory(
-        InventoryQuery(branch_external_id="BR-BEY", product_filter="Rice", limit=10)
+        InventoryReadQuery(
+            branch_external_id="BR-BEY", external_product_id="P1001", limit=10
+        )
     )
 
     assert len(result.items) == 1
@@ -85,8 +189,8 @@ def test_expired_reservations_are_not_subtracted(
     operational_adapter: PostgreSQLOperationalAdapter,
 ) -> None:
     result = operational_adapter.get_current_inventory(
-        InventoryQuery(
-            branch_external_id="BR-BEY", product_filter="WATER-1500", limit=10
+        InventoryReadQuery(
+            branch_external_id="BR-BEY", external_product_id="P1003", limit=10
         )
     )
 
@@ -98,26 +202,22 @@ def test_inventory_branch_warehouse_isolation_and_literal_filtering(
     operational_adapter: PostgreSQLOperationalAdapter,
 ) -> None:
     branch = operational_adapter.get_current_inventory(
-        InventoryQuery(branch_external_id="BR-JBEIL", limit=100)
+        InventoryReadQuery(branch_external_id="BR-JBEIL", limit=100)
     )
     warehouse = operational_adapter.get_current_inventory(
-        InventoryQuery(warehouse_external_id="WH-BEY", limit=100)
-    )
-    literal_wildcard = operational_adapter.get_current_inventory(
-        InventoryQuery(product_filter="%", limit=100)
+        InventoryReadQuery(warehouse_external_id="WH-BEY", limit=100)
     )
 
-    assert len(branch.items) == 6
+    assert len(branch.items) == 8
     assert {item.branch_external_id for item in branch.items} == {"BR-JBEIL"}
-    assert len(warehouse.items) == 6
+    assert len(warehouse.items) == 8
     assert {item.warehouse_external_id for item in warehouse.items} == {"WH-BEY"}
-    assert literal_wildcard.items == ()
 
 
 def test_inventory_limit_is_enforced_and_reports_truncation(
     operational_adapter: PostgreSQLOperationalAdapter,
 ) -> None:
-    result = operational_adapter.get_current_inventory(InventoryQuery(limit=1))
+    result = operational_adapter.get_current_inventory(InventoryReadQuery(limit=1))
 
     assert len(result.items) == 1
     assert result.metadata.requested_limit == 1
@@ -218,7 +318,7 @@ def test_restocking_recommendations_use_available_stock_and_target(
     operational_adapter: PostgreSQLOperationalAdapter,
 ) -> None:
     result = operational_adapter.get_restocking_recommendations(
-        RestockingQuery(branch_external_id="BR-BEY", limit=100)
+        RestockingReadQuery(branch_external_id="BR-BEY", limit=100)
     )
 
     quantities = {
@@ -251,6 +351,9 @@ def test_readonly_role_has_only_required_source_access(
             )
         ).one()
         count = connection.scalar(text("SELECT count(*) FROM minimarket.catalog_items"))
+        alias_count = connection.scalar(
+            text("SELECT count(*) FROM minimarket.catalog_item_aliases")
+        )
         platform_table = connection.scalar(
             text("SELECT to_regclass('public.businesses')")
         )
@@ -263,7 +366,8 @@ def test_readonly_role_has_only_required_source_access(
 
     assert identity == ("fake_store", "sou2ai_store_reader", "on", "2s")
     assert privileges == (False, False, False, False, False)
-    assert count == 6
+    assert count == 8
+    assert alias_count == 8
     assert platform_table is None
     assert hidden == []
 
@@ -280,6 +384,7 @@ def test_readonly_role_has_only_required_source_access(
         "CREATE SCHEMA forbidden",
         "CREATE TEMP TABLE forbidden_temp (id integer)",
         "ALTER TABLE minimarket.catalog_items ADD COLUMN forbidden text",
+        "UPDATE minimarket.catalog_item_aliases SET approved = false",
         "SELECT * FROM private_internal.admin_notes",
     ],
 )
@@ -300,5 +405,5 @@ def test_denied_operations_do_not_change_source_fixture(
         )
         assert (
             connection.scalar(text("SELECT count(*) FROM minimarket.catalog_items"))
-            == 6
+            == 8
         )

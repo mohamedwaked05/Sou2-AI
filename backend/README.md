@@ -138,7 +138,9 @@ the `minimarket` schema, host port 5434, and its own persistent
 `sou2ai_fake_store_data` volume. Its deterministic fixture includes Lebanese
 minimarket products and categories, two branches, one warehouse, stock and
 reservations, completed/pending/cancelled/returned receipts, completed and ignored
-refunds, and Asia/Beirut timestamps in LBP.
+refunds, approved product aliases in English abbreviation, Arabic, Lebanese, and
+Franco-Arabic forms, and Asia/Beirut timestamps in LBP. Aliases are owned by this
+external catalogue and are not copied into Sou2AI.
 
 From the repository root:
 
@@ -163,6 +165,13 @@ counted; pending and cancelled receipts are excluded. Only completed refunds are
 subtracted at their refund timestamp. Active, unexpired reservations reduce
 available inventory, and restocking is the deterministic target-minus-available
 quantity when available stock is at or below its reorder point.
+
+Product-scoped inventory and restocking resolve exact internal/external IDs, SKU,
+barcode, normalized product name, then approved alias. Only after exact matching
+fails may the adapter return bounded partial name/alias matches. Results are
+explicitly `resolved`, `ambiguous`, or `not_found`; ambiguous candidates expose
+only name, SKU, barcode, and external product ID. A resolved product is queried by
+its stable external ID while separate branch and warehouse rows remain separate.
 
 These records are queried live and read-only. They are never copied into the
 Sou2AI platform database. The platform stores only a tenant-owned safe display
@@ -536,6 +545,12 @@ citations. Idempotent replay returns the stored assistant response without anoth
 provider call, tool execution, audit, reservation, or charge. Missing, disabled,
 unhealthy, unsupported, or unauditable sources keep the established safe
 live-data-unavailable response.
+
+The integration protocol requires each adapter to declare and enforce a
+cancellable query timeout internally. The executor checks that declaration before
+execution and keeps its elapsed-time bound as defense in depth. The PostgreSQL
+adapter applies `statement_timeout`; future HTTP or database adapters must provide
+equivalent cancellable enforcement before they can validate and activate.
 
 ## Implementation boundary
 

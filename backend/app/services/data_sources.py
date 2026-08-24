@@ -187,6 +187,13 @@ def _check_external_source(
     try:
         mapping = _mapping_for_source(snapshot, registry)
         adapter = registry.resolve(snapshot.connection_profile_key)
+        timeout_seconds = adapter.enforced_query_timeout_seconds
+        if (
+            not isinstance(timeout_seconds, int)
+            or isinstance(timeout_seconds, bool)
+            or not 1 <= timeout_seconds <= 30
+        ):
+            raise MappingProfileError("Operational source timeout is unsupported.")
         health = adapter.check_health()
         mapping.validate_health(health)
         return health, None

@@ -25,12 +25,15 @@ from app.schemas.operational import (
     BestSellingProductsResult,
     IntegrationHealth,
     InventoryItem,
-    InventoryQuery,
+    InventoryReadQuery,
     InventoryResult,
     OperationalResultMetadata,
     Product,
+    ProductResolution,
+    ProductResolutionCandidate,
+    ProductResolutionQuery,
     ReportingPeriod,
-    RestockingQuery,
+    RestockingReadQuery,
     RestockingRecommendation,
     RestockingRecommendationsResult,
     SalesQuery,
@@ -83,11 +86,8 @@ _INVENTORY_SQL = text(
            AND reservation.item_id = stock.item_id
         WHERE item.active = true
           AND (
-              CAST(:product_filter AS text) IS NULL
-              OR item.display_label ILIKE :product_filter ESCAPE '\'
-              OR item.item_code ILIKE :product_filter ESCAPE '\'
-              OR item.merchant_sku ILIKE :product_filter ESCAPE '\'
-              OR item.ean_barcode ILIKE :product_filter ESCAPE '\'
+              CAST(:external_product_id AS text) IS NULL
+              OR item.item_code = :external_product_id
           )
           AND (
               CAST(:branch_code AS text) IS NULL
@@ -116,6 +116,93 @@ _INVENTORY_SQL = text(
         location_code,
         product_name,
         external_product_id
+    LIMIT :row_limit
+    """
+)
+
+_PRODUCT_RESOLUTION_EXACT_SQL = text(
+    r"""
+    WITH matched AS (
+        SELECT
+            item.item_id,
+            item.item_code AS external_product_id,
+            item.merchant_sku AS sku,
+            item.ean_barcode AS barcode,
+            item.display_label AS product_name,
+            category.label AS category,
+            CASE
+                WHEN item.item_id::text = :reference THEN 1
+                WHEN lower(item.item_code) = :normalized_reference THEN 1
+                WHEN lower(item.merchant_sku) = :normalized_reference THEN 2
+                WHEN lower(item.ean_barcode) = :normalized_reference THEN 3
+                WHEN lower(regexp_replace(btrim(item.display_label), '\s+', ' ', 'g'))
+                    = :normalized_reference THEN 4
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM minimarket.catalog_item_aliases AS alias
+                    WHERE alias.item_id = item.item_id
+                      AND alias.approved = true
+                      AND lower(regexp_replace(btrim(alias.alias), '\s+', ' ', 'g'))
+                          = :normalized_reference
+                ) THEN 5
+            END AS match_rank,
+            CASE
+                WHEN item.item_id::text = :reference THEN 'internal_id'
+                WHEN lower(item.item_code) = :normalized_reference THEN 'external_id'
+                WHEN lower(item.merchant_sku) = :normalized_reference THEN 'sku'
+                WHEN lower(item.ean_barcode) = :normalized_reference THEN 'barcode'
+                WHEN lower(regexp_replace(btrim(item.display_label), '\s+', ' ', 'g'))
+                    = :normalized_reference THEN 'name'
+                ELSE 'alias'
+            END AS match_type
+        FROM minimarket.catalog_items AS item
+        LEFT JOIN minimarket.categories AS category
+            ON category.category_id = item.category_id
+        WHERE item.active = true
+    ), prioritized AS (
+        SELECT *, min(match_rank) OVER () AS best_rank
+        FROM matched
+        WHERE match_rank IS NOT NULL
+    )
+    SELECT *
+    FROM prioritized
+    WHERE match_rank = best_rank
+    ORDER BY product_name, external_product_id
+    LIMIT :row_limit
+    """
+)
+
+_PRODUCT_RESOLUTION_PARTIAL_SQL = text(
+    r"""
+    SELECT
+        item.item_id,
+        item.item_code AS external_product_id,
+        item.merchant_sku AS sku,
+        item.ean_barcode AS barcode,
+        item.display_label AS product_name,
+        category.label AS category,
+        CASE
+            WHEN lower(regexp_replace(btrim(item.display_label), '\s+', ' ', 'g'))
+                LIKE :partial_reference ESCAPE '\' THEN 'partial_name'
+            ELSE 'partial_alias'
+        END AS match_type
+    FROM minimarket.catalog_items AS item
+    LEFT JOIN minimarket.categories AS category
+        ON category.category_id = item.category_id
+    WHERE item.active = true
+      AND (
+          lower(regexp_replace(btrim(item.display_label), '\s+', ' ', 'g'))
+              LIKE :partial_reference ESCAPE '\'
+          OR EXISTS (
+              SELECT 1
+              FROM minimarket.catalog_item_aliases AS alias
+              WHERE alias.item_id = item.item_id
+                AND alias.approved = true
+                AND lower(regexp_replace(btrim(alias.alias), '\s+', ' ', 'g'))
+                    LIKE :partial_reference ESCAPE '\'
+          )
+      )
+    ORDER BY product_name, external_product_id
     LIMIT :row_limit
     """
 )
@@ -342,7 +429,47 @@ class PostgreSQLOperationalAdapter:
         )
         event.listen(self._engine, "connect", _reject_privileged_operational_connection)
 
-    def get_current_inventory(self, query: InventoryQuery) -> InventoryResult:
+    @property
+    def enforced_query_timeout_seconds(self) -> int:
+        return self.query_timeout_milliseconds // 1000
+
+    def resolve_product(self, query: ProductResolutionQuery) -> ProductResolution:
+        try:
+            with self._engine.connect() as connection:
+                self._prepare_read(connection)
+                source = self._source_configuration(connection)
+                normalized_reference = self._normalized_reference(query.reference)
+                rows = list(
+                    connection.execute(
+                        _PRODUCT_RESOLUTION_EXACT_SQL,
+                        {
+                            "reference": query.reference,
+                            "normalized_reference": normalized_reference,
+                            "row_limit": query.candidate_limit + 1,
+                        },
+                    ).mappings()
+                )
+                if not rows:
+                    rows = list(
+                        connection.execute(
+                            _PRODUCT_RESOLUTION_PARTIAL_SQL,
+                            {
+                                "partial_reference": self._escaped_search(
+                                    normalized_reference
+                                ),
+                                "row_limit": query.candidate_limit + 1,
+                            },
+                        ).mappings()
+                    )
+            return self._normalize_resolution(source, query, rows)
+        except (SQLAlchemyError, RuntimeError) as exc:
+            self._raise_safe_database_error(exc)
+        except ValidationError, KeyError, TypeError, ArithmeticError:
+            raise OperationalDataInvalid(
+                "Operational source data is invalid."
+            ) from None
+
+    def get_current_inventory(self, query: InventoryReadQuery) -> InventoryResult:
         try:
             with self._engine.connect() as connection:
                 self._prepare_read(connection)
@@ -457,7 +584,7 @@ class PostgreSQLOperationalAdapter:
             ) from None
 
     def get_restocking_recommendations(
-        self, query: RestockingQuery
+        self, query: RestockingReadQuery
     ) -> RestockingRecommendationsResult:
         try:
             with self._engine.connect() as connection:
@@ -531,7 +658,7 @@ class PostgreSQLOperationalAdapter:
     def _inventory_rows(
         self,
         connection: Connection,
-        query: InventoryQuery,
+        query: InventoryReadQuery,
         *,
         restock_only: bool,
     ) -> list[Mapping[str, Any]]:
@@ -539,7 +666,7 @@ class PostgreSQLOperationalAdapter:
             connection.execute(
                 _INVENTORY_SQL,
                 {
-                    "product_filter": self._escaped_search(query.product_filter),
+                    "external_product_id": query.external_product_id,
                     "branch_code": query.branch_external_id,
                     "warehouse_code": query.warehouse_external_id,
                     "restock_only": restock_only,
@@ -573,6 +700,46 @@ class PostgreSQLOperationalAdapter:
             category=row["category"],
         )
 
+    @staticmethod
+    def _normalize_candidate(row: Mapping[str, Any]) -> ProductResolutionCandidate:
+        return ProductResolutionCandidate(
+            external_product_id=row["external_product_id"],
+            sku=row["sku"],
+            barcode=row["barcode"],
+            name=row["product_name"],
+        )
+
+    @classmethod
+    def _normalize_resolution(
+        cls,
+        source: Mapping[str, Any],
+        query: ProductResolutionQuery,
+        rows: list[Mapping[str, Any]],
+    ) -> ProductResolution:
+        limited = rows[: query.candidate_limit]
+        metadata = cls._metadata(
+            source,
+            row_count=len(limited),
+            requested_limit=query.candidate_limit,
+            is_truncated=len(rows) > query.candidate_limit,
+        )
+        if not limited:
+            return ProductResolution(status="not_found", metadata=metadata)
+        match_type = limited[0]["match_type"]
+        if len(limited) == 1 and len(rows) == 1:
+            return ProductResolution(
+                status="resolved",
+                matched_by=match_type,
+                product=cls._normalize_product(limited[0]),
+                metadata=metadata,
+            )
+        return ProductResolution(
+            status="ambiguous",
+            matched_by=match_type,
+            candidates=tuple(cls._normalize_candidate(row) for row in limited),
+            metadata=metadata,
+        )
+
     @classmethod
     def _normalize_inventory(cls, row: Mapping[str, Any]) -> InventoryItem:
         is_branch = row["location_type"] == "BRANCH"
@@ -595,6 +762,10 @@ class PostgreSQLOperationalAdapter:
             return None
         escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         return f"%{escaped}%"
+
+    @staticmethod
+    def _normalized_reference(value: str) -> str:
+        return " ".join(value.casefold().split())
 
     @staticmethod
     def _metadata(

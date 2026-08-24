@@ -476,6 +476,65 @@ def _normalized_classifier_text(value: str) -> str:
     )
 
 
+def _is_product_quantity_request(value: str) -> bool:
+    """Recognize bounded stock phrasing without classifying generic quantities."""
+
+    text = _normalized_classifier_text(value).strip(" ?!.,")
+    if not text:
+        return False
+    patterns = (
+        r"\bhow many (?P<product>.+?) do we have(?: left| remaining)?\b",
+        r"\bdo we have (?P<product>.+?) (?:available|left|in stock)\b",
+        r"\bwhat is (?:the )?quantity of (?P<product>.+?)$",
+        r"\bhow much (?P<product>.+?) (?:remains?|is left)\b",
+        r"(?:قديش|كم)\s+(?:عنا\s+)?(?P<product>.+?)(?:\s+(?:باقي|ضال|ضل))?$",
+        r"هل\s+(?:المنتج\s+)?(?P<product>.+?)\s+متوفر$",
+        r"قديش\s+باقي\s+من\s+هيدا\s+المنتج$",
+        r"\b(?:adde|addeh|kam)\s+(?:3anna\s+)?(?P<product>.+?)(?:\s+ba2e)?$",
+        r"\bfi\s+(?P<product>.+?)\s+available$",
+        r"\badde\s+ba2e\s+men\s+(?P<product>.+?)$",
+    )
+    non_product_terms = {
+        "day",
+        "days",
+        "hour",
+        "hours",
+        "time",
+        "people",
+        "person",
+        "employee",
+        "employees",
+        "customer",
+        "customers",
+        "order",
+        "orders",
+        "appointment",
+        "appointments",
+        "meeting",
+        "meetings",
+        "يوم",
+        "ايام",
+        "ساعة",
+        "ساعات",
+        "موظف",
+        "موظفين",
+        "زبون",
+        "زباين",
+        "طلبات",
+        "مواعيد",
+    }
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match is None:
+            continue
+        product = match.groupdict().get("product")
+        if product is None:
+            return True
+        product_terms = set(re.findall(r"[^\W_]+", product, flags=re.UNICODE))
+        return bool(product_terms) and not product_terms <= non_product_terms
+    return False
+
+
 def _query_concepts(value: str) -> frozenset[str]:
     text = _normalized_classifier_text(value)
     patterns = {
@@ -553,11 +612,14 @@ def _query_concepts(value: str) -> frozenset[str]:
             r"\bmawa3id\b",
         ),
     }
-    return frozenset(
+    concepts = {
         concept
         for concept, concept_patterns in patterns.items()
         if any(re.search(pattern, text) for pattern in concept_patterns)
-    )
+    }
+    if _is_product_quantity_request(value):
+        concepts.add("inventory")
+    return frozenset(concepts)
 
 
 def _search_query_text(value: str) -> str:
@@ -623,7 +685,8 @@ def _is_live_operational_request(value: str) -> bool:
         r"how many|how much|best sell\w*|top sell\w*|in stock|available now)\b",
         r"(?:الحالي|الحالية|اليوم|هلق|الان|الآن|قديش|كم|الأكثر مبيعا|"
         r"الاكثر مبيعا|متوفر حاليا)",
-        r"\b(?:el yom|lyom|halla2|hala2|adde|current|latest|in stock)\b",
+        r"\b(?:el yom|lyom|halla2|hala2|adde|addeh|kam|current|latest|"
+        r"in stock|available)\b",
     )
     if any(re.search(pattern, text) for pattern in explicit_live):
         return True
@@ -1409,6 +1472,71 @@ def _operational_result_with_usage(
     )
 
 
+def _product_resolution_reply(
+    tool_results: list[ProviderToolResult],
+    message: str,
+    default_language: str,
+) -> str | None:
+    if not tool_results:
+        return None
+    resolution = tool_results[-1].output.get("resolution")
+    if not isinstance(resolution, dict):
+        return None
+    status = resolution.get("status")
+    language = _fallback_language(message, default_language)
+    if status == "not_found":
+        replies = {
+            "english": "I couldn't find that product in the live catalogue.",
+            "arabic": "لم أجد هذا المنتج في الكتالوج المباشر.",
+            "lebanese_arabic": "ما لقيت هيدا المنتج بالكاتالوغ المباشر.",
+            "franco_arabic": "Ma la2et hal product bel live catalogue.",
+            "mixed": "I couldn't find هيدا المنتج in the live catalogue.",
+        }
+        return replies[language]
+    if status != "ambiguous":
+        return None
+    raw_candidates = resolution.get("candidates")
+    if not isinstance(raw_candidates, list):
+        return None
+    labels: list[str] = []
+    for candidate in raw_candidates[:5]:
+        if not isinstance(candidate, dict) or not isinstance(
+            candidate.get("name"), str
+        ):
+            continue
+        identifiers = [
+            f"SKU {candidate['sku']}"
+            if isinstance(candidate.get("sku"), str)
+            else None,
+            f"barcode {candidate['barcode']}"
+            if isinstance(candidate.get("barcode"), str)
+            else None,
+            f"ID {candidate['external_product_id']}"
+            if isinstance(candidate.get("external_product_id"), str)
+            else None,
+        ]
+        details = ", ".join(item for item in identifiers if item is not None)
+        labels.append(
+            f"{candidate['name']} ({details})" if details else candidate["name"]
+        )
+    if not labels:
+        return None
+    candidate_text = "; ".join(labels)
+    replies = {
+        "english": (
+            f"I found several matching products: {candidate_text}. "
+            "Which one do you mean?"
+        ),
+        "arabic": f"وجدت عدة منتجات مطابقة: {candidate_text}. أي منتج تقصد؟",
+        "lebanese_arabic": f"لقيت أكتر من منتج مطابق: {candidate_text}. أي واحد قصدك؟",
+        "franco_arabic": (
+            f"La2et aktar men product: {candidate_text}. Ayya wa7ad 2asdak?"
+        ),
+        "mixed": f"I found أكتر من منتج: {candidate_text}. Which one do you mean?",
+    }
+    return replies[language]
+
+
 def _run_operational_loop(
     session: Session,
     business_id: uuid.UUID,
@@ -1453,6 +1581,21 @@ def _run_operational_loop(
                 model_identifier=result.model_identifier,
             )
         aggregate_usage = _add_usage(aggregate_usage, call_usage)
+
+        resolution_reply = _product_resolution_reply(
+            tool_results,
+            request.messages[-1].content,
+            prepared.business.default_language,
+        )
+        if resolution_reply is not None:
+            resolved_result = OwnerChatResult(
+                reply=resolution_reply,
+                usage=aggregate_usage,
+                provider_identifier=result.provider_identifier,
+                model_identifier=result.model_identifier,
+                decision="final",
+            )
+            return resolved_result, aggregate_usage
 
         if result.decision == "unavailable":
             return _operational_result_with_usage(
