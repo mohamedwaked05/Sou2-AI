@@ -112,7 +112,23 @@ it("shows the classified owner-chat provider error", async () => {
     onboarding_submitted_at: "2026-08-23T08:00:00Z",
     working_hours: [],
   });
-  vi.spyOn(api, "messages").mockResolvedValue({ items: [], next_cursor: null });
+  vi.spyOn(api, "messages")
+    .mockResolvedValueOnce({ items: [], next_cursor: null })
+    .mockResolvedValueOnce({
+      items: [
+        {
+          id: "failed-after-submit",
+          sequence_number: 1,
+          role: "owner",
+          content: "How can I stay focused?",
+          created_at: "2026-08-24T08:00:00Z",
+          reply_to_message_id: null,
+          generation_state: "failed",
+          sources: [],
+        },
+      ],
+      next_cursor: null,
+    });
   vi.spyOn(api, "send").mockRejectedValueOnce(
     new ApiError(503, "assistant_timeout", "generic error"),
   );
@@ -133,5 +149,62 @@ it("shows the classified owner-chat provider error", async () => {
     await screen.findByText(
       "The assistant took too long to respond. Please try again.",
     ),
+  ).toBeInTheDocument();
+  expect(
+    await screen.findByText("Response failed. Send a new message to try again."),
+  ).toBeInTheDocument();
+});
+
+it("renders a failed owner turn as terminal history", async () => {
+  vi.spyOn(api, "restoreSession").mockResolvedValueOnce({
+    id: "owner-1",
+    email: "owner@example.com",
+    first_name: "Maya",
+    last_name: "Haddad",
+    email_verified_at: "2026-08-23T08:00:00Z",
+    status: "ACTIVE",
+  });
+  vi.spyOn(api, "business").mockResolvedValueOnce({
+    id: "business-1",
+    name: "Maya Bakery",
+    description: "A neighborhood bakery.",
+    category: "BAKERY",
+    custom_category: null,
+    default_language: "en",
+    governorate: "Beirut",
+    district: "Beirut",
+    city: "Beirut",
+    address_line: "Hamra Street",
+    status: "ACTIVE",
+    is_active: true,
+    profile_complete: true,
+    first_incomplete_section: null,
+    onboarding_submitted_at: "2026-08-23T08:00:00Z",
+    working_hours: [],
+  });
+  vi.spyOn(api, "messages").mockResolvedValueOnce({
+    items: [
+      {
+        id: "failed-owner-message",
+        sequence_number: 1,
+        role: "owner",
+        content: "What is our return policy?",
+        created_at: "2026-08-24T08:00:00Z",
+        reply_to_message_id: null,
+        generation_state: "failed",
+        sources: [],
+      },
+    ],
+    next_cursor: null,
+  });
+
+  render(
+    <MemoryRouter initialEntries={["/businesses/business-1/chat"]}>
+      <App />
+    </MemoryRouter>,
+  );
+
+  expect(
+    await screen.findByText("Response failed. Send a new message to try again."),
   ).toBeInTheDocument();
 });

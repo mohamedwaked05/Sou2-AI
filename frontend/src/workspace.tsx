@@ -653,6 +653,7 @@ function ChatPage({ business }: { business: Business }) {
       await load();
     } catch (caught) {
       setError(ownerChatErrorMessage(caught));
+      await load();
     } finally {
       setSending(false);
     }
@@ -738,6 +739,15 @@ function Message({ message }: { message: ChatMessage }) {
       </span>
       <div>
         <div className="message-bubble">{message.content}</div>
+        {message.role === "owner" && message.generation_state === "failed" && (
+          <p role="status">Response failed. Send a new message to try again.</p>
+        )}
+        {message.role === "owner" && message.generation_state === "processing" && (
+          <p role="status">Response is being generated.</p>
+        )}
+        {message.role === "owner" && message.generation_state === "pending" && (
+          <p role="status">Response is pending.</p>
+        )}
         {message.sources.length > 0 && (
           <div className="citations">
             <strong>Sources</strong>

@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from app.database.models import (
+    ChatGenerationState,
     ChatMessageRole,
     KnowledgeCategory,
     KnowledgeKind,
@@ -59,6 +60,8 @@ class ChatMessageResponse(BaseModel):
     role: ChatMessageRole
     content: str
     created_at: datetime
+    reply_to_message_id: uuid.UUID | None
+    generation_state: ChatGenerationState | None
     sources: list[CitationResponse] = []
 
 

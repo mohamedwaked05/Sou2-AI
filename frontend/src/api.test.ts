@@ -139,6 +139,14 @@ describe("owner-chat error messages", () => {
       "assistant_invalid_response",
       "The assistant couldn't produce a usable response. Please try again.",
     ],
+    [
+      "conversation_busy",
+      "This conversation is already processing a message. Please retry shortly.",
+    ],
+    [
+      "owner_turn_failed",
+      "That message couldn't be completed. Send a new message to try again.",
+    ],
   ])("maps %s without exposing provider details", (code, expected) => {
     const error = new ApiError(503, code, "private provider response body");
 

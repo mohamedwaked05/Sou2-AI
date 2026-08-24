@@ -137,7 +137,7 @@ def test_authoritative_usage_reconciles_once_and_replay_is_not_charged_twice(
     assert len(provider.requests) == 1
 
 
-def test_insufficient_budget_blocks_before_provider_and_keeps_turn_retryable(
+def test_insufficient_budget_blocks_before_provider_and_terminalizes_turn(
     api_client: TestClient,
     db_session: Session,
     operator_engine: Engine,
@@ -155,9 +155,11 @@ def test_insufficient_budget_blocks_before_provider_and_keeps_turn_retryable(
         api_client, user, business["id"], "budget blocked", key="budget-blocked"
     )
 
-    assert blocked.status_code == repeated.status_code == 429
+    assert blocked.status_code == 429
     assert blocked.json()["error"]["code"] == "daily_ai_token_limit_reached"
     assert int(blocked.headers["retry-after"]) > 0
+    assert repeated.status_code == 409
+    assert repeated.json()["error"]["code"] == "owner_turn_failed"
     assert provider.requests == []
     with migration_engine.connect() as connection:
         assert (
@@ -365,7 +367,7 @@ def test_ollama_failure_reservation_accounting(
     assert summary.tokens_reserved == 0
 
 
-def test_reported_failure_reconciles_once_and_retry_preserves_first_charge(
+def test_reported_failure_reconciles_once_and_replay_does_not_call_provider(
     api_client: TestClient,
     db_session: Session,
     database_engine: Engine,
@@ -416,8 +418,9 @@ def test_reported_failure_reconciles_once_and_retry_preserves_first_charge(
             )
             is False
         )
-    retry = submit(api_client, user, business["id"], "retry me", key="retry-usage")
-    assert retry.status_code == 200
+    replay = submit(api_client, user, business["id"], "retry me", key="retry-usage")
+    assert replay.status_code == 409
+    assert replay.json()["error"]["code"] == "owner_turn_failed"
     with migration_engine.connect() as connection:
         reservations = connection.execute(
             text(
@@ -428,10 +431,10 @@ def test_reported_failure_reconciles_once_and_retry_preserves_first_charge(
         summary = connection.execute(
             text("SELECT * FROM business_ai_usage_daily")
         ).one()
-    assert reservations == [(1, 12, "charged"), (2, 23, "completed")]
-    assert summary.total_tokens_used == 35
+    assert reservations == [(1, 12, "charged")]
+    assert summary.total_tokens_used == 12
     assert summary.tokens_reserved == 0
-    assert calls == 2
+    assert calls == 1
 
 
 def test_complete_provider_estimate_blocks_before_invocation(

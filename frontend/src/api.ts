@@ -57,6 +57,8 @@ export interface ChatMessage {
   role: "owner" | "assistant";
   content: string;
   created_at: string;
+  reply_to_message_id: string | null;
+  generation_state: "pending" | "processing" | "completed" | "failed" | null;
   sources: {
     label: string;
     document_id: string | null;
@@ -105,6 +107,10 @@ export function ownerChatErrorMessage(error: unknown) {
       "The assistant can't be reached right now. Please try again shortly.",
     assistant_invalid_response:
       "The assistant couldn't produce a usable response. Please try again.",
+    conversation_busy:
+      "This conversation is already processing a message. Please retry shortly.",
+    owner_turn_failed:
+      "That message couldn't be completed. Send a new message to try again.",
   };
   return messages[error.code] ?? error.message;
 }

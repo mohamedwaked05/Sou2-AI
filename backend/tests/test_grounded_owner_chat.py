@@ -94,6 +94,7 @@ def test_missing_knowledge_bypasses_provider_persists_and_replays_without_usage(
         OwnerChatMessage, uuid.UUID(first_payload["owner_message"]["id"])
     )
     assert owner is not None
+    assert owner.generation_attempts == 0
     assert (
         db_session.scalar(
             select(func.count())
@@ -127,7 +128,7 @@ def test_missing_knowledge_bypasses_provider_persists_and_replays_without_usage(
                 ),
                 {"business_id": business_id},
             )
-            == 1
+            == 0
         )
 
 
@@ -278,6 +279,16 @@ def test_live_operational_turn_bypasses_all_ai_work_persists_and_replays(
             connection.scalar(
                 text(
                     "SELECT count(*) FROM business_ai_usage_daily "
+                    "WHERE business_id = :business_id"
+                ),
+                {"business_id": business_id},
+            )
+            == 0
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM owner_chat_rate_limit_events "
                     "WHERE business_id = :business_id"
                 ),
                 {"business_id": business_id},

@@ -10,7 +10,7 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from fastapi import status
 from sqlalchemy import and_, or_, select
@@ -73,6 +73,7 @@ from app.services.businesses import load_full_access_business
 
 CHAT_CONTEXT_MESSAGE_LIMIT = 12
 HISTORY_PAGE_SIZE = 50
+ABANDONED_TURN_RECOVERY_BATCH_SIZE = 100
 HIGH_CONFIDENCE_EVIDENCE_SIMILARITY = 0.65
 PROVIDER_WEEKDAYS = (
     "monday",
@@ -161,24 +162,87 @@ def _get_or_create_conversation(
     return conversation
 
 
+def _conversation_busy() -> ApplicationError:
+    return ApplicationError(
+        "This conversation is already processing a message. Please retry shortly.",
+        status_code=status.HTTP_409_CONFLICT,
+        error_code="conversation_busy",
+    )
+
+
+def _owner_turn_failed() -> ApplicationError:
+    return ApplicationError(
+        "This message could not be completed. Send a new message to try again.",
+        status_code=status.HTTP_409_CONFLICT,
+        error_code="owner_turn_failed",
+    )
+
+
+def _fail_abandoned_turns(
+    session: Session,
+    conversation_id: uuid.UUID,
+    *,
+    now: datetime,
+    stale_before: datetime,
+) -> None:
+    abandoned = session.scalars(
+        select(OwnerChatMessage)
+        .where(
+            OwnerChatMessage.conversation_id == conversation_id,
+            OwnerChatMessage.role == ChatMessageRole.OWNER,
+            or_(
+                and_(
+                    OwnerChatMessage.generation_state == ChatGenerationState.PENDING,
+                    OwnerChatMessage.created_at <= stale_before,
+                ),
+                and_(
+                    OwnerChatMessage.generation_state == ChatGenerationState.PROCESSING,
+                    OwnerChatMessage.generation_claim_expires_at <= now,
+                ),
+            ),
+        )
+        .order_by(OwnerChatMessage.sequence_number, OwnerChatMessage.id)
+        .limit(ABANDONED_TURN_RECOVERY_BATCH_SIZE)
+        .with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True)
+    ).all()
+    for message in abandoned:
+        message.generation_state = ChatGenerationState.FAILED
+        message.generation_claim_token = None
+        message.generation_claim_expires_at = None
+
+
 def _create_or_reuse_owner_message(
     session: Session,
     conversation_id: uuid.UUID,
     body: OwnerMessageRequest,
-) -> tuple[OwnerChatMessage, bool]:
+    settings: Settings,
+) -> tuple[OwnerChatMessage, bool, _Claim | None]:
     conversation = session.scalar(
         select(OwnerConversation)
         .where(OwnerConversation.id == conversation_id)
-        .with_for_update(key_share=True)
+        .with_for_update()
     )
     if conversation is None:  # pragma: no cover - business owns the conversation
         raise _provider_unavailable()
+    now = utc_now()
+    _fail_abandoned_turns(
+        session,
+        conversation_id,
+        now=now,
+        stale_before=now
+        - timedelta(seconds=settings.owner_chat_generation_lease_seconds),
+    )
     existing = session.scalar(
-        select(OwnerChatMessage).where(
+        select(OwnerChatMessage)
+        .where(
             OwnerChatMessage.conversation_id == conversation_id,
             OwnerChatMessage.idempotency_key == body.idempotency_key,
         )
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
+    replayed = existing is not None
     if existing is not None:
         if existing.content != body.content:
             session.rollback()
@@ -187,20 +251,50 @@ def _create_or_reuse_owner_message(
                 status_code=status.HTTP_409_CONFLICT,
                 error_code="idempotency_conflict",
             )
-        session.commit()
-        return existing, True
+        if existing.generation_state in {
+            ChatGenerationState.COMPLETED,
+            ChatGenerationState.FAILED,
+        }:
+            session.commit()
+            return existing, True, None
+        if existing.generation_state == ChatGenerationState.PROCESSING:
+            session.commit()
+            return existing, True, None
+    else:
+        active_claim = session.scalar(
+            select(OwnerChatMessage.id)
+            .where(
+                OwnerChatMessage.conversation_id == conversation_id,
+                OwnerChatMessage.role == ChatMessageRole.OWNER,
+                OwnerChatMessage.generation_state == ChatGenerationState.PROCESSING,
+                OwnerChatMessage.generation_claim_expires_at > now,
+            )
+            .limit(1)
+        )
+        if active_claim is not None:
+            session.commit()
+            raise _conversation_busy()
 
-    turn_number = conversation.next_turn_number
-    conversation.next_turn_number += 1
-    message = OwnerChatMessage(
-        conversation_id=conversation.id,
-        sequence_number=turn_number * 2 - 1,
-        role=ChatMessageRole.OWNER,
-        content=body.content,
-        idempotency_key=body.idempotency_key,
-        generation_state=ChatGenerationState.PENDING,
+        turn_number = conversation.next_turn_number
+        conversation.next_turn_number += 1
+        existing = OwnerChatMessage(
+            conversation_id=conversation.id,
+            sequence_number=turn_number * 2 - 1,
+            role=ChatMessageRole.OWNER,
+            content=body.content,
+            idempotency_key=body.idempotency_key,
+            generation_state=ChatGenerationState.PENDING,
+        )
+        session.add(existing)
+        session.flush()
+
+    token = uuid.uuid4()
+    existing.generation_state = ChatGenerationState.PROCESSING
+    existing.generation_claim_token = token
+    existing.generation_claim_expires_at = now + timedelta(
+        seconds=settings.owner_chat_generation_lease_seconds
     )
-    session.add(message)
+    message_id = existing.id
     try:
         session.commit()
     except IntegrityError:
@@ -219,8 +313,8 @@ def _create_or_reuse_owner_message(
                 status_code=status.HTTP_409_CONFLICT,
                 error_code="idempotency_conflict",
             ) from None
-        return raced, True
-    return message, False
+        return raced, True, None
+    return existing, replayed, _Claim(message_id=message_id, token=token)
 
 
 def _message_response(message: OwnerChatMessage) -> ChatMessageResponse:
@@ -230,6 +324,8 @@ def _message_response(message: OwnerChatMessage) -> ChatMessageResponse:
         role=message.role,
         content=message.content,
         created_at=message.created_at,
+        reply_to_message_id=message.reply_to_message_id,
+        generation_state=message.generation_state,
         sources=[
             {
                 "label": citation.label,
@@ -268,57 +364,34 @@ def _completed_turn(
     )
 
 
-def _claim_oldest_turn(
+def _admit_provider_generation(
     session: Session,
-    conversation_id: uuid.UUID,
     business_id: uuid.UUID,
-    settings: Settings,
-) -> _Claim | None:
-    session.scalar(
-        select(OwnerConversation)
-        .where(OwnerConversation.id == conversation_id)
-        .with_for_update(key_share=True)
-    )
-    now = utc_now()
-    oldest = session.scalar(
+    claim: _Claim,
+) -> int:
+    message = session.scalar(
         select(OwnerChatMessage)
         .where(
-            OwnerChatMessage.conversation_id == conversation_id,
-            OwnerChatMessage.role == ChatMessageRole.OWNER,
-            OwnerChatMessage.generation_state != ChatGenerationState.COMPLETED,
+            OwnerChatMessage.id == claim.message_id,
+            OwnerChatMessage.generation_state == ChatGenerationState.PROCESSING,
+            OwnerChatMessage.generation_claim_token == claim.token,
         )
-        .order_by(OwnerChatMessage.sequence_number, OwnerChatMessage.id)
-        .limit(1)
         .with_for_update()
         .execution_options(populate_existing=True)
     )
-    if oldest is None:
-        session.commit()
-        return None
-    if (
-        oldest.generation_state == ChatGenerationState.PROCESSING
-        and oldest.generation_claim_expires_at is not None
-        and oldest.generation_claim_expires_at > now
-    ):
-        session.commit()
-        return None
-    token = uuid.uuid4()
-    next_attempt = oldest.generation_attempts + 1
+    if message is None:
+        session.rollback()
+        raise _conversation_busy()
+    next_attempt = message.generation_attempts + 1
     admit_owner_chat_generation(
         session,
         business_id=business_id,
-        owner_message_id=oldest.id,
+        owner_message_id=message.id,
         generation_attempt=next_attempt,
     )
-    oldest.generation_state = ChatGenerationState.PROCESSING
-    oldest.generation_claim_token = token
-    oldest.generation_claim_expires_at = now + timedelta(
-        seconds=settings.owner_chat_generation_lease_seconds
-    )
-    oldest.generation_attempts = next_attempt
-    message_id = oldest.id
+    message.generation_attempts = next_attempt
     session.commit()
-    return _Claim(message_id=message_id, token=token)
+    return next_attempt
 
 
 def _cosine_similarity(left: tuple[float, ...], right: tuple[float, ...]) -> float:
@@ -660,6 +733,11 @@ def _provider_messages(
         .where(
             OwnerChatMessage.conversation_id == owner_message.conversation_id,
             OwnerChatMessage.sequence_number <= owner_message.sequence_number,
+            or_(
+                OwnerChatMessage.role == ChatMessageRole.ASSISTANT,
+                OwnerChatMessage.id == owner_message.id,
+                OwnerChatMessage.generation_state == ChatGenerationState.COMPLETED,
+            ),
         )
         .order_by(OwnerChatMessage.sequence_number.desc(), OwnerChatMessage.id.desc())
         .limit(CHAT_CONTEXT_MESSAGE_LIMIT)
@@ -1323,7 +1401,7 @@ def _undo_pre_provider_admission(
     claim: _Claim,
     generation_attempt: int,
 ) -> None:
-    """Keep budget-blocked idempotent owner turns retryable without event inflation."""
+    """Remove admission when generation never reached the provider."""
     undone = undo_owner_chat_generation_admission(
         session,
         business_id=business_id,
@@ -1500,7 +1578,8 @@ def _generate_claimed_turn(
                 request.sources,
             )
             return
-        generation_attempt = owner_message.generation_attempts
+        estimated_input_tokens = provider.estimate_input_tokens(request)
+        generation_attempt = _admit_provider_generation(session, business_id, claim)
         try:
             reservation = reserve_owner_chat_usage(
                 session,
@@ -1508,15 +1587,15 @@ def _generate_claimed_turn(
                 user=user,
                 owner_message_id=claim.message_id,
                 generation_attempt=generation_attempt,
-                estimated_input_tokens=provider.estimate_input_tokens(request),
+                estimated_input_tokens=estimated_input_tokens,
                 max_output_tokens=request.max_output_tokens,
                 lease_seconds=settings.owner_chat_generation_lease_seconds,
             )
-        except ApplicationError as exc:
-            if exc.error_code == "daily_ai_token_limit_reached":
-                _undo_pre_provider_admission(
-                    session, business_id, claim, generation_attempt
-                )
+        except Exception:
+            session.rollback()
+            _undo_pre_provider_admission(
+                session, business_id, claim, generation_attempt
+            )
             raise
         result = _validate_result(provider.generate(request), request)
         if request.mode == "conversation":
@@ -1569,6 +1648,13 @@ def _generate_claimed_turn(
         )
         raise _safe_provider_failure(exc) from None
     except ApplicationError:
+        session.rollback()
+        _mark_failed(
+            session,
+            claim,
+            reservation=reservation,
+            outcome="release" if reservation is not None else None,
+        )
         raise
     except Exception:
         session.rollback()
@@ -1607,29 +1693,19 @@ def submit_owner_message(
     provider: OwnerChatProvider,
     settings: Settings,
 ) -> OwnerTurnResponse:
-    """Persist an idempotent owner turn and process ordered generation inline."""
+    """Persist and process only the idempotent owner turn from this request."""
     _eligible_business(session, user, business_id)
     conversation = _get_or_create_conversation(session, business_id)
-    owner_message, replayed = _create_or_reuse_owner_message(
-        session, conversation.id, body
+    owner_message, replayed, claim = _create_or_reuse_owner_message(
+        session, conversation.id, body, settings
     )
     completed = _completed_turn(session, owner_message, replayed)
     if completed is not None:
         return completed
+    if owner_message.generation_state == ChatGenerationState.FAILED:
+        raise _owner_turn_failed()
 
-    deadline = time.monotonic() + settings.owner_chat_generation_wait_seconds
-    while time.monotonic() < deadline:
-        claim = _claim_oldest_turn(session, conversation.id, business_id, settings)
-        if claim is None:
-            session.expire_all()
-            refreshed = session.get(OwnerChatMessage, owner_message.id)
-            if refreshed is not None:
-                completed = _completed_turn(session, refreshed, replayed)
-                if completed is not None:
-                    return completed
-            session.rollback()
-            time.sleep(0.025)
-            continue
+    if claim is not None:
         _generate_claimed_turn(session, business_id, claim, user, provider, settings)
         session.expire_all()
         refreshed = session.get(OwnerChatMessage, owner_message.id)
@@ -1637,11 +1713,23 @@ def submit_owner_message(
             completed = _completed_turn(session, refreshed, replayed)
             if completed is not None:
                 return completed
-    raise ApplicationError(
-        "This conversation is still processing an earlier message. Please retry.",
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        error_code="generation_in_progress",
-    )
+            if refreshed.generation_state == ChatGenerationState.FAILED:
+                raise _owner_turn_failed()
+        raise _conversation_busy()
+
+    deadline = time.monotonic() + settings.owner_chat_generation_wait_seconds
+    while time.monotonic() < deadline:
+        session.expire_all()
+        refreshed = session.get(OwnerChatMessage, owner_message.id)
+        if refreshed is not None:
+            completed = _completed_turn(session, refreshed, replayed)
+            if completed is not None:
+                return completed
+            if refreshed.generation_state == ChatGenerationState.FAILED:
+                raise _owner_turn_failed()
+        session.rollback()
+        time.sleep(0.025)
+    raise _conversation_busy()
 
 
 def _encode_cursor(message: OwnerChatMessage) -> str:

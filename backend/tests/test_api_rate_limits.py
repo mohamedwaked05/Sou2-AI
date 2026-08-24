@@ -155,8 +155,10 @@ def test_owner_chat_minute_limit_and_blocked_idempotent_retry(
         key="rate-blocked",
     )
 
-    assert blocked.status_code == repeated.status_code == 429
+    assert blocked.status_code == 429
     assert blocked.json()["error"]["code"] == "owner_chat_rate_limited"
+    assert repeated.status_code == 409
+    assert repeated.json()["error"]["code"] == "owner_turn_failed"
     assert len(provider.requests) == 3
     with migration_engine.connect() as connection:
         assert (
@@ -167,7 +169,7 @@ def test_owner_chat_minute_limit_and_blocked_idempotent_retry(
         select(OwnerChatMessage).where(OwnerChatMessage.content == "blocked generation")
     ).all()
     assert len(blocked_messages) == 1
-    assert blocked_messages[0].generation_state == ChatGenerationState.PENDING
+    assert blocked_messages[0].generation_state == ChatGenerationState.FAILED
     assert (
         db_session.scalar(
             select(func.count())

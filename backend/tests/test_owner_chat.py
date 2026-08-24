@@ -18,6 +18,8 @@ from app.agent.owner_chat_provider import (
     get_owner_chat_provider,
 )
 from app.core.config import get_settings
+from app.core.exceptions import ApplicationError
+from app.core.security import utc_now
 from app.database.models import (
     BusinessKnowledge,
     ChatMessageRole,
@@ -27,6 +29,7 @@ from app.database.models import (
 )
 from app.main import app
 from app.schemas.owner_chat import OwnerMessageRequest
+from app.services import owner_chat
 from app.services.owner_chat import submit_owner_message
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, func, select, text
@@ -153,6 +156,155 @@ def test_message_persists_in_logical_order_and_is_idempotent(
     conflict = submit(api_client, user, business["id"], "Different", key="turn-1")
     assert conflict.status_code == 409
     assert conflict.json()["error"]["code"] == "idempotency_conflict"
+
+
+def test_casual_turn_isolated_from_older_abandoned_pending_backlog(
+    api_client: TestClient,
+    db_session: Session,
+    migration_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email="abandoned-backlog@example.com",
+        name="Abandoned Backlog Market",
+    )
+    conversation = db_session.scalar(
+        select(OwnerConversation).where(
+            OwnerConversation.business_id == uuid.UUID(str(business["id"]))
+        )
+    )
+    assert conversation is not None
+    stale_at = utc_now() - timedelta(minutes=10)
+    stale_messages = [
+        OwnerChatMessage(
+            conversation_id=conversation.id,
+            sequence_number=index * 2 + 1,
+            role=ChatMessageRole.OWNER,
+            content=f"abandoned question {index}",
+            idempotency_key=f"abandoned-{index}",
+            generation_state="pending",
+            created_at=stale_at,
+        )
+        for index in range(3)
+    ]
+    conversation.next_turn_number = 4
+    db_session.add_all(stale_messages)
+    db_session.commit()
+
+    def unexpected_retrieval(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("retrieval called for a casual turn")
+
+    monkeypatch.setattr(owner_chat, "retrieve", unexpected_retrieval)
+    monkeypatch.setattr(owner_chat, "create_embedding_provider", unexpected_retrieval)
+    provider = CapturingProvider()
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "hi",
+        key="isolated-casual-turn",
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["owner_message"]["sequence_number"] == 7
+    assert payload["owner_message"]["generation_state"] == "completed"
+    assert payload["assistant_message"]["sequence_number"] == 8
+    assert (
+        payload["assistant_message"]["reply_to_message_id"]
+        == payload["owner_message"]["id"]
+    )
+    assert provider.requests == []
+    db_session.expire_all()
+    assert all(message.generation_state == "failed" for message in stale_messages)
+    assert all(message.generation_attempts == 0 for message in stale_messages)
+    completed_owner = db_session.get(
+        OwnerChatMessage, uuid.UUID(payload["owner_message"]["id"])
+    )
+    assert completed_owner is not None
+    assert completed_owner.generation_attempts == 0
+    assistants = db_session.scalars(
+        select(OwnerChatMessage).where(
+            OwnerChatMessage.role == ChatMessageRole.ASSISTANT
+        )
+    ).all()
+    assert len(assistants) == 1
+    assert assistants[0].reply_to_message_id == uuid.UUID(
+        payload["owner_message"]["id"]
+    )
+    with migration_engine.connect() as connection:
+        assert (
+            connection.scalar(text("SELECT count(*) FROM ai_usage_reservations")) == 0
+        )
+        assert (
+            connection.scalar(text("SELECT count(*) FROM business_ai_usage_daily")) == 0
+        )
+        assert (
+            connection.scalar(text("SELECT count(*) FROM owner_chat_rate_limit_events"))
+            == 0
+        )
+
+
+def test_active_claim_rejects_new_turn_and_expired_claim_is_failed(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email="claim-recovery@example.com",
+        name="Claim Recovery Market",
+    )
+    conversation = db_session.scalar(
+        select(OwnerConversation).where(
+            OwnerConversation.business_id == uuid.UUID(str(business["id"]))
+        )
+    )
+    assert conversation is not None
+    claimed = OwnerChatMessage(
+        conversation_id=conversation.id,
+        sequence_number=1,
+        role=ChatMessageRole.OWNER,
+        content="active provider work",
+        idempotency_key="active-claim",
+        generation_state="processing",
+        generation_claim_token=uuid.uuid4(),
+        generation_claim_expires_at=utc_now() + timedelta(minutes=2),
+    )
+    conversation.next_turn_number = 2
+    db_session.add(claimed)
+    db_session.commit()
+
+    busy = submit(api_client, user, business["id"], "hi", key="busy-new-turn")
+    assert busy.status_code == 409
+    assert busy.json()["error"]["code"] == "conversation_busy"
+    assert db_session.scalar(select(func.count()).select_from(OwnerChatMessage)) == 1
+
+    claimed.generation_claim_expires_at = utc_now() - timedelta(seconds=1)
+    db_session.commit()
+    recovered = submit(api_client, user, business["id"], "hi", key="after-expiry")
+    assert recovered.status_code == 200
+    db_session.expire_all()
+    assert claimed.generation_state == "failed"
+    assert claimed.generation_claim_token is None
+    assert claimed.generation_claim_expires_at is None
+    expired_replay = submit(
+        api_client,
+        user,
+        business["id"],
+        "active provider work",
+        key="active-claim",
+    )
+    assert expired_replay.status_code == 409
+    assert expired_replay.json()["error"]["code"] == "owner_turn_failed"
+    messages = db_session.scalars(
+        select(OwnerChatMessage).order_by(OwnerChatMessage.sequence_number)
+    ).all()
+    assert [message.sequence_number for message in messages] == [1, 3, 4]
+    assert messages[2].reply_to_message_id == messages[1].id
 
 
 @pytest.mark.parametrize(
@@ -302,7 +454,7 @@ def test_database_rejects_assistant_message_above_14000_characters(
         db_session.commit()
 
 
-def test_provider_failure_keeps_one_owner_message_and_retry_reuses_it(
+def test_provider_failure_is_terminal_and_later_casual_turn_succeeds(
     api_client: TestClient, db_session: Session
 ) -> None:
     user, business = active_business(api_client, db_session)
@@ -313,11 +465,26 @@ def test_provider_failure_keeps_one_owner_message_and_retry_reuses_it(
     messages = db_session.scalars(select(OwnerChatMessage)).all()
     assert len(messages) == 1
     assert messages[0].role == ChatMessageRole.OWNER
+    assert messages[0].generation_state == "failed"
 
-    app.dependency_overrides[get_owner_chat_provider] = lambda: CapturingProvider()
-    retried = submit(api_client, user, business["id"], "Please remember this")
-    assert retried.status_code == 200
-    assert db_session.scalar(select(func.count()).select_from(OwnerChatMessage)) == 2
+    replacement = CapturingProvider()
+    app.dependency_overrides[get_owner_chat_provider] = lambda: replacement
+    replay = submit(api_client, user, business["id"], "Please remember this")
+    assert replay.status_code == 409
+    assert replay.json()["error"]["code"] == "owner_turn_failed"
+    assert replacement.requests == []
+
+    later = submit(api_client, user, business["id"], "hi", key="after-failure")
+    assert later.status_code == 200
+    assert replacement.requests == []
+    payload = later.json()
+    assert payload["owner_message"]["sequence_number"] == 3
+    assert payload["assistant_message"]["sequence_number"] == 4
+    assert (
+        payload["assistant_message"]["reply_to_message_id"]
+        == payload["owner_message"]["id"]
+    )
+    assert db_session.scalar(select(func.count()).select_from(OwnerChatMessage)) == 3
 
 
 def test_ollama_connection_failure_is_safe_and_retry_is_idempotent(
@@ -352,11 +519,12 @@ def test_ollama_connection_failure_is_safe_and_retry_is_idempotent(
     assert messages[0].role == ChatMessageRole.OWNER
 
     app.dependency_overrides[get_owner_chat_provider] = lambda: CapturingProvider()
-    retried = submit(
+    replayed = submit(
         api_client, user, business["id"], "Use the local model", key="ollama-retry"
     )
-    assert retried.status_code == 200
-    assert db_session.scalar(select(func.count()).select_from(OwnerChatMessage)) == 2
+    assert replayed.status_code == 409
+    assert replayed.json()["error"]["code"] == "owner_turn_failed"
+    assert db_session.scalar(select(func.count()).select_from(OwnerChatMessage)) == 1
 
 
 def test_mocked_ollama_answers_saturday_hours_from_business_schedule(
@@ -718,9 +886,10 @@ def test_assistant_persistence_failure_never_returns_unsaved_reply(
                 )
             )
 
-    retried = submit(api_client, user, business["id"], "Persist this safely")
-    assert retried.status_code == 200
-    assert db_session.scalar(select(func.count()).select_from(OwnerChatMessage)) == 2
+    replayed = submit(api_client, user, business["id"], "Persist this safely")
+    assert replayed.status_code == 409
+    assert replayed.json()["error"]["code"] == "owner_turn_failed"
+    assert db_session.scalar(select(func.count()).select_from(OwnerChatMessage)) == 1
 
 
 class OrderedBlockingProvider:
@@ -743,7 +912,7 @@ class OrderedBlockingProvider:
         return OwnerChatResult(reply=f"ordered-reply-{call_number}")
 
 
-def test_simultaneous_same_conversation_turns_generate_in_order(
+def test_simultaneous_different_turn_is_busy_without_creating_backlog(
     api_client: TestClient, db_session: Session, database_engine: Engine
 ) -> None:
     user, business = active_business(api_client, db_session)
@@ -772,14 +941,20 @@ def test_simultaneous_same_conversation_turns_generate_in_order(
         time.sleep(0.1)
         provider.release_first.set()
         first_result = first.result(timeout=10)
-        second_result = second.result(timeout=10)
+        with pytest.raises(ApplicationError) as busy:
+            second.result(timeout=10)
 
     assert first_result.assistant_message.content == "ordered-reply-1"
-    assert second_result.assistant_message.content == "ordered-reply-2"
-    assert len(provider.requests) == 2
+    assert busy.value.error_code == "conversation_busy"
+    assert len(provider.requests) == 1
     assert [message.content for message in provider.requests[0].messages] == [
         "first concurrent owner"
     ]
+    assert db_session.scalar(select(func.count()).select_from(OwnerChatMessage)) == 2
+
+    second_result = attempt("concurrent-2", "second concurrent owner")
+    assert second_result.assistant_message.content == "ordered-reply-2"
+    assert len(provider.requests) == 2
     assert [message.content for message in provider.requests[1].messages] == [
         "first concurrent owner",
         "ordered-reply-1",
@@ -789,6 +964,8 @@ def test_simultaneous_same_conversation_turns_generate_in_order(
         select(OwnerChatMessage).order_by(OwnerChatMessage.sequence_number)
     ).all()
     assert [message.sequence_number for message in messages] == [1, 2, 3, 4]
+    assert messages[1].reply_to_message_id == messages[0].id
+    assert messages[3].reply_to_message_id == messages[2].id
 
 
 class ParallelBusinessProvider:
