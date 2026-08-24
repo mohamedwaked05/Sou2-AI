@@ -15,6 +15,7 @@ from app.agent.owner_chat_provider import (
     OwnerChatRequest,
     OwnerChatResult,
     ProposedKnowledge,
+    TokenUsage,
     get_owner_chat_provider,
 )
 from app.core.config import get_settings
@@ -158,6 +159,105 @@ def test_message_persists_in_logical_order_and_is_idempotent(
     assert conflict.json()["error"]["code"] == "idempotency_conflict"
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "hi",
+        "مرحبا، كيف حالك؟",
+        "شو الوضع",
+        "شو الأخبار",
+        "كيفك",
+        "kifak",
+        "sho lwade3",
+        "hi كيفك اليوم?",
+    ],
+)
+def test_multilingual_casual_conversation_uses_one_provider_call_without_rag(
+    api_client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"casual-{uuid.uuid4()}@example.com",
+    )
+
+    def unexpected_rag(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("casual conversation must not retrieve or embed")
+
+    monkeypatch.setattr(owner_chat, "retrieve", unexpected_rag)
+    monkeypatch.setattr(owner_chat, "create_embedding_provider", unexpected_rag)
+    provider = CapturingProvider(
+        OwnerChatResult(reply="A natural mocked conversational reply.")
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        message,
+        key="multilingual-casual",
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["assistant_message"]["content"] == (
+        "A natural mocked conversational reply."
+    )
+    assert payload["assistant_message"]["sources"] == []
+    assert len(provider.requests) == 1
+    request = provider.requests[0]
+    assert request.mode == "conversation"
+    assert request.knowledge == ()
+    assert request.sources == ()
+    assert request.messages[-1].content == message
+
+
+def test_conversation_provider_business_signal_uses_missing_information_fallback(
+    api_client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email="conversation-business-signal@example.com",
+    )
+
+    def unexpected_rag(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("the conversational route must not retrieve or embed")
+
+    monkeypatch.setattr(owner_chat, "retrieve", unexpected_rag)
+    monkeypatch.setattr(owner_chat, "create_embedding_provider", unexpected_rag)
+    provider = CapturingProvider(
+        OwnerChatResult(
+            reply="It is blue.",
+            requires_business_knowledge=True,
+        )
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "What colors does it come in?",
+        key="provider-business-signal",
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["assistant_message"]["content"] == (
+        "I don't have information about that yet. You can add it to your business "
+        "profile or knowledge base, and I'll be able to help."
+    )
+    assert response.json()["assistant_message"]["sources"] == []
+    assert len(provider.requests) == 1
+    assert provider.requests[0].mode == "conversation"
+
+
 def test_casual_turn_isolated_from_older_abandoned_pending_backlog(
     api_client: TestClient,
     db_session: Session,
@@ -198,7 +298,14 @@ def test_casual_turn_isolated_from_older_abandoned_pending_backlog(
 
     monkeypatch.setattr(owner_chat, "retrieve", unexpected_retrieval)
     monkeypatch.setattr(owner_chat, "create_embedding_provider", unexpected_retrieval)
-    provider = CapturingProvider()
+    provider = CapturingProvider(
+        OwnerChatResult(
+            reply="Hi! Nice to hear from you.",
+            usage=TokenUsage(12, 7, 19, True),
+            provider_identifier="test-provider",
+            model_identifier="test-model",
+        )
+    )
     app.dependency_overrides[get_owner_chat_provider] = lambda: provider
 
     response = submit(
@@ -218,7 +325,24 @@ def test_casual_turn_isolated_from_older_abandoned_pending_backlog(
         payload["assistant_message"]["reply_to_message_id"]
         == payload["owner_message"]["id"]
     )
-    assert provider.requests == []
+    assert len(provider.requests) == 1
+    assert provider.requests[0].mode == "conversation"
+    assert provider.requests[0].sources == ()
+    assert provider.requests[0].knowledge == ()
+    assert [message.content for message in provider.requests[0].messages] == ["hi"]
+    replay = submit(
+        api_client,
+        user,
+        business["id"],
+        "hi",
+        key="isolated-casual-turn",
+    )
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    assert (
+        replay.json()["assistant_message"]["id"] == payload["assistant_message"]["id"]
+    )
+    assert len(provider.requests) == 1
     db_session.expire_all()
     assert all(message.generation_state == "failed" for message in stale_messages)
     assert all(message.generation_attempts == 0 for message in stale_messages)
@@ -226,7 +350,7 @@ def test_casual_turn_isolated_from_older_abandoned_pending_backlog(
         OwnerChatMessage, uuid.UUID(payload["owner_message"]["id"])
     )
     assert completed_owner is not None
-    assert completed_owner.generation_attempts == 0
+    assert completed_owner.generation_attempts == 1
     assistants = db_session.scalars(
         select(OwnerChatMessage).where(
             OwnerChatMessage.role == ChatMessageRole.ASSISTANT
@@ -237,15 +361,23 @@ def test_casual_turn_isolated_from_older_abandoned_pending_backlog(
         payload["owner_message"]["id"]
     )
     with migration_engine.connect() as connection:
-        assert (
-            connection.scalar(text("SELECT count(*) FROM ai_usage_reservations")) == 0
-        )
-        assert (
-            connection.scalar(text("SELECT count(*) FROM business_ai_usage_daily")) == 0
-        )
+        reservation = connection.execute(
+            text(
+                "SELECT status, input_tokens, output_tokens, total_tokens "
+                "FROM ai_usage_reservations"
+            )
+        ).one()
+        assert tuple(reservation) == ("completed", 12, 7, 19)
+        usage = connection.execute(
+            text(
+                "SELECT input_tokens_used, output_tokens_used, total_tokens_used "
+                "FROM business_ai_usage_daily"
+            )
+        ).one()
+        assert tuple(usage) == (12, 7, 19)
         assert (
             connection.scalar(text("SELECT count(*) FROM owner_chat_rate_limit_events"))
-            == 0
+            == 1
         )
 
 
@@ -476,7 +608,9 @@ def test_provider_failure_is_terminal_and_later_casual_turn_succeeds(
 
     later = submit(api_client, user, business["id"], "hi", key="after-failure")
     assert later.status_code == 200
-    assert replacement.requests == []
+    assert len(replacement.requests) == 1
+    assert replacement.requests[0].mode == "conversation"
+    assert [message.content for message in replacement.requests[0].messages] == ["hi"]
     payload = later.json()
     assert payload["owner_message"]["sequence_number"] == 3
     assert payload["assistant_message"]["sequence_number"] == 4
@@ -643,13 +777,13 @@ def test_context_uses_latest_twelve_messages_and_excludes_expired_knowledge(
     app.dependency_overrides[get_owner_chat_provider] = lambda: provider
 
     response = submit(
-        api_client, user, business_id, "newest-owner-message", key="new-turn"
+        api_client, user, business_id, "What is our return policy?", key="new-turn"
     )
     assert response.status_code == 200, response.text
     request = provider.requests[0]
     assert len(request.messages) == 12
     assert request.messages[0].content == "message-4"
-    assert request.messages[-1].content == "newest-owner-message"
+    assert request.messages[-1].content == "What is our return policy?"
     assert [fact.subject_key for fact in request.knowledge] == ["return_policy"]
 
 
@@ -815,7 +949,9 @@ def test_invalid_provider_facts_are_ignored_without_losing_reply(
         )
     )
     app.dependency_overrides[get_owner_chat_provider] = lambda: provider
-    response = submit(api_client, user, business["id"], "Test invalid proposals")
+    response = submit(
+        api_client, user, business["id"], "What is our business description?"
+    )
     assert response.status_code == 200
     assert response.json()["assistant_message"]["content"] == "Safe answer."
     assert db_session.scalar(select(func.count()).select_from(BusinessKnowledge)) == 0

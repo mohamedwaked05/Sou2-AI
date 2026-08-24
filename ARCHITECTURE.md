@@ -117,12 +117,15 @@ value or polarity, the final answer must identify the conflict, ask for
 clarification, and cite exactly every involved source; ordinary complementary
 sources do not trigger that path.
 
-Owner chat routes each claimed turn in a fixed order: unavailable live operations,
-simple localized casual conversation, business questions with trusted evidence,
-general conversation or advice, then business-specific missing knowledge. Simple
-casual replies bypass embeddings and generation. General advice uses the same
-provider boundary in a context-isolated conversation mode with no business
-profile, knowledge, source citations, or permission to invent business facts.
+Owner chat routes each claimed turn in a fixed order: unavailable live operations;
+clearly business-related questions, which use tenant-scoped trusted profile and
+retrieval evidence or the localized missing-information fallback; then casual or
+general conversation. Conversational turns use one provider call through the same
+provider-neutral boundary in a context-isolated mode with no retrieval, embeddings,
+business profile payload, knowledge, sources, citations, or permission to invent
+business or live operational facts. The structured conversational result can signal
+that business knowledge is actually required; orchestration then discards its reply
+and persists the deterministic localized missing-information fallback.
 
 ## 8. Platform data versus operational business data
 
@@ -321,11 +324,12 @@ persistence, accepted knowledge upserts, and completion commit atomically.
 Different conversations do not block one another. Redis, queues, workers, sticky
 sessions, and process-local locks are not used.
 
-The provider boundary accepts a provider-neutral business profile with all seven
-working days and ordered local-time shifts, bounded active knowledge, retrieved
-sources, ordered messages, and request time. It returns a reply, structured
-proposed facts, and citation labels. The deterministic offline mock remains the
-default.
+The provider boundary accepts a provider-neutral mode plus ordered messages and
+request time. Grounded mode also carries the business profile, all seven working
+days and ordered local-time shifts, bounded active knowledge, and retrieved sources;
+it returns a reply, proposed facts, and citation labels. Conversation mode omits
+that business context and returns a reply plus a boolean business-knowledge signal.
+The deterministic offline mock remains the default.
 The optional local Ollama implementation sends one non-streaming `/api/chat`
 request to configurable `qwen2.5:7b`, validates its JSON-schema response, and maps
 timeouts, missing models, unavailability, HTTP failures, and invalid output to the
@@ -429,10 +433,10 @@ permits five attempts per normalized email/hour, 30 per client IP/15 minutes, an
 100 per client IP/24 hours. Owner generation permits three attempts/business/minute
 and 20/business/hour. Registration admission happens before password hashing or
 email delivery. Owner-generation admission happens only after deterministic
-casual, live-data-unavailable, and missing-evidence routing, immediately before a
-provider-backed reservation and call. Blocked or failed idempotent replays reuse
-one terminal owner message and create no assistant, provider call, duplicate rate
-event, or token charge.
+live-data-unavailable and missing-evidence routing, immediately before any grounded
+or conversational provider-backed reservation and call. Blocked or failed
+idempotent replays reuse one terminal owner message and create no assistant,
+provider call, duplicate rate event, or token charge.
 
 The restricted runtime cannot directly select or mutate rate-event tables.
 Fixed-search-path, migrator-owned security-definer functions perform admission

@@ -9,7 +9,6 @@ from app.agent.owner_chat_provider import (
     OwnerChatProviderUnavailable,
     OwnerChatRequest,
     OwnerChatResult,
-    ProposedKnowledge,
 )
 from app.database.models import BusinessKnowledge, OwnerChatMessage
 from app.rag.embeddings import EmbeddingResult
@@ -47,7 +46,7 @@ class _FailingChatProvider:
 
 
 @pytest.mark.parametrize(
-    ("language", "intent", "message"),
+    ("_language", "_intent", "message"),
     [
         ("english", "greeting", "Hello!"),
         ("english", "thanks", "Thank you"),
@@ -76,18 +75,13 @@ class _FailingChatProvider:
         ("mixed", "goodbye", "bye باي"),
     ],
 )
-def test_simple_casual_intents_are_localized(
-    language: str, intent: str, message: str
+def test_ordinary_casual_phrases_do_not_require_business_evidence(
+    _language: str, _intent: str, message: str
 ) -> None:
-    assert owner_chat._casual_intent(message) == intent
-    reply = owner_chat._casual_reply(message, "en", intent)
-    has_arabic = any("\u0600" <= character <= "\u06ff" for character in reply)
-
-    assert reply
-    assert has_arabic is (language in {"arabic", "lebanese_arabic", "mixed"})
+    assert owner_chat._requires_business_evidence(message) is False
 
 
-def test_casual_turn_bypasses_ai_persists_and_replays_without_usage(
+def test_casual_turn_uses_provider_once_and_replays_without_duplicate_usage(
     api_client,
     db_session: Session,
     migration_engine: Engine,
@@ -96,7 +90,7 @@ def test_casual_turn_bypasses_ai_persists_and_replays_without_usage(
     user, business = active_business(
         api_client, db_session, email="casual-routing@example.com"
     )
-    provider = CapturingProvider(OwnerChatResult(reply="must not run"))
+    provider = CapturingProvider(OwnerChatResult(reply="Hello! How are things?"))
     monkeypatch.setattr(
         owner_chat,
         "create_embedding_provider",
@@ -113,13 +107,15 @@ def test_casual_turn_bypasses_ai_persists_and_replays_without_usage(
 
     assert first.status_code == replay.status_code == 200
     payload = first.json()
-    assert payload["assistant_message"]["content"] == "Hi! How can I help?"
+    assert payload["assistant_message"]["content"] == "Hello! How are things?"
     assert payload["assistant_message"]["sources"] == []
     assert (
         replay.json()["assistant_message"]["id"] == payload["assistant_message"]["id"]
     )
     assert replay.json()["replayed"] is True
-    assert provider.requests == []
+    assert len(provider.requests) == 1
+    assert provider.requests[0].mode == "conversation"
+    assert provider.requests[0].knowledge == provider.requests[0].sources == ()
     owner = db_session.get(OwnerChatMessage, uuid.UUID(payload["owner_message"]["id"]))
     assert owner is not None
     assert (
@@ -146,7 +142,14 @@ def test_casual_turn_bypasses_ai_persists_and_replays_without_usage(
             ),
             {"business_id": business_id},
         )
-    assert reservations == usage == 0
+        rate_events = connection.scalar(
+            text(
+                "SELECT count(*) FROM owner_chat_rate_limit_events "
+                "WHERE business_id = :business_id"
+            ),
+            {"business_id": business_id},
+        )
+    assert reservations == usage == rate_events == 1
 
 
 def test_live_request_has_priority_over_greeting(
@@ -255,17 +258,7 @@ def test_general_advice_uses_conversation_mode_without_rag_or_citations(
         api_client, db_session, email="general-advice@example.com"
     )
     provider = CapturingProvider(
-        OwnerChatResult(
-            reply="Break the goal into small, measurable steps.",
-            proposed_knowledge=(
-                ProposedKnowledge(
-                    subject_key="unsafe_advice_memory",
-                    content="Do not persist general advice.",
-                    kind="permanent",
-                    category="preference",
-                ),
-            ),
-        )
+        OwnerChatResult(reply="Break the goal into small, measurable steps.")
     )
     monkeypatch.setattr(
         owner_chat,

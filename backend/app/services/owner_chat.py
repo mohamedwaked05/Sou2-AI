@@ -1020,138 +1020,26 @@ def _fallback_language(message: str, default_language: str) -> str:
     return "arabic" if default_language == "ar" else "english"
 
 
-def _casual_intent(message: str) -> str | None:
-    normalized = _normalized_classifier_text(message)
-    text = " ".join(
-        part for part in re.split(r"[\W_]+", normalized, flags=re.UNICODE) if part
+def _requires_business_evidence(value: str) -> bool:
+    if _query_concepts(value):
+        return True
+    if _is_general_conversation_request(value):
+        return False
+    text = _normalized_classifier_text(value)
+    patterns = (
+        r"\b(?:our|my) (?:business|store|shop|company|products?|services?|"
+        r"prices?|polic(?:y|ies)|hours|location|address)\b",
+        r"\b(?:do|can) you (?:sell|offer|provide|repair|carry|deliver|accept|"
+        r"stock|make)\b",
+        r"\b(?:what|which) (?:products?|services?|payment methods?|"
+        r"polic(?:y|ies))\b",
+        r"\b(?:product|service|price|cost|payment|catalog|menu)\b",
+        r"(?:عندكم|عنا|بتبيعوا|تبيعون|بتعملوا|بتقدموا|تقدمون|"
+        r"محل(?:نا|كم)?|نشاط(?:نا|كم)?|خدمة|منتج|سعر|دفع|سياسة)",
+        r"\b(?:3endkon|3anna|btbi3o|bta3mlo|bte?2addmo|ma7al|khedme|"
+        r"muntaj|se3er|daf3|siyese|policy)\b",
     )
-    phrases = {
-        "greeting": {
-            "hi",
-            "hello",
-            "hey",
-            "good morning",
-            "good evening",
-            "مرحبا",
-            "اهلا",
-            "اهلين",
-            "السلام عليكم",
-            "صباح الخير",
-            "مساء الخير",
-            "marhaba",
-            "ahla",
-            "ahlein",
-            "salam",
-            "saba7 el kheir",
-            "hi مرحبا",
-            "hello مرحبا",
-        },
-        "thanks": {
-            "thanks",
-            "thank you",
-            "many thanks",
-            "شكرا",
-            "مشكور",
-            "يسلمو",
-            "مرسي",
-            "merci",
-            "shukran",
-            "chokran",
-            "thanks شكرا",
-        },
-        "acknowledgement": {
-            "ok",
-            "okay",
-            "got it",
-            "sounds good",
-            "great",
-            "yes",
-            "حسنا",
-            "تمام",
-            "موافق",
-            "فهمت",
-            "اي",
-            "ايوه",
-            "tamam",
-            "fhemet",
-            "eh",
-            "okay تمام",
-        },
-        "wellbeing": {
-            "how are you",
-            "how is it going",
-            "hows it going",
-            "كيف حالك",
-            "كيفك",
-            "شو الاخبار",
-            "kifak",
-            "kifik",
-            "shu el akhbar",
-            "hi how are you",
-            "مرحبا كيفك",
-            "hi كيفك",
-        },
-        "goodbye": {
-            "bye",
-            "goodbye",
-            "see you",
-            "talk later",
-            "مع السلامة",
-            "الى اللقاء",
-            "باي",
-            "يلا باي",
-            "bye bye",
-            "yalla bye",
-            "bshoufak",
-            "bshoufik",
-            "bye باي",
-        },
-    }
-    return next(
-        (intent for intent, options in phrases.items() if text in options), None
-    )
-
-
-def _casual_reply(message: str, default_language: str, intent: str) -> str:
-    language = _fallback_language(message, default_language)
-    replies = {
-        "english": {
-            "greeting": "Hi! How can I help?",
-            "thanks": "You're welcome!",
-            "acknowledgement": "Got it.",
-            "wellbeing": "I'm doing well, thanks! How can I help?",
-            "goodbye": "Goodbye! Talk soon.",
-        },
-        "arabic": {
-            "greeting": "مرحباً! كيف يمكنني مساعدتك؟",
-            "thanks": "على الرحب والسعة!",
-            "acknowledgement": "حسناً، فهمت.",
-            "wellbeing": "أنا بخير، شكراً! كيف يمكنني مساعدتك؟",
-            "goodbye": "إلى اللقاء!",
-        },
-        "lebanese_arabic": {
-            "greeting": "أهلين! كيف فيني ساعدك؟",
-            "thanks": "أهلا وسهلا!",
-            "acknowledgement": "تمام، فهمت.",
-            "wellbeing": "منيح، شكراً! كيف فيني ساعدك؟",
-            "goodbye": "يلا باي، بشوفك!",
-        },
-        "franco_arabic": {
-            "greeting": "Ahlein! Kif fine se3dak?",
-            "thanks": "Ahla w sahla!",
-            "acknowledgement": "Tamam, fhemet.",
-            "wellbeing": "Mnih, merci! Kif fine se3dak?",
-            "goodbye": "Yalla bye, bshoufak!",
-        },
-        "mixed": {
-            "greeting": "Hi! كيف فيني help?",
-            "thanks": "You're welcome، أهلا وسهلا!",
-            "acknowledgement": "Got it، تمام.",
-            "wellbeing": "I'm doing well، شكراً! كيف فيني help?",
-            "goodbye": "Goodbye، يلا باي!",
-        },
-    }
-    return replies[language][intent]
+    return any(re.search(pattern, text) for pattern in patterns)
 
 
 def _missing_knowledge_reply(message: str, default_language: str) -> str:
@@ -1433,6 +1321,14 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
         raise OwnerChatProviderInvalidResponse
     if result.usage is not None and result.usage.output_tokens < 0:
         raise OwnerChatProviderInvalidResponse
+    if not isinstance(result.requires_business_knowledge, bool):
+        raise OwnerChatProviderInvalidResponse
+    if request.mode == "conversation" and (
+        result.proposed_knowledge or result.cited_source_ids
+    ):
+        raise OwnerChatProviderInvalidResponse(reason="invalid_conversation_response")
+    if request.mode == "grounded" and result.requires_business_knowledge:
+        raise OwnerChatProviderInvalidResponse(reason="invalid_grounded_response")
     labels = {source.label for source in request.sources}
     if (
         not isinstance(result.cited_source_ids, tuple)
@@ -1540,24 +1436,13 @@ def _generate_claimed_turn(
             )
             _persist_result(session, business_id, claim, live_result, None, None, ())
             return
-        casual_intent = _casual_intent(owner_message.content)
-        if casual_intent is not None:
-            casual_result = OwnerChatResult(
-                reply=_casual_reply(
-                    owner_message.content,
-                    business.default_language,
-                    casual_intent,
-                )
-            )
-            _persist_result(session, business_id, claim, casual_result, None, None, ())
-            return
-        if _is_general_conversation_request(owner_message.content):
-            prepared = _build_conversation_request(
-                session, business_id, claim.message_id, settings
-            )
-        else:
+        if _requires_business_evidence(owner_message.content):
             prepared = _build_provider_request(
                 session, user, business_id, claim.message_id, settings
+            )
+        else:
+            prepared = _build_conversation_request(
+                session, business_id, claim.message_id, settings
             )
         request = prepared.request
         business = prepared.business
@@ -1600,7 +1485,13 @@ def _generate_claimed_turn(
         result = _validate_result(provider.generate(request), request)
         if request.mode == "conversation":
             result = OwnerChatResult(
-                reply=result.reply,
+                reply=(
+                    _missing_knowledge_reply(
+                        request.messages[-1].content, business.default_language
+                    )
+                    if result.requires_business_knowledge
+                    else result.reply
+                ),
                 usage=result.usage,
                 provider_identifier=result.provider_identifier,
                 model_identifier=result.model_identifier,

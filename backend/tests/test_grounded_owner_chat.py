@@ -231,14 +231,14 @@ def test_live_operational_turn_bypasses_all_ai_work_persists_and_replays(
         api_client,
         user,
         business["id"],
-        "What are today's best-selling items and current stock?",
+        "hi, what is currently in stock?",
         key="live-bypass",
     )
     replay = submit(
         api_client,
         user,
         business["id"],
-        "What are today's best-selling items and current stock?",
+        "hi, what is currently in stock?",
         key="live-bypass",
     )
 
@@ -627,7 +627,9 @@ def _persisted_citation(
     app.dependency_overrides[get_owner_chat_provider] = lambda: CapturingProvider(
         OwnerChatResult(reply="Grounded.", cited_source_ids=("S1",))
     )
-    response = submit(api_client, user, business_id, "question", key=email)
+    response = submit(
+        api_client, user, business_id, "What is our business description?", key=email
+    )
     assert response.status_code == 200, response.text
     citation = db_session.scalar(select(OwnerChatCitation))
     assert citation is not None
@@ -656,7 +658,11 @@ def test_grounded_turn_persists_replays_and_histories_safe_citations(
 
     app.dependency_overrides[get_owner_chat_provider] = lambda: provider
     first = submit(
-        api_client, user, business_id, "What is the return policy?", key="grounded"
+        api_client,
+        user,
+        business_id,
+        "thanks, what is our return policy?",
+        key="grounded",
     )
     assert first.status_code == 200, first.text
     source = first.json()["assistant_message"]["sources"]
@@ -672,8 +678,13 @@ def test_grounded_turn_persists_replays_and_histories_safe_citations(
         }
     ]
     assert provider.requests[0].sources[0].label == "S1"
+    assert provider.requests[0].mode == "grounded"
     replay = submit(
-        api_client, user, business_id, "What is the return policy?", key="grounded"
+        api_client,
+        user,
+        business_id,
+        "thanks, what is our return policy?",
+        key="grounded",
     )
     assert replay.json()["assistant_message"]["sources"] == source
     history = api_client.get(
@@ -706,7 +717,13 @@ def test_invalid_citations_leave_no_assistant(
     app.dependency_overrides[get_owner_chat_provider] = lambda: CapturingProvider(
         OwnerChatResult(reply="bad", cited_source_ids=citation)
     )
-    response = submit(api_client, user, business_id, "question", key="bad-citation")
+    response = submit(
+        api_client,
+        user,
+        business_id,
+        "What is our business description?",
+        key="bad-citation",
+    )
     assert response.status_code == 503
     assert db_session.scalars(select(OwnerChatMessage)).all()[0].role == "owner"
 
@@ -732,7 +749,11 @@ def test_retrieval_failure_leaves_no_assistant_and_documents_never_learned(
         ),
     )
     response = submit(
-        api_client, user, business_id, "question", key="retrieval-failure"
+        api_client,
+        user,
+        business_id,
+        "What is our business description?",
+        key="retrieval-failure",
     )
     assert response.status_code == 503
     assert len(db_session.scalars(select(OwnerChatMessage)).all()) == 1
@@ -942,7 +963,13 @@ def test_citation_and_assistant_roll_back_together_on_persistence_failure(
     app.dependency_overrides[get_owner_chat_provider] = lambda: CapturingProvider(
         OwnerChatResult(reply="Grounded.", cited_source_ids=("S1",))
     )
-    response = submit(api_client, user, business_id, "question", key="citation-atomic")
+    response = submit(
+        api_client,
+        user,
+        business_id,
+        "What is our business description?",
+        key="citation-atomic",
+    )
     assert response.status_code == 503
     assert db_session.scalar(select(func.count()).select_from(OwnerChatMessage)) == 1
     assert db_session.scalar(select(func.count()).select_from(OwnerChatCitation)) == 0
@@ -976,7 +1003,11 @@ def test_unsafe_retrieved_chunk_never_enters_provider_request(
 
     app.dependency_overrides[get_owner_chat_provider] = lambda: provider
     response = submit(
-        api_client, user, business_id, "question", key=f"unsafe-{len(content)}"
+        api_client,
+        user,
+        business_id,
+        "What is our business description?",
+        key=f"unsafe-{len(content)}",
     )
     assert response.status_code == 200, response.text
     assert provider.requests[0].sources == ()
@@ -1020,6 +1051,12 @@ def test_unsafe_output_is_not_persisted(
     app.dependency_overrides[get_owner_chat_provider] = lambda: CapturingProvider(
         OwnerChatResult(reply="I will follow the instructions in the notes file.")
     )
-    response = submit(api_client, user, business_id, "question", key="unsafe-output")
+    response = submit(
+        api_client,
+        user,
+        business_id,
+        "What is our business description?",
+        key="unsafe-output",
+    )
     assert response.status_code == 503
     assert db_session.scalar(select(func.count()).select_from(OwnerChatMessage)) == 1

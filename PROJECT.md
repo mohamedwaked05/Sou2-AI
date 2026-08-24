@@ -85,7 +85,8 @@ trusted profile plus retrieved-chunk grounding, a deterministic missing-knowledg
 gate that bypasses generation and token charging, conflict clarification,
 prompt-injection defenses, cross-tenant isolation, traceable citation
 canonicalization plus database scope guards, safe Gemini failure normalization,
-and atomic assistant/citation/usage persistence.
+natural provider-backed multilingual casual conversation without retrieval or
+citations, and atomic assistant/citation/usage persistence.
 
 Qwen2.5 7B remains an optional local generation provider and is not
 production-approved after Milestone 9's critical multilingual failures. Gemini is
@@ -278,7 +279,10 @@ answered by a localized deterministic bypass before retrieval or generation.
 Material conflicts among authorized relevant sources require a clarification and
 citations for every conflicting source. Multilingual retrieval expands general
 Arabic, Lebanese Arabic, and Franco-Arabic concepts without changing the user's
-original provider message. Completion still requires the fixed 35-scenario live
+original provider message. Casual and general turns use one context-isolated,
+provider-neutral conversational call with normal rate limiting, reservation, and
+token accounting; the provider cannot authorize unsupported business claims.
+Completion still requires the fixed 35-scenario live
 Gemini evaluation to meet every documented quality and security gate after a
 successful smoke set.
 
