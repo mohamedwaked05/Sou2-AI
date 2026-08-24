@@ -124,6 +124,31 @@ class OperationalDataSourceStatus(StrEnum):
     DISABLED = "DISABLED"
 
 
+class MessagingConnectionStatus(StrEnum):
+    CONFIGURED = "CONFIGURED"
+    VALIDATED = "VALIDATED"
+    ACTIVE = "ACTIVE"
+    UNHEALTHY = "UNHEALTHY"
+    DISABLED = "DISABLED"
+
+
+class CustomerConversationState(StrEnum):
+    AI_ACTIVE = "AI_ACTIVE"
+    HUMAN_HANDOFF = "HUMAN_HANDOFF"
+
+
+class CustomerMessageStatus(StrEnum):
+    RECEIVED = "RECEIVED"
+    PROCESSING = "PROCESSING"
+    COMPLETED = "COMPLETED"
+    PENDING_SEND = "PENDING_SEND"
+    SENDING = "SENDING"
+    SENT = "SENT"
+    DELIVERED = "DELIVERED"
+    READ = "READ"
+    FAILED = "FAILED"
+
+
 account_status_enum = ENUM(
     AccountStatus,
     name="account_status",
@@ -579,6 +604,12 @@ class Business(Base):
     operational_data_sources: Mapped[list[OperationalDataSourceConfig]] = relationship(
         back_populates="business", cascade="all, delete-orphan", passive_deletes=True
     )
+    messaging_connections: Mapped[list[MessagingChannelConnection]] = relationship(
+        back_populates="business", cascade="all, delete-orphan", passive_deletes=True
+    )
+    customer_conversations: Mapped[list[CustomerConversation]] = relationship(
+        back_populates="business", cascade="all, delete-orphan", passive_deletes=True
+    )
 
     @property
     def is_active(self) -> bool:
@@ -871,6 +902,11 @@ class AIUsageReservation(Base):
             "generation_attempt",
             name="uq_ai_reservation_summary_attempt",
         ),
+        UniqueConstraint(
+            "customer_message_id",
+            "generation_attempt",
+            name="uq_ai_reservation_customer_message_attempt",
+        ),
         CheckConstraint(
             "channel IN ('owner', 'customer', 'whatsapp', 'system')",
             name="ck_ai_reservation_channel",
@@ -878,9 +914,13 @@ class AIUsageReservation(Base):
         CheckConstraint(
             "(capability = 'conversation_summary' AND "
             "conversation_summary_id IS NOT NULL AND owner_message_id IS NULL "
+            "AND customer_message_id IS NULL "
             "AND channel = 'system') OR "
-            "(capability <> 'conversation_summary' "
-            "AND conversation_summary_id IS NULL)",
+            "(capability = 'customer_chat' AND customer_message_id IS NOT NULL "
+            "AND owner_message_id IS NULL AND conversation_summary_id IS NULL "
+            "AND channel = 'whatsapp') OR "
+            "(capability NOT IN ('conversation_summary', 'customer_chat') "
+            "AND conversation_summary_id IS NULL AND customer_message_id IS NULL)",
             name="ck_ai_reservation_subject",
         ),
         CheckConstraint(
@@ -943,6 +983,9 @@ class AIUsageReservation(Base):
     )
     conversation_summary_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("owner_conversation_summaries.id", ondelete="SET NULL")
+    )
+    customer_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("customer_messages.id", ondelete="SET NULL")
     )
     generation_attempt: Mapped[int] = mapped_column(Integer, nullable=False)
     channel: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -1437,6 +1480,9 @@ class BusinessKnowledge(Base):
     source_message_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("owner_chat_messages.id", ondelete="SET NULL")
     )
+    customer_visible: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1600,6 +1646,299 @@ class OperationalDataSourceConfig(Base):
         return " ".join(value.split())
 
 
+class MessagingChannelConnection(Base):
+    """Tenant-owned, non-secret configuration for an external channel."""
+
+    __tablename__ = "messaging_channel_connections"
+    __table_args__ = (
+        CheckConstraint("provider_type = 'meta_whatsapp'", name="ck_channel_provider"),
+        CheckConstraint(
+            "connection_profile_key = 'meta_whatsapp_cloud'",
+            name="ck_channel_profile",
+        ),
+        CheckConstraint(
+            "char_length(btrim(display_name)) BETWEEN 2 AND 120",
+            name="ck_channel_display_name",
+        ),
+        CheckConstraint(
+            "status IN ('CONFIGURED','VALIDATED','ACTIVE','UNHEALTHY','DISABLED')",
+            name="ck_channel_status",
+        ),
+        CheckConstraint(
+            "failure_code IS NULL OR (char_length(failure_code) BETWEEN 1 AND 100 "
+            "AND failure_code ~ '^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)*$')",
+            name="ck_channel_failure_code",
+        ),
+        UniqueConstraint("id", "business_id", name="uq_channel_id_business"),
+        UniqueConstraint(
+            "external_phone_number_id", name="uq_channel_external_phone_number"
+        ),
+        Index("ix_channel_business_created", "business_id", "created_at", "id"),
+        Index(
+            "uq_channel_active_provider",
+            "business_id",
+            "provider_type",
+            unique=True,
+            postgresql_where=text("status = 'ACTIVE'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    provider_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    connection_profile_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    external_phone_number_id: Mapped[str | None] = mapped_column(String(100))
+    status: Mapped[MessagingConnectionStatus] = mapped_column(
+        String(20), nullable=False, default=MessagingConnectionStatus.CONFIGURED
+    )
+    auto_reply_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    last_validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_successful_health_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    failure_code: Mapped[str | None] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    business: Mapped[Business] = relationship(back_populates="messaging_connections")
+    customer_conversations: Mapped[list[CustomerConversation]] = relationship(
+        back_populates="connection",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        overlaps="business,customer_conversations",
+    )
+
+
+class CustomerConversation(Base):
+    """One privacy-protected customer thread for an external channel."""
+
+    __tablename__ = "customer_conversations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["connection_id", "business_id"],
+            [
+                "messaging_channel_connections.id",
+                "messaging_channel_connections.business_id",
+            ],
+            name="fk_customer_conversation_channel_scope",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "state IN ('AI_ACTIVE','HUMAN_HANDOFF')",
+            name="ck_customer_conversation_state",
+        ),
+        CheckConstraint(
+            "customer_identity_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_customer_identity_hash",
+        ),
+        CheckConstraint(
+            "char_length(btrim(masked_customer_label)) BETWEEN 3 AND 40",
+            name="ck_customer_masked_label",
+        ),
+        UniqueConstraint("id", "business_id", name="uq_customer_conversation_scope"),
+        UniqueConstraint(
+            "connection_id", "customer_identity_hash", name="uq_customer_identity"
+        ),
+        Index(
+            "ix_customer_conversation_activity",
+            "business_id",
+            "state",
+            text("last_message_at DESC NULLS LAST"),
+            "id",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    connection_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    customer_identity_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    encrypted_customer_identity: Mapped[str] = mapped_column(Text, nullable=False)
+    masked_customer_label: Mapped[str] = mapped_column(String(40), nullable=False)
+    state: Mapped[CustomerConversationState] = mapped_column(
+        String(20), nullable=False, default=CustomerConversationState.AI_ACTIVE
+    )
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    business: Mapped[Business] = relationship(
+        back_populates="customer_conversations",
+        overlaps="connection,customer_conversations",
+    )
+    connection: Mapped[MessagingChannelConnection] = relationship(
+        back_populates="customer_conversations",
+        overlaps="business,customer_conversations",
+    )
+    messages: Mapped[list[CustomerMessage]] = relationship(
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class CustomerMessage(Base):
+    """A normalized inbound or persisted-outbox customer message."""
+
+    __tablename__ = "customer_messages"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["conversation_id", "business_id"],
+            ["customer_conversations.id", "customer_conversations.business_id"],
+            name="fk_customer_message_conversation_scope",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "direction IN ('inbound','outbound')", name="ck_customer_message_direction"
+        ),
+        CheckConstraint(
+            "sender IN ('customer','ai','owner')", name="ck_customer_message_sender"
+        ),
+        CheckConstraint(
+            "status IN ('RECEIVED','PROCESSING','COMPLETED','PENDING_SEND','SENDING',"
+            "'SENT','DELIVERED','READ','FAILED')",
+            name="ck_customer_message_status",
+        ),
+        CheckConstraint(
+            "char_length(btrim(content)) BETWEEN 1 AND 4000",
+            name="ck_customer_message_content",
+        ),
+        CheckConstraint(
+            "send_attempts BETWEEN 0 AND 3", name="ck_customer_send_attempts"
+        ),
+        CheckConstraint(
+            "failure_code IS NULL OR failure_code ~ '^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)*$'",
+            name="ck_customer_message_failure_code",
+        ),
+        UniqueConstraint("provider_message_id", name="uq_customer_provider_message"),
+        UniqueConstraint("reply_to_message_id", name="uq_customer_reply_once"),
+        Index("ix_customer_messages_history", "conversation_id", "created_at", "id"),
+        Index("ix_customer_messages_outbox", "status", "next_attempt_at", "id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False
+    )
+    direction: Mapped[str] = mapped_column(String(10), nullable=False)
+    sender: Mapped[str] = mapped_column(String(10), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[CustomerMessageStatus] = mapped_column(String(20), nullable=False)
+    provider_message_id: Mapped[str | None] = mapped_column(String(200))
+    reply_to_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("customer_messages.id", ondelete="SET NULL")
+    )
+    send_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failure_code: Mapped[str | None] = mapped_column(String(100))
+    provider_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    conversation: Mapped[CustomerConversation] = relationship(back_populates="messages")
+
+
+class InboundWebhookDelivery(Base):
+    """Deduplication record containing no raw webhook content."""
+
+    __tablename__ = "inbound_webhook_deliveries"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('QUEUED','PROCESSED','IGNORED','FAILED')",
+            name="ck_webhook_delivery_status",
+        ),
+        UniqueConstraint("provider_event_id", name="uq_webhook_provider_event"),
+        Index("ix_webhook_connection_received", "connection_id", "received_at", "id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    connection_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messaging_channel_connections.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    provider_event_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    event_kind: Mapped[str] = mapped_column(String(30), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    customer_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("customer_messages.id", ondelete="SET NULL")
+    )
+    failure_code: Mapped[str | None] = mapped_column(String(100))
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class CustomerGenerationRateEvent(Base):
+    """One admission marker per unique inbound customer generation."""
+
+    __tablename__ = "customer_generation_rate_events"
+    __table_args__ = (
+        UniqueConstraint("customer_message_id", name="uq_customer_rate_message"),
+        Index("ix_customer_rate_business_created", "business_id", "created_at"),
+        Index("ix_customer_rate_conversation_created", "conversation_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("customer_conversations.id", ondelete="CASCADE"), nullable=False
+    )
+    customer_message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("customer_messages.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class KnowledgeDocument(Base):
     """Tenant-owned uploaded-document metadata, separate from owner-chat facts."""
 
@@ -1712,6 +2051,9 @@ class KnowledgeDocument(Base):
     )
     processing_attempts: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
+    )
+    customer_visible: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

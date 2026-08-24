@@ -117,6 +117,7 @@ class KnowledgeResponse(BaseModel):
     source_message_id: uuid.UUID | None
     created_at: datetime
     updated_at: datetime
+    customer_visible: bool
 
 
 class KnowledgeUpdateRequest(BaseModel):
@@ -127,6 +128,7 @@ class KnowledgeUpdateRequest(BaseModel):
     kind: KnowledgeKind | None = None
     category: KnowledgeCategory | None = None
     expires_at: datetime | None = None
+    customer_visible: bool | None = None
 
     @field_validator("subject_key")
     @classmethod

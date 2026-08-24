@@ -21,3 +21,9 @@ class KnowledgeDocumentResponse(BaseModel):
     processing_completed_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    customer_visible: bool
+
+
+class KnowledgeDocumentVisibilityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    customer_visible: bool

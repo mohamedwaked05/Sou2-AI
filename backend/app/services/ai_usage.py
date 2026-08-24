@@ -14,7 +14,12 @@ from sqlalchemy.orm import Session
 from app.agent.owner_chat_provider import TokenUsage
 from app.core.exceptions import ApplicationError
 from app.core.security import utc_now
-from app.database.models import Business, OwnerConversationSummary, User
+from app.database.models import (
+    Business,
+    CustomerMessage,
+    OwnerConversationSummary,
+    User,
+)
 from app.schemas.ai_usage import CurrentAIUsageResponse
 from app.services.businesses import load_full_access_business
 
@@ -109,6 +114,40 @@ def reserve_conversation_summary_usage(
             {
                 "summary_id": summary.id,
                 "claim_token": claim_token,
+                "estimated_input": estimated_input_tokens,
+                "max_output": max_output_tokens,
+                "lease_seconds": lease_seconds,
+            },
+        ).one()
+        session.commit()
+    except DBAPIError as exc:
+        session.rollback()
+        if "daily_ai_token_limit_reached" in str(exc.orig):
+            raise _daily_limit_error(window_end) from None
+        raise
+    return AIUsageReservationClaim(id=row.reservation_id, reset_at=row.reset_at)
+
+
+def reserve_customer_message_usage(
+    session: Session,
+    *,
+    message: CustomerMessage,
+    estimated_input_tokens: int,
+    max_output_tokens: int,
+    lease_seconds: int,
+) -> AIUsageReservationClaim:
+    business = session.get(Business, message.business_id)
+    if business is None:
+        raise RuntimeError("Customer message business is unavailable.")
+    _, window_end = business_local_day_window(business)
+    try:
+        row = session.execute(
+            text(
+                "SELECT * FROM public.sou2ai_reserve_customer_message_usage("
+                ":message_id, :estimated_input, :max_output, :lease_seconds)"
+            ),
+            {
+                "message_id": message.id,
                 "estimated_input": estimated_input_tokens,
                 "max_output": max_output_tokens,
                 "lease_seconds": lease_seconds,

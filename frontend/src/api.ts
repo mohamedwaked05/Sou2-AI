@@ -49,6 +49,7 @@ export interface Document {
   page_count: number | null;
   created_at: string;
   updated_at: string;
+  customer_visible: boolean;
 }
 
 export interface ChatMessage {
@@ -139,6 +140,55 @@ export interface DataSource {
   last_successful_health_check_at: string | null;
   failure_code: string | null;
   capabilities: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export type WhatsAppConnectionStatus =
+  "CONFIGURED" | "VALIDATED" | "ACTIVE" | "UNHEALTHY" | "DISABLED";
+
+export interface WhatsAppConnection {
+  id: string;
+  display_name: string;
+  provider_type: "meta_whatsapp";
+  connection_profile_key: "meta_whatsapp_cloud";
+  status: WhatsAppConnectionStatus;
+  auto_reply_enabled: boolean;
+  last_validated_at: string | null;
+  last_successful_health_check_at: string | null;
+  failure_code: string | null;
+  capabilities: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CustomerConversation {
+  id: string;
+  masked_customer_label: string;
+  state: "AI_ACTIVE" | "HUMAN_HANDOFF";
+  last_message_at: string | null;
+  latest_message_preview: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CustomerMessage {
+  id: string;
+  direction: "inbound" | "outbound";
+  sender: "customer" | "ai" | "owner";
+  content: string;
+  status:
+    | "RECEIVED"
+    | "PROCESSING"
+    | "COMPLETED"
+    | "PENDING_SEND"
+    | "SENDING"
+    | "SENT"
+    | "DELIVERED"
+    | "READ"
+    | "FAILED";
+  reply_to_message_id: string | null;
+  failure_code: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -382,6 +432,15 @@ export const api = {
     request<void>(`/businesses/${business}/knowledge/documents/${document}`, {
       method: "DELETE",
     }),
+  setDocumentCustomerVisibility: (
+    business: string,
+    document: string,
+    customerVisible: boolean,
+  ) =>
+    request<Document>(
+      `/businesses/${business}/knowledge/documents/${document}/customer-visibility`,
+      { method: "PATCH", ...json({ customer_visible: customerVisible }) },
+    ),
   dataSourceProfiles: (business: string) =>
     request<ConnectionProfile[]>(
       `/businesses/${business}/data-sources/available-profiles`,
@@ -417,6 +476,68 @@ export const api = {
     request<DataSource>(`/businesses/${business}/data-sources/${source}/disable`, {
       method: "POST",
     }),
+  whatsAppConnections: (business: string) =>
+    request<WhatsAppConnection[]>(`/businesses/${business}/channels/whatsapp`),
+  configureWhatsApp: (business: string, displayName: string) =>
+    request<WhatsAppConnection>(`/businesses/${business}/channels/whatsapp`, {
+      method: "POST",
+      ...json({
+        display_name: displayName,
+        connection_profile_key: "meta_whatsapp_cloud",
+      }),
+    }),
+  validateWhatsApp: (business: string, connection: string) =>
+    request<WhatsAppConnection>(
+      `/businesses/${business}/channels/whatsapp/${connection}/validate`,
+      { method: "POST" },
+    ),
+  activateWhatsApp: (business: string, connection: string) =>
+    request<WhatsAppConnection>(
+      `/businesses/${business}/channels/whatsapp/${connection}/activate`,
+      { method: "POST" },
+    ),
+  checkWhatsApp: (business: string, connection: string) =>
+    request<WhatsAppConnection>(
+      `/businesses/${business}/channels/whatsapp/${connection}/health`,
+      { method: "POST" },
+    ),
+  disableWhatsApp: (business: string, connection: string) =>
+    request<WhatsAppConnection>(
+      `/businesses/${business}/channels/whatsapp/${connection}/disable`,
+      { method: "POST" },
+    ),
+  setWhatsAppAutoReply: (business: string, connection: string, enabled: boolean) =>
+    request<WhatsAppConnection>(
+      `/businesses/${business}/channels/whatsapp/${connection}/auto-reply`,
+      { method: "PATCH", ...json({ enabled }) },
+    ),
+  customerConversations: (business: string, cursor?: string) => {
+    const suffix = cursor ? `?${new URLSearchParams({ cursor }).toString()}` : "";
+    return request<{ items: CustomerConversation[]; next_cursor: string | null }>(
+      `/businesses/${business}/channels/whatsapp/conversations${suffix}`,
+    );
+  },
+  customerMessages: (business: string, conversation: string, cursor?: string) => {
+    const suffix = cursor ? `?${new URLSearchParams({ cursor }).toString()}` : "";
+    return request<{ items: CustomerMessage[]; next_cursor: string | null }>(
+      `/businesses/${business}/channels/whatsapp/conversations/${conversation}/messages${suffix}`,
+    );
+  },
+  handoffCustomerConversation: (business: string, conversation: string) =>
+    request<CustomerConversation>(
+      `/businesses/${business}/channels/whatsapp/conversations/${conversation}/handoff`,
+      { method: "POST" },
+    ),
+  resumeCustomerConversation: (business: string, conversation: string) =>
+    request<CustomerConversation>(
+      `/businesses/${business}/channels/whatsapp/conversations/${conversation}/resume`,
+      { method: "POST" },
+    ),
+  sendCustomerReply: (business: string, conversation: string, content: string) =>
+    request<CustomerMessage>(
+      `/businesses/${business}/channels/whatsapp/conversations/${conversation}/messages`,
+      { method: "POST", ...json({ content, confirmed: true }) },
+    ),
 };
 
 export function resetApiSessionForTests() {
