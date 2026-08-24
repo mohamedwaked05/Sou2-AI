@@ -73,7 +73,7 @@ Testing and quality:
 
 ## Current status
 
-Milestones 1–13 and 15 are implemented. The repository includes the authenticated
+Milestones 1–13, 15, and 16 are implemented. The repository includes the authenticated
 PostgreSQL platform, tenant lifecycle and AI-budget controls, private document
 storage and processing, pgvector with local BGE-M3 embeddings, tenant-authorized
 retrieval, replaceable mock/Ollama/Gemini generation providers, grounded owner
@@ -90,9 +90,9 @@ citations, and atomic assistant/citation/usage persistence.
 
 Qwen2.5 7B remains an optional local generation provider and is not
 production-approved after Milestone 9's critical multilingual failures. Gemini is
-implemented for grounded-chat development evaluation. Milestone 16 Part 1's
-provider-neutral operational contracts and read-only PostgreSQL adapter are
-implemented; connection management remains in Milestone 16 and agent tool calling
+implemented for grounded-chat development evaluation. Milestone 16's
+provider-neutral contracts, read-only PostgreSQL adapter, tenant connection
+lifecycle, management API, and Data Sources UI are implemented. Agent tool calling
 remains future Milestone 17. Customer channels, WhatsApp, and unrelated later
 roadmap work are also not implemented.
 
@@ -322,7 +322,7 @@ and truthful future-feature states. The business profile persists the selected
 default language; Alembic revision `20260822_05` restores the database and API
 completion invariant.
 
-### Milestone 16: In Progress — Controlled operational integrations
+### Milestone 16: Complete — Controlled operational integrations
 
 * Define stable Sou2AI operational contracts for products, inventory, sales, best-seller rankings, and restocking recommendations.
 * Build a separate fake PostgreSQL store database with realistic Lebanese minimarket products, stock, sales, and restocking rules.
@@ -344,8 +344,13 @@ PostgreSQL adapter against a separate deterministic Lebanese minimarket database
 Inventory stays reservation-aware; sales and refunds use source-local reporting
 boundaries; rankings and restocking are deterministic. The source is queried live
 and its operational records are not copied into the Sou2AI platform database.
-Connection management, API/UI work, tenant activation, and agent tool calling are
-not part of Part 1, so Milestone 16 remains In Progress.
+Part 2 adds tenant-scoped, non-secret source configuration, deployment-managed
+allowlisted connection profiles, a versioned semantic mapping, validated lifecycle
+transitions, safe management APIs, and the responsive Data Sources interface. The
+platform persists only profile/mapping keys and privacy-minimal lifecycle metadata;
+credentials and operational records remain outside Sou2AI. Milestone 16 is
+complete. Connecting approved operations to the assistant is separate future
+Milestone 17 work and has not started.
 
 ### Milestone 17: Agent tool calling
 

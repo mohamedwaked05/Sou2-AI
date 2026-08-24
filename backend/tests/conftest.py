@@ -120,6 +120,7 @@ def db_session(database_engine: Engine, migration_engine: Engine) -> Generator[S
                 "email_verification_tokens, refresh_sessions, tool_call_logs, "
                 "ai_usage_reservations, business_ai_usage_daily, "
                 "business_ai_allowance_audit, business_ai_allowance_configs, "
+                "operational_data_sources, "
                 "business_lifecycle_history, knowledge_document_chunks, "
                 "knowledge_documents, business_knowledge, owner_chat_messages, "
                 "owner_conversations, "

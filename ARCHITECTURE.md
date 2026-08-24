@@ -31,9 +31,9 @@ flowchart TD
     LLM --> QWEN[Optional Qwen2.5 7B through Ollama]
 ```
 
-The Milestone 16 Part 1 operational adapter is backend-only and has no route or
-agent caller. Connection management remains in Milestone 16, and agent tool
-calling remains future Milestone 17.
+Milestone 16 adds authenticated management routes for tenant-owned, non-secret
+connection metadata and a Data Sources UI. It does not expose adapter query
+operations to an agent; controlled tool calling remains future Milestone 17.
 
 ## 3. Runtime components
 
@@ -77,8 +77,8 @@ tools, and memory services remain future milestones.
 
 `/api/v1/health` reports API health status.
 
-Business, authentication, document, owner-chat, citation, and usage APIs are under
-`/api/v1`.
+Business, authentication, document, owner-chat, citation, usage, and operational
+data-source management APIs are under `/api/v1`.
 
 ## 6. RAG ingestion flow
 
@@ -136,8 +136,9 @@ Sou2AI PostgreSQL stores data the platform owns: users, business profiles,
 memberships, weekly opening hours, owner chat, learned stable facts, and minimal
 tool-call audit metadata. Products,
 inventory, orders, sales, revenue, customers, appointments, and billing remain in
-the business's source system. The Milestone 16 Part 1 PostgreSQL adapter proves a
-read-only integration boundary against a separate demonstration source. Future
+the business's source system. The Milestone 16 PostgreSQL adapter proves a
+read-only integration boundary against a separate demonstration source. The
+platform persists only tenant-owned profile keys and lifecycle metadata. Future
 controlled tools may use that boundary or other approved API/database adapters.
 This avoids stale copies and preserves the business's source of truth.
 
@@ -149,7 +150,22 @@ semantics, statement timeouts, safe errors, and a dedicated unprivileged login.
 Active unexpired reservations reduce available stock. Restocking recommends the
 trusted arithmetic difference between target and available stock only when
 available stock is at or below the reorder point. No model, route, or tool can
-submit SQL, inspect the source schema, or receive its credentials in Part 1.
+submit SQL, inspect the source schema, or receive its credentials.
+
+The public management API accepts only the allowlisted connection profile key and
+versioned mapping profile key. The environment-backed registry resolves the safe
+key to credentials inside the process and can later be replaced by a secret
+manager without changing the API. Mapping validation covers completed/excluded
+sale statuses, refunds, active reservations, location meaning, quantities,
+revenue, currency, timezone, and required capabilities before activation.
+
+The `operational_data_sources` platform table contains no operational records or
+secrets. Its tenant foreign key, immutable scope/profile trigger, constrained
+lifecycle, runtime column grants, and partial unique active-source index enforce
+ownership and race-safe activation. External health checks occur before taking the
+final platform row lock; the service rejects an update if configuration changed in
+the meantime. Management states are `CONFIGURED`, `VALIDATED`, `ACTIVE`,
+`UNHEALTHY`, and `DISABLED`.
 
 Unstructured RAG data is stored separately and covers approved documents such as
 policies, descriptions, warranties, FAQs, and business notes.
@@ -557,9 +573,9 @@ optional local Ollama generation providers, managed permanent/temporary learned
 knowledge, pgvector/BGE-M3 retrieval, private document ingestion and processing,
 grounded answers with persisted citations, PostgreSQL-backed API limits and AI
 budgets, the HTTP/logging security boundary, the React business interface, and
-Milestone 16 Part 1's provider-neutral read-only operational contracts plus fake
-store PostgreSQL adapter. Connection management and API/UI integration remain in
-Milestone 16; controlled agent tool calling remains future Milestone 17;
+Milestone 16's provider-neutral contracts, fake-store PostgreSQL adapter,
+tenant-scoped lifecycle API, and responsive Data Sources UI. Controlled agent tool
+calling remains future Milestone 17;
 customer chat, WhatsApp, billing, and activation/admin APIs also remain future
 work.
 

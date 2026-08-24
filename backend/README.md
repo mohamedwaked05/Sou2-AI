@@ -9,10 +9,10 @@ Milestone 14 is in progress. It adds tenant-scoped grounded owner-chat retrieval
 safe persisted citations, and Gemini development generation through the existing
 replaceable provider boundary. Local Ollama `bge-m3` remains the embedding model.
 
-Milestone 16 is also in progress. Part 1 adds strict provider-neutral operational
-contracts and a predefined read-only PostgreSQL adapter backed by a separate fake
-Lebanese minimarket source. It does not add routes, connection management, agent
-tools, model calls, or UI work.
+Milestone 16 adds strict provider-neutral operational contracts, a predefined
+read-only PostgreSQL adapter backed by a separate fake Lebanese minimarket source,
+and tenant-scoped connection management through safe deployment profile keys. It
+does not add agent tools, model calls, or public operational-query endpoints.
 
 Milestone 7 adds PostgreSQL-backed registration and owner-generation limits,
 per-business local-day AI token allowances, leased usage reconciliation, a
@@ -26,8 +26,8 @@ Milestone 13 adds local BGE-M3 embeddings, atomic document embedding, internal
 tenant-scoped exact pgvector retrieval, and an internal re-embedding queue/CLI.
 Milestone 14 connects that retrieval to grounded owner chat and Gemini; Milestone
 15 provides the React interface. Customer chat, activation/admin APIs,
-operational integrations and analytics, tool execution, payments, invitations,
-and additional roles remain outside the current implementation boundary.
+operational analytics, agent tool execution, payments, invitations, and additional
+roles remain outside the current implementation boundary.
 
 ## Requirements
 
@@ -164,8 +164,45 @@ available inventory, and restocking is the deterministic target-minus-available
 quantity when available stock is at or below its reorder point.
 
 These records are queried live and read-only. They are never copied into the
-Sou2AI platform database. Part 1 exposes no HTTP endpoint, arbitrary SQL, schema
-inspection, model integration, or agent tool.
+Sou2AI platform database. The platform stores only a tenant-owned safe display
+name, adapter/profile and mapping keys, lifecycle timestamps, and a safe failure
+code. It stores no connection string, credential, host, SQL, product, inventory,
+sale, or customer record.
+
+### Deployment-managed profile and lifecycle
+
+The public profile key `fake_store_postgresql` resolves inside the backend to the
+deployment-provided `FAKE_STORE_DATABASE_URL`; the value never crosses the API
+boundary. `EnvironmentConnectionProfileRegistry` is the replaceable resolution
+boundary for a future production secret manager or customer credential provider.
+The allowlisted `fake_store_minimarket` mapping at version 1 describes finalized
+and excluded sale statuses, refund and reservation treatment, branch/warehouse
+meaning, quantity/revenue interpretation, LBP, Asia/Beirut, and required
+capabilities. It contains no table names or SQL.
+
+An authenticated full-access business member can use these endpoints:
+
+- `GET /api/v1/businesses/{business_id}/data-sources/available-profiles`
+- `POST|GET /api/v1/businesses/{business_id}/data-sources`
+- `GET /api/v1/businesses/{business_id}/data-sources/{source_id}`
+- `POST .../{source_id}/validate`
+- `POST .../{source_id}/activate`
+- `POST .../{source_id}/health`
+- `POST .../{source_id}/disable`
+
+New sources start `CONFIGURED`. Validation checks the allowlisted mapping and the
+external health contract before producing `VALIDATED`; failure produces
+`UNHEALTHY` with a safe code. Only a validated source can become `ACTIVE`, and a
+database constraint permits only one active source of the same adapter type per
+business. Disable and repeated activation are safely idempotent. External checks
+run without holding a Sou2AI row lock, while the final tenant update rechecks the
+configuration under a lock. The Data Sources UI presents this lifecycle and the
+approved capabilities without accepting database coordinates or credentials.
+
+These management APIs do not execute operational queries for the assistant.
+Milestone 17 will separately expose approved adapter operations through controlled
+agent tools; arbitrary SQL, schema inspection, and model access to credentials
+remain forbidden.
 
 From `backend`, apply or roll back the schema:
 
@@ -493,8 +530,8 @@ remains the planned production replacement through this boundary and is not yet
 implemented. Authoritative provider token counts are preferred; otherwise the existing
 conservative estimate is recorded as non-authoritative. Private documents,
 BGE-M3/pgvector retrieval, grounded RAG with citations, and the React frontend are
-implemented. Milestone 16 Part 1's operational contracts and read-only PostgreSQL
-adapter are implemented; connection management remains in Milestone 16 and tool
+implemented. Milestone 16's operational contracts, read-only PostgreSQL adapter,
+tenant lifecycle management, and Data Sources UI are implemented; controlled tool
 calling remains future Milestone 17. Customer channels also remain planned.
 Authentication alone never grants business access without membership.
 

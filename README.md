@@ -26,14 +26,15 @@ documentation, and redacted environment-aware logging. Production host and CORS
 checks normalize case, DNS trailing dots, and IPv4/IPv6 loopback representations
 before rejecting local or malformed values.
 
-Milestone 16 Part 1 provides provider-neutral operational contracts and a
-read-only adapter for a separate deterministic fake-store PostgreSQL source.
-Connection management, operational APIs/UI, agent tools, customer chat,
-additional cloud providers, payments, and activation/admin HTTP endpoints remain
-future work. The responsive
-React frontend implements authentication, multi-business onboarding and selection,
-owner chat, document management, account settings, and truthful empty states for
-future operational features. Manual lifecycle
+Milestone 16 provides provider-neutral operational contracts, a read-only adapter
+for a separate deterministic fake-store PostgreSQL source, and tenant-scoped Data
+Sources management. Deployment-managed allowlisted profile keys keep connection
+credentials out of the public API and browser; a versioned semantic mapping must
+validate before activation. The responsive React interface can configure,
+validate, activate, health-check, and disable the demonstration source. Live
+operational records remain in that external database and are never copied into
+Sou2AI. Agent tools, customer chat, additional cloud providers, payments, and
+activation/admin HTTP endpoints remain future work. Manual lifecycle
 changes use a controlled PostgreSQL function with permanent append-only history.
 The local database uses separate bootstrap, restricted FastAPI runtime, and
 restricted lifecycle-operator roles; the backend never connects as the database

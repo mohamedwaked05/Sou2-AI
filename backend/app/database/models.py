@@ -110,6 +110,14 @@ class KnowledgeDocumentStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class OperationalDataSourceStatus(StrEnum):
+    CONFIGURED = "CONFIGURED"
+    VALIDATED = "VALIDATED"
+    ACTIVE = "ACTIVE"
+    UNHEALTHY = "UNHEALTHY"
+    DISABLED = "DISABLED"
+
+
 account_status_enum = ENUM(
     AccountStatus,
     name="account_status",
@@ -143,6 +151,11 @@ business_category_enum = ENUM(
 knowledge_document_status_enum = ENUM(
     KnowledgeDocumentStatus,
     name="knowledge_document_status",
+    values_callable=lambda items: [item.value for item in items],
+)
+operational_data_source_status_enum = ENUM(
+    OperationalDataSourceStatus,
+    name="operational_data_source_status",
     values_callable=lambda items: [item.value for item in items],
 )
 
@@ -555,6 +568,9 @@ class Business(Base):
         back_populates="business", passive_deletes=True
     )
     knowledge_documents: Mapped[list[KnowledgeDocument]] = relationship(
+        back_populates="business", cascade="all, delete-orphan", passive_deletes=True
+    )
+    operational_data_sources: Mapped[list[OperationalDataSourceConfig]] = relationship(
         back_populates="business", cascade="all, delete-orphan", passive_deletes=True
     )
 
@@ -1316,6 +1332,97 @@ class ToolCallLog(Base):
     @validates("tool_name", "error_code")
     def trim_audit_text(self, _key: str, value: str | None) -> str | None:
         return value.strip() if value is not None else None
+
+
+class OperationalDataSourceConfig(Base):
+    """Tenant-owned non-secret configuration for one operational source."""
+
+    __tablename__ = "operational_data_sources"
+    __table_args__ = (
+        CheckConstraint(
+            "char_length(btrim(display_name)) BETWEEN 2 AND 120",
+            name="ck_operational_sources_display_name",
+        ),
+        CheckConstraint(
+            "adapter_type = 'postgresql_readonly'",
+            name="ck_operational_sources_adapter",
+        ),
+        CheckConstraint(
+            "connection_profile_key = 'fake_store_postgresql'",
+            name="ck_operational_sources_connection_profile",
+        ),
+        CheckConstraint(
+            "mapping_profile_key = 'fake_store_minimarket' "
+            "AND mapping_profile_version = 1",
+            name="ck_operational_sources_mapping_profile",
+        ),
+        CheckConstraint(
+            "failure_code IS NULL OR (char_length(failure_code) BETWEEN 1 AND 100 "
+            "AND failure_code ~ '^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)*$')",
+            name="ck_operational_sources_failure_code",
+        ),
+        CheckConstraint(
+            "(status = 'CONFIGURED' AND last_validated_at IS NULL "
+            "AND last_successful_health_check_at IS NULL AND failure_code IS NULL) "
+            "OR (status IN ('VALIDATED', 'ACTIVE') AND last_validated_at IS NOT NULL "
+            "AND last_successful_health_check_at IS NOT NULL AND failure_code IS NULL) "
+            "OR (status = 'UNHEALTHY' AND last_validated_at IS NOT NULL "
+            "AND failure_code IS NOT NULL) "
+            "OR (status = 'DISABLED' AND failure_code IS NULL)",
+            name="ck_operational_sources_status_metadata",
+        ),
+        UniqueConstraint(
+            "id", "business_id", name="uq_operational_sources_id_business"
+        ),
+        Index(
+            "ix_operational_sources_business_created",
+            "business_id",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "uq_operational_sources_active_type",
+            "business_id",
+            "adapter_type",
+            unique=True,
+            postgresql_where=text("status = 'ACTIVE'::operational_data_source_status"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    adapter_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    connection_profile_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    mapping_profile_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    mapping_profile_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[OperationalDataSourceStatus] = mapped_column(
+        operational_data_source_status_enum,
+        nullable=False,
+        default=OperationalDataSourceStatus.CONFIGURED,
+        server_default=text("'CONFIGURED'::operational_data_source_status"),
+    )
+    last_validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_successful_health_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    failure_code: Mapped[str | None] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    business: Mapped[Business] = relationship(back_populates="operational_data_sources")
+
+    @validates("display_name")
+    def clean_display_name(self, _key: str, value: str) -> str:
+        return " ".join(value.split())
 
 
 class KnowledgeDocument(Base):

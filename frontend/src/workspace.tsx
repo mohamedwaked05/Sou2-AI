@@ -48,6 +48,7 @@ import {
 } from "./api";
 import { ScheduleEditor } from "./businesses";
 import { CATEGORIES, categoryLabel, LOCATIONS } from "./constants";
+import { DataSourcesPage } from "./data-sources";
 import {
   Alert,
   BusyLabel,
@@ -513,15 +514,7 @@ function WorkspacePage({
         text="No customer records or external messaging conversations are stored in the current milestone."
       />
     );
-  if (page === "data-sources")
-    return (
-      <FuturePage
-        icon={Database}
-        title="Data Sources"
-        description="Operational data sources are not connected yet."
-        text="Controlled read-only integrations are planned for a later milestone. No connection details are available today."
-      />
-    );
+  if (page === "data-sources") return <DataSourcesPage business={business} />;
   return <Navigate to={`/businesses/${business.id}/overview`} replace />;
 }
 

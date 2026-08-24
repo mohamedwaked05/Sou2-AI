@@ -85,6 +85,50 @@ export interface Usage {
   status: "normal" | "approaching_limit" | "nearly_exhausted" | "exhausted";
 }
 
+export type DataSourceStatus =
+  "CONFIGURED" | "VALIDATED" | "ACTIVE" | "UNHEALTHY" | "DISABLED";
+
+export interface OperationalMappingProfile {
+  key: string;
+  version: number;
+  display_name: string;
+  completed_sale_statuses: string[];
+  excluded_sale_statuses: string[];
+  return_treatment: string;
+  active_reservation_statuses: string[];
+  reservation_treatment: string;
+  branch_meaning: string;
+  warehouse_meaning: string;
+  quantity_interpretation: string;
+  revenue_interpretation: string;
+  currency: string;
+  source_timezone: string;
+}
+
+export interface ConnectionProfile {
+  key: string;
+  display_name: string;
+  description: string;
+  adapter_type: string;
+  mapping: OperationalMappingProfile;
+  capabilities: string[];
+}
+
+export interface DataSource {
+  id: string;
+  display_name: string;
+  adapter_type: string;
+  connection_profile_key: string;
+  mapping: OperationalMappingProfile;
+  status: DataSourceStatus;
+  last_validated_at: string | null;
+  last_successful_health_check_at: string | null;
+  failure_code: string | null;
+  capabilities: string[];
+  created_at: string;
+  updated_at: string;
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -294,6 +338,41 @@ export const api = {
   deleteDocument: (business: string, document: string) =>
     request<void>(`/businesses/${business}/knowledge/documents/${document}`, {
       method: "DELETE",
+    }),
+  dataSourceProfiles: (business: string) =>
+    request<ConnectionProfile[]>(
+      `/businesses/${business}/data-sources/available-profiles`,
+    ),
+  dataSources: (business: string) =>
+    request<DataSource[]>(`/businesses/${business}/data-sources`),
+  createDataSource: (
+    business: string,
+    body: {
+      display_name: string;
+      connection_profile_key: string;
+      mapping_profile_key: string;
+      mapping_profile_version: number;
+    },
+  ) =>
+    request<DataSource>(`/businesses/${business}/data-sources`, {
+      method: "POST",
+      ...json(body),
+    }),
+  validateDataSource: (business: string, source: string) =>
+    request<DataSource>(`/businesses/${business}/data-sources/${source}/validate`, {
+      method: "POST",
+    }),
+  activateDataSource: (business: string, source: string) =>
+    request<DataSource>(`/businesses/${business}/data-sources/${source}/activate`, {
+      method: "POST",
+    }),
+  checkDataSource: (business: string, source: string) =>
+    request<DataSource>(`/businesses/${business}/data-sources/${source}/health`, {
+      method: "POST",
+    }),
+  disableDataSource: (business: string, source: string) =>
+    request<DataSource>(`/businesses/${business}/data-sources/${source}/disable`, {
+      method: "POST",
     }),
 };
 
