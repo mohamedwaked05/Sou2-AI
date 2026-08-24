@@ -90,9 +90,11 @@ citations, and atomic assistant/citation/usage persistence.
 
 Qwen2.5 7B remains an optional local generation provider and is not
 production-approved after Milestone 9's critical multilingual failures. Gemini is
-implemented for grounded-chat development evaluation. Controlled operational
-adapters and agent tool calling remain future Milestones 16–17; customer channels,
-WhatsApp, and unrelated later roadmap work are also not implemented.
+implemented for grounded-chat development evaluation. Milestone 16 Part 1's
+provider-neutral operational contracts and read-only PostgreSQL adapter are
+implemented; connection management remains in Milestone 16 and agent tool calling
+remains future Milestone 17. Customer channels, WhatsApp, and unrelated later
+roadmap work are also not implemented.
 
 ## Development roadmap
 
@@ -320,7 +322,7 @@ and truthful future-feature states. The business profile persists the selected
 default language; Alembic revision `20260822_05` restores the database and API
 completion invariant.
 
-### Milestone 16: Controlled operational integrations
+### Milestone 16: In Progress — Controlled operational integrations
 
 * Define stable Sou2AI operational contracts for products, inventory, sales, best-seller rankings, and restocking recommendations.
 * Build a separate fake PostgreSQL store database with realistic Lebanese minimarket products, stock, sales, and restocking rules.
@@ -336,6 +338,14 @@ completion invariant.
 * Clearly report when a source lacks the data needed for an answer or recommendation.
 
 The first integration proves the contract and adapter design. Sou2AI will add connectors based on real customer demand rather than promise compatibility with every store system in the initial MVP.
+
+Part 1 implements the provider-neutral contracts and a predefined read-only
+PostgreSQL adapter against a separate deterministic Lebanese minimarket database.
+Inventory stays reservation-aware; sales and refunds use source-local reporting
+boundaries; rankings and restocking are deterministic. The source is queried live
+and its operational records are not copied into the Sou2AI platform database.
+Connection management, API/UI work, tenant activation, and agent tool calling are
+not part of Part 1, so Milestone 16 remains In Progress.
 
 ### Milestone 17: Agent tool calling
 

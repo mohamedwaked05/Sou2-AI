@@ -51,7 +51,29 @@ services:
       timeout: 5s
       retries: 10
       start_period: 5s
+  fake-store-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${FAKE_STORE_ADMIN_USER:-fake_store_admin}
+      POSTGRES_PASSWORD: ${FAKE_STORE_ADMIN_PASSWORD:-fake_store_admin_local}
+      POSTGRES_DB: ${FAKE_STORE_DATABASE:-fake_store}
+      FAKE_STORE_READONLY_USER: ${FAKE_STORE_READONLY_USER:-sou2ai_store_reader}
+      FAKE_STORE_READONLY_PASSWORD: ${FAKE_STORE_READONLY_PASSWORD:-sou2ai_store_reader_local}
+      FAKE_STORE_TIMEZONE: ${FAKE_STORE_TIMEZONE:-Asia/Beirut}
+      FAKE_STORE_CURRENCY: ${FAKE_STORE_CURRENCY:-LBP}
+    ports:
+      - "127.0.0.1:${FAKE_STORE_PORT:-5434}:5432"
+    volumes:
+      - sou2ai_fake_store_data:/var/lib/postgresql/data
+      - ./docker/fake-store/init-fake-store.sh:/docker-entrypoint-initdb.d/10-init-fake-store.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
 
 volumes:
   sou2ai_postgres_data:
+  sou2ai_fake_store_data:
   sou2ai_redis_data:

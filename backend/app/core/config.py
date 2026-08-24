@@ -157,6 +157,12 @@ class Settings(BaseSettings):
         "127.0.0.1:5433/sou2ai_test"
     )
     postgresql_connect_timeout_seconds: int = Field(default=5, ge=1)
+    fake_store_database_url: SecretStr = SecretStr(
+        "postgresql+psycopg://sou2ai_store_reader:sou2ai_store_reader_local@"
+        "127.0.0.1:5434/fake_store"
+    )
+    operational_query_timeout_seconds: int = Field(default=2, ge=1, le=30)
+    operational_max_reporting_days: int = Field(default=366, ge=1, le=366)
     tool_call_audit_retention_days: int = Field(default=90, ge=1)
     tool_call_audit_hmac_secret: SecretStr | None = None
     auth_event_retention_hours: int = Field(

@@ -21,17 +21,19 @@ flowchart TD
     API --> CHAT[Owner Chat Service]
     CHAT --> RAG[RAG Service]
     CHAT --> LLM[Generation Provider]
-    CHAT --> DB[(PostgreSQL)]
+    CHAT --> DB[(Sou2AI PostgreSQL)]
     RAG --> EMBED[Embedding Service]
     RAG --> VECTOR[(PostgreSQL and pgvector)]
+    OI[Operational Adapter] --> STORE[(External store PostgreSQL)]
 
     EMBED --> BGE[BGE-M3 through Ollama]
     LLM --> GEMINI[Gemini]
     LLM --> QWEN[Optional Qwen2.5 7B through Ollama]
 ```
 
-Controlled operational adapters and agent tool calling are not active; they remain
-future Milestones 16 and 17.
+The Milestone 16 Part 1 operational adapter is backend-only and has no route or
+agent caller. Connection management remains in Milestone 16, and agent tool
+calling remains future Milestone 17.
 
 ## 3. Runtime components
 
@@ -56,6 +58,7 @@ app/core/      configuration, logging, and shared exceptions
 app/database/  persistence infrastructure
 app/rag/       document ingestion and retrieval
 app/agent/     model-provider contracts and adapters; future agent orchestration
+app/integrations/ provider-neutral operational contracts and source adapters
 app/tools/     future controlled operational capabilities
 app/memory/    future conversation and semantic memory services
 app/services/  application logic
@@ -133,9 +136,20 @@ Sou2AI PostgreSQL stores data the platform owns: users, business profiles,
 memberships, weekly opening hours, owner chat, learned stable facts, and minimal
 tool-call audit metadata. Products,
 inventory, orders, sales, revenue, customers, appointments, and billing remain in
-the business's source system. Future controlled tools will access those systems
-through an API, a read-only database integration, or a Sou2AI-managed operational
-system. This avoids stale copies and preserves the business's source of truth.
+the business's source system. The Milestone 16 Part 1 PostgreSQL adapter proves a
+read-only integration boundary against a separate demonstration source. Future
+controlled tools may use that boundary or other approved API/database adapters.
+This avoids stale copies and preserves the business's source of truth.
+
+Operational callers receive strict Sou2AI contracts rather than source table or
+column names. The implemented operations are fixed inventory, sales-summary,
+best-seller, restocking, and health queries. They use parameterized SQL, bounded
+dates and rows, source-local half-open date windows, explicit final-sale/refund
+semantics, statement timeouts, safe errors, and a dedicated unprivileged login.
+Active unexpired reservations reduce available stock. Restocking recommends the
+trusted arithmetic difference between target and available stock only when
+available stock is at or below the reorder point. No model, route, or tool can
+submit SQL, inspect the source schema, or receive its credentials in Part 1.
 
 Unstructured RAG data is stored separately and covers approved documents such as
 policies, descriptions, warranties, FAQs, and business notes.
@@ -492,6 +506,7 @@ answers, bodies, raw provider payloads, reasoning, authorization data, or costs.
 React: 5173
 FastAPI: 8000
 PostgreSQL host port: 5433 (container port: 5432)
+External fake-store PostgreSQL host port: 5434 (container port: 5432)
 Ollama: 11434
 ```
 
@@ -501,6 +516,7 @@ flowchart TD
     PC --> FE[React on 5173]
     PC --> BE[FastAPI on 8000]
     PC --> PG[PostgreSQL on host port 5433]
+    PC --> FS[External fake store on host port 5434]
     PC --> OL[Ollama on 11434]
     BE --> GM[Gemini HTTPS when configured]
 ```
@@ -513,6 +529,14 @@ reject any database name other than `sou2ai_test` and exercise lifecycle attacks
 and budget controls through the real non-superuser logins. `GET
 /api/v1/health/database` performs
 `SELECT 1` and returns only `healthy` or `unavailable` without connection details.
+
+The separate `fake-store-postgres` service owns only the `fake_store` database and
+persists it in its own named volume. Its `minimarket` schema contains deterministic
+catalog, branch/warehouse stock, reservations, receipts, lines, and refunds. The
+adapter login can connect and select only required source tables; it cannot mutate
+data, create objects, alter schemas, use temporary storage, or read the private
+fixture schema. This database is an external demonstration system and has no
+Sou2AI platform tables or Alembic migrations.
 
 ## 15. Model-provider boundary and future deployment
 
@@ -532,8 +556,10 @@ per business, ordered persistent owner chat, deterministic mock, Gemini, and
 optional local Ollama generation providers, managed permanent/temporary learned
 knowledge, pgvector/BGE-M3 retrieval, private document ingestion and processing,
 grounded answers with persisted citations, PostgreSQL-backed API limits and AI
-budgets, the HTTP/logging security boundary, and the React business interface.
-Controlled operational adapters and tool calling remain future Milestones 16–17;
+budgets, the HTTP/logging security boundary, the React business interface, and
+Milestone 16 Part 1's provider-neutral read-only operational contracts plus fake
+store PostgreSQL adapter. Connection management and API/UI integration remain in
+Milestone 16; controlled agent tool calling remains future Milestone 17;
 customer chat, WhatsApp, billing, and activation/admin APIs also remain future
 work.
 

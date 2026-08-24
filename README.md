@@ -26,8 +26,11 @@ documentation, and redacted environment-aware logging. Production host and CORS
 checks normalize case, DNS trailing dots, and IPv4/IPv6 loopback representations
 before rejecting local or malformed values.
 
-Customer chat, cloud providers, live operational integrations and analytics,
-payments, and activation/admin HTTP endpoints remain future work. The responsive
+Milestone 16 Part 1 provides provider-neutral operational contracts and a
+read-only adapter for a separate deterministic fake-store PostgreSQL source.
+Connection management, operational APIs/UI, agent tools, customer chat,
+additional cloud providers, payments, and activation/admin HTTP endpoints remain
+future work. The responsive
 React frontend implements authentication, multi-business onboarding and selection,
 owner chat, document management, account settings, and truthful empty states for
 future operational features. Manual lifecycle

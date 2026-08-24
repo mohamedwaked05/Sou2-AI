@@ -9,6 +9,11 @@ Milestone 14 is in progress. It adds tenant-scoped grounded owner-chat retrieval
 safe persisted citations, and Gemini development generation through the existing
 replaceable provider boundary. Local Ollama `bge-m3` remains the embedding model.
 
+Milestone 16 is also in progress. Part 1 adds strict provider-neutral operational
+contracts and a predefined read-only PostgreSQL adapter backed by a separate fake
+Lebanese minimarket source. It does not add routes, connection management, agent
+tools, model calls, or UI work.
+
 Milestone 7 adds PostgreSQL-backed registration and owner-generation limits,
 per-business local-day AI token allowances, leased usage reconciliation, a
 tenant-scoped current-usage endpoint, and controlled allowance administration. It
@@ -124,6 +129,44 @@ The local role model is:
 PostgreSQL superusers remain trusted bootstrap administrators and can bypass
 ordinary grants. Neither FastAPI nor normal lifecycle operators may use one.
 
+## Start the external fake store
+
+The `fake-store-postgres` Compose service is an external demonstration source, not
+part of `sou2ai_dev` or `sou2ai_test`. It uses the separate `fake_store` database,
+the `minimarket` schema, host port 5434, and its own persistent
+`sou2ai_fake_store_data` volume. Its deterministic fixture includes Lebanese
+minimarket products and categories, two branches, one warehouse, stock and
+reservations, completed/pending/cancelled/returned receipts, completed and ignored
+refunds, and Asia/Beirut timestamps in LBP.
+
+From the repository root:
+
+```powershell
+docker compose up -d fake-store-postgres
+docker compose ps fake-store-postgres
+docker compose exec fake-store-postgres pg_isready -U fake_store_admin -d fake_store
+```
+
+The adapter uses only `FAKE_STORE_DATABASE_URL`, whose local default names the
+dedicated `sou2ai_store_reader` login. Local defaults in `.env.example` are not
+production credentials. The role can connect and select only the required source
+tables; it cannot write, truncate, create, alter, use temporary tables, or read the
+private fixture schema. Do not give the API the fake-store administrator password.
+
+The integration boundary returns Sou2AI products, inventory, sales summaries,
+ranked best sellers, restocking recommendations, and safe health/result metadata.
+Source-specific names never cross that boundary. Reporting periods are local
+calendar dates with an exclusive end date in `Asia/Beirut`. `COMPLETED` and
+`RETURNED` receipts contribute gross finalized sales while remaining separately
+counted; pending and cancelled receipts are excluded. Only completed refunds are
+subtracted at their refund timestamp. Active, unexpired reservations reduce
+available inventory, and restocking is the deterministic target-minus-available
+quantity when available stock is at or below its reorder point.
+
+These records are queried live and read-only. They are never copied into the
+Sou2AI platform database. Part 1 exposes no HTTP endpoint, arbitrary SQL, schema
+inspection, model integration, or agent tool.
+
 From `backend`, apply or roll back the schema:
 
 ```powershell
@@ -230,6 +273,9 @@ python -m pytest
 
 The integration suite also mocks the email-service boundary and exercises the
 complete authentication and session lifecycle without contacting Resend.
+Operational integration tests require the healthy `fake-store-postgres` service
+and use deterministic expected totals. They also directly verify both allowed
+reads and denied writes/DDL/private-schema access through the dedicated login.
 
 Owner-chat tests use the provider contract without network access and exercise
 PostgreSQL constraints, idempotency races, independent-session concurrency,
@@ -447,8 +493,9 @@ remains the planned production replacement through this boundary and is not yet
 implemented. Authoritative provider token counts are preferred; otherwise the existing
 conservative estimate is recorded as non-authoritative. Private documents,
 BGE-M3/pgvector retrieval, grounded RAG with citations, and the React frontend are
-implemented. Controlled operational adapters and tool calling remain future
-Milestones 16–17; customer channels also remain planned.
+implemented. Milestone 16 Part 1's operational contracts and read-only PostgreSQL
+adapter are implemented; connection management remains in Milestone 16 and tool
+calling remains future Milestone 17. Customer channels also remain planned.
 Authentication alone never grants business access without membership.
 
 ## Milestone 12 knowledge documents
