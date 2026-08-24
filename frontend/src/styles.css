@@ -1604,6 +1604,7 @@ textarea::placeholder {
   flex-direction: column;
   gap: 22px;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: clamp(20px, 4vw, 40px);
 }
 .chat-welcome {
@@ -1724,7 +1725,8 @@ textarea::placeholder {
 }
 .composer textarea {
   width: 100%;
-  min-height: 72px;
+  min-height: 0;
+  overflow-y: hidden;
   resize: none;
   border: 0;
   background: transparent;
@@ -1753,8 +1755,11 @@ textarea::placeholder {
 }
 .conversation-list {
   display: flex;
+  max-height: min(65dvh, 720px);
   flex-direction: column;
   gap: 20px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .dark .chat-panel {
   border-color: #263246;

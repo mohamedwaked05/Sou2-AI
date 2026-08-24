@@ -26,7 +26,14 @@ import {
   UsersRound,
   X,
 } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import {
+  FormEvent,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { Link, Navigate, useLocation, useParams } from "react-router-dom";
 import {
   api,
@@ -67,6 +74,91 @@ const navItems = [
   ["data-sources", "Data Sources", Database],
   ["settings", "Business Settings", Settings],
 ] as const;
+
+const PINNED_BOTTOM_THRESHOLD_PX = 96;
+const COMPOSER_MAX_LINES = 6;
+
+function usePinnedToBottom(
+  contentVersion: unknown,
+  ready: boolean,
+  resetKey: string,
+  trailingContentVisible = false,
+) {
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const pinnedRef = useRef(true);
+  const positionedRef = useRef(false);
+  const resetKeyRef = useRef(resetKey);
+
+  const onScroll = useCallback(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const distanceFromBottom =
+      viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop;
+    pinnedRef.current = distanceFromBottom <= PINNED_BOTTOM_THRESHOLD_PX;
+  }, []);
+
+  useLayoutEffect(() => {
+    if (resetKeyRef.current !== resetKey) {
+      resetKeyRef.current = resetKey;
+      positionedRef.current = false;
+      pinnedRef.current = true;
+    }
+
+    const viewport = viewportRef.current;
+    if (!ready || !viewport) return;
+
+    const bottom = viewport.scrollHeight;
+    if (!positionedRef.current) {
+      viewport.scrollTop = bottom;
+      positionedRef.current = true;
+      pinnedRef.current = true;
+      return;
+    }
+    if (!pinnedRef.current) return;
+
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      viewport.scrollTop = bottom;
+    } else if (typeof viewport.scrollTo === "function") {
+      viewport.scrollTo({ top: bottom, behavior: "smooth" });
+    } else {
+      viewport.scrollTop = bottom;
+    }
+  }, [contentVersion, ready, resetKey, trailingContentVisible]);
+
+  return { viewportRef, onScroll };
+}
+
+function pixelValue(value: string) {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function resizeComposer(textarea: HTMLTextAreaElement, empty: boolean) {
+  textarea.style.height = "auto";
+  textarea.style.overflowY = "hidden";
+
+  const style = window.getComputedStyle(textarea);
+  const fontSize = pixelValue(style.fontSize) || 16;
+  const parsedLineHeight = pixelValue(style.lineHeight);
+  const lineHeight =
+    style.lineHeight === "normal"
+      ? fontSize * 1.2
+      : parsedLineHeight > 4
+        ? parsedLineHeight
+        : (parsedLineHeight || 1.55) * fontSize;
+  const verticalChrome =
+    pixelValue(style.paddingTop) +
+    pixelValue(style.paddingBottom) +
+    pixelValue(style.borderTopWidth) +
+    pixelValue(style.borderBottomWidth);
+  const oneLineHeight = lineHeight + verticalChrome;
+  const maximumHeight = lineHeight * COMPOSER_MAX_LINES + verticalChrome;
+  const contentHeight = empty ? oneLineHeight : textarea.scrollHeight;
+
+  textarea.style.height = `${Math.max(oneLineHeight, Math.min(contentHeight, maximumHeight))}px`;
+  textarea.style.overflowY =
+    !empty && textarea.scrollHeight > maximumHeight ? "auto" : "hidden";
+}
 
 export function WorkspaceRoute({
   user,
@@ -628,6 +720,9 @@ function ChatPage({ business }: { business: Business }) {
   const [loading, setLoading] = useState(business.is_active);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const composingRef = useRef(false);
+  const messageScroll = usePinnedToBottom(messages, !loading, business.id, sending);
   const load = useCallback(async () => {
     if (!business.is_active) return;
     try {
@@ -641,6 +736,9 @@ function ChatPage({ business }: { business: Business }) {
   useEffect(() => {
     void load();
   }, [load]);
+  useLayoutEffect(() => {
+    if (textareaRef.current) resizeComposer(textareaRef.current, text.length === 0);
+  }, [text]);
   async function send(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const content = text.trim();
@@ -671,7 +769,14 @@ function ChatPage({ business }: { business: Business }) {
         </Alert>
       ) : (
         <section className="chat-panel" aria-busy={loading || sending}>
-          <div className="messages" aria-live="polite">
+          <div
+            ref={messageScroll.viewportRef}
+            className="messages"
+            role="log"
+            aria-label="Owner chat messages"
+            aria-live="polite"
+            onScroll={messageScroll.onScroll}
+          >
             {loading ? (
               <>
                 <Skeleton className="h-20 max-w-xl" />
@@ -703,12 +808,30 @@ function ChatPage({ business }: { business: Business }) {
             <label>
               <span className="sr-only">Message Sou2AI</span>
               <textarea
+                ref={textareaRef}
                 name="message"
-                rows={2}
+                rows={1}
                 maxLength={4000}
                 disabled={sending}
                 value={text}
                 onChange={(event) => setText(event.target.value)}
+                onCompositionStart={() => {
+                  composingRef.current = true;
+                }}
+                onCompositionEnd={() => {
+                  composingRef.current = false;
+                }}
+                onKeyDown={(event) => {
+                  if (
+                    event.key !== "Enter" ||
+                    event.shiftKey ||
+                    composingRef.current ||
+                    event.nativeEvent.isComposing
+                  )
+                    return;
+                  event.preventDefault();
+                  event.currentTarget.form?.requestSubmit();
+                }}
                 placeholder="Ask about your business knowledge…"
               />
             </label>
@@ -774,6 +897,11 @@ function Message({ message }: { message: ChatMessage }) {
 function ConversationsPage({ business }: { business: Business }) {
   const [messages, setMessages] = useState<ChatMessage[] | null>(null);
   const [error, setError] = useState("");
+  const conversationScroll = usePinnedToBottom(
+    messages,
+    messages !== null,
+    business.id,
+  );
   useEffect(() => {
     if (!business.is_active) {
       setMessages([]);
@@ -812,7 +940,13 @@ function ConversationsPage({ business }: { business: Business }) {
         {messages === null ? (
           <Skeleton className="h-64" />
         ) : messages.length ? (
-          <div className="conversation-list">
+          <div
+            ref={conversationScroll.viewportRef}
+            className="conversation-list"
+            role="log"
+            aria-label="Owner conversation history"
+            onScroll={conversationScroll.onScroll}
+          >
             {messages.map((message) => (
               <Message key={message.id} message={message} />
             ))}
