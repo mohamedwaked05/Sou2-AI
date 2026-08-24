@@ -343,6 +343,132 @@ def _has_meaningful_overlap(question: str, evidence: str) -> bool:
     return bool((_evidence_terms(question) - ignored) & _evidence_terms(evidence))
 
 
+def _normalized_classifier_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value).casefold()
+    return " ".join(
+        "".join(
+            character
+            for character in normalized
+            if not unicodedata.combining(character)
+        ).split()
+    )
+
+
+def _query_concepts(value: str) -> frozenset[str]:
+    text = _normalized_classifier_text(value)
+    patterns = {
+        "returns": (
+            r"\breturn\w*\b",
+            r"\brefund\w*\b",
+            r"\bexchange\w*\b",
+            r"ارجاع",
+            r"ترجيع",
+            r"رجع",
+            r"\b(?:tarji\w*|raje3\w*|rja3\w*)\b",
+        ),
+        "delivery": (
+            r"\bdeliver\w*\b",
+            r"\bshipping\b",
+            r"توصيل",
+            r"شحن",
+            r"\b(?:tawsil|tawsiil|sh7n)\b",
+        ),
+        "warranty": (
+            r"\bwarrant\w*\b",
+            r"\bguarantee\w*\b",
+            r"ضمان",
+            r"\bdaman\b",
+        ),
+        "opening_hours": (
+            r"\bopening\s+hours\b",
+            r"\b(?:open|close|hours|schedule)\b",
+            r"ساعات العمل",
+            r"دوام",
+            r"فتح",
+            r"سكر",
+            r"\b(?:wa2et|fte7|fta7|btefta\w*|bteskar\w*)\b",
+        ),
+        "location": (
+            r"\b(?:address|location|located|where)\b",
+            r"عنوان",
+            r"موقع",
+            r"وين",
+            r"\b(?:wen|wein)\b",
+        ),
+        "inventory": (
+            r"\b(?:inventory|stock)\b",
+            r"مخزون",
+            r"\bmakhzou?n\b",
+        ),
+        "sales": (
+            r"\b(?:sales?|selling|sellers?|sold)\b",
+            r"مبيعات",
+            r"مبيعا",
+            r"\bmabi3\w*\b",
+        ),
+        "orders": (
+            r"\borders?\b",
+            r"طلبات",
+            r"طلبي",
+            r"\btalabiy\w*\b",
+        ),
+        "revenue": (
+            r"\b(?:revenue|turnover|profit|earnings)\b",
+            r"ايراد",
+            r"ارباح",
+            r"\b(?:iradet|eradet|arbe7)\b",
+        ),
+        "restocking": (
+            r"\b(?:restock\w*|replenish\w*)\b",
+            r"اعادة تخزين",
+            r"تزويد المخزون",
+            r"\b(?:restock|ta3biye)\b",
+        ),
+        "appointments": (
+            r"\b(?:appointment|booking)s?\b",
+            r"مواعيد",
+            r"حجوزات",
+            r"\bmawa3id\b",
+        ),
+    }
+    return frozenset(
+        concept
+        for concept, concept_patterns in patterns.items()
+        if any(re.search(pattern, text) for pattern in concept_patterns)
+    )
+
+
+def _search_query_text(value: str) -> str:
+    search_terms = {
+        "returns": "return refund exchange policy",
+        "delivery": "delivery shipping policy",
+        "warranty": "warranty guarantee policy",
+        "opening_hours": "business opening hours schedule",
+        "location": "business address location",
+        "inventory": "current inventory stock availability",
+        "sales": "current sales best selling items",
+        "orders": "current customer orders",
+        "revenue": "current revenue earnings",
+        "restocking": "current restocking replenishment",
+        "appointments": "current appointment booking availability",
+    }
+    concepts = _query_concepts(value)
+    expanded = " ".join(search_terms[concept] for concept in sorted(concepts))
+    return value if not expanded else f"{value}\nSearch concepts: {expanded}"
+
+
+def _is_live_operational_request(value: str) -> bool:
+    operational = {
+        "inventory",
+        "sales",
+        "orders",
+        "revenue",
+        "restocking",
+        "appointments",
+    }
+    return bool(_query_concepts(value) & operational)
+
+
 def _profile_evidence_texts(profile: ProviderBusinessProfile) -> tuple[str, ...]:
     identity = (
         f"Business name: {profile.name}. Description: {profile.description}. "
@@ -494,9 +620,10 @@ def _build_provider_request(
     knowledge_evidence = tuple(
         f"{record.subject_key}: {record.content}" for record in knowledge
     )
+    search_query = _search_query_text(owner_message.content)
     embedding_provider = create_embedding_provider(settings)
     evidence_embeddings = embedding_provider.embed(
-        [owner_message.content, *profile_evidence, *knowledge_evidence]
+        [search_query, *profile_evidence, *knowledge_evidence]
     ).vectors
     question_embedding = evidence_embeddings[0]
     profile_end = 1 + len(profile_evidence)
@@ -509,11 +636,11 @@ def _build_provider_request(
         for vector in evidence_embeddings[profile_end:]
     )
     selected_knowledge = _select_relevant_knowledge(
-        knowledge, owner_message.content, knowledge_similarities, settings
+        knowledge, search_query, knowledge_similarities, settings
     )
     has_relevant_profile = any(
         similarity >= settings.retrieval_minimum_similarity
-        or _has_meaningful_overlap(owner_message.content, evidence)
+        or _has_meaningful_overlap(search_query, evidence)
         for evidence, similarity in zip(
             profile_evidence, profile_similarities, strict=True
         )
@@ -522,14 +649,12 @@ def _build_provider_request(
         session,
         user,
         business_id,
-        owner_message.content,
+        search_query,
         embedding_provider,
         settings,
         question_embedding=question_embedding,
     )
-    sources = _select_sources(
-        retrieved.chunks, settings, question=owner_message.content
-    )
+    sources = _select_sources(retrieved.chunks, settings, question=search_query)
     request = OwnerChatRequest(
         profile=profile,
         knowledge=selected_knowledge,
@@ -686,7 +811,12 @@ def _fallback_language(message: str, default_language: str) -> str:
             if any(marker in normalized for marker in lebanese_markers)
             else "arabic"
         )
-    if re.search(r"(?i)(?:[a-z][2356789]|[2356789][a-z])", message):
+    franco_markers = re.search(
+        r"(?i)\b(?:shu|shou|wen|wein|emta|adde|addesh|kif|leish|lesh|"
+        r"nhar|fina|fine|fik|bte[a-z]*|bt[a-z]+|hal|mawdu3)\b",
+        message,
+    )
+    if re.search(r"(?i)(?:[a-z][2356789]|[2356789][a-z])", message) or franco_markers:
         return "franco_arabic"
     return "arabic" if default_language == "ar" else "english"
 
@@ -716,6 +846,185 @@ def _missing_knowledge_reply(message: str, default_language: str) -> str:
         ),
     }
     return replies[language]
+
+
+def _live_operational_reply(message: str, default_language: str) -> str:
+    language = _fallback_language(message, default_language)
+    replies = {
+        "english": (
+            "I can't access live operational data yet. Current inventory, sales, "
+            "orders, revenue, appointments, and restocking require a connected "
+            "operational tool."
+        ),
+        "arabic": (
+            "لا تتوفر لدي بيانات تشغيلية مباشرة بعد. المخزون والمبيعات والطلبات "
+            "والإيرادات والمواعيد وإعادة التخزين تحتاج إلى أداة تشغيلية موصولة."
+        ),
+        "lebanese_arabic": (
+            "ما فيني وصّل للبيانات التشغيلية المباشرة بعد. المخزون والمبيعات "
+            "والطلبات والمواعيد وإعادة التخزين بدها أداة تشغيلية موصولة."
+        ),
+        "franco_arabic": (
+            "Ma fine ousal lal live operational data ba3d. El stock, sales, orders, "
+            "revenue, appointments, w restocking baddon connected operational tool."
+        ),
+        "mixed": (
+            "I can't access البيانات التشغيلية المباشرة yet. Current stock, sales, "
+            "orders, revenue, appointments، وإعادة التخزين need a connected "
+            "operational tool."
+        ),
+    }
+    return replies[language]
+
+
+def _conflicting_source_labels(
+    sources: tuple[ProviderSource, ...],
+) -> tuple[str, ...]:
+    ignored = {
+        "business",
+        "current",
+        "customer",
+        "document",
+        "information",
+        "policy",
+        "service",
+        "that",
+        "the",
+        "this",
+        "with",
+    }
+
+    def stated_values(content: str) -> set[str]:
+        return set(re.findall(r"\b\d+(?:[.,]\d+)?%?\b", content))
+
+    def has_negation(content: str) -> bool:
+        text = _normalized_classifier_text(content)
+        return bool(
+            re.search(r"\b(?:no|not|never|without|ma|mesh|mish)\b", text)
+            or re.search(r"(?:ليس|لا|غير)", text)
+        )
+
+    involved: set[str] = set()
+    for index, left in enumerate(sources):
+        left_terms = _evidence_terms(left.content) - ignored
+        left_values = stated_values(left.content)
+        for right in sources[index + 1 :]:
+            right_terms = _evidence_terms(right.content) - ignored
+            smaller = min(len(left_terms), len(right_terms))
+            if smaller == 0 or len(left_terms & right_terms) / smaller < 0.6:
+                continue
+            right_values = stated_values(right.content)
+            numeric_conflict = bool(
+                left_values and right_values and left_values != right_values
+            )
+            polarity_conflict = has_negation(left.content) != has_negation(
+                right.content
+            )
+            if numeric_conflict or polarity_conflict:
+                involved.update((left.label, right.label))
+    return tuple(source.label for source in sources if source.label in involved)
+
+
+def _conflict_reply(
+    message: str,
+    default_language: str,
+    sources: tuple[ProviderSource, ...] = (),
+    labels: tuple[str, ...] = (),
+) -> str:
+    language = _fallback_language(message, default_language)
+    involved = set(labels)
+    values = tuple(
+        dict.fromkeys(
+            value
+            for source in sources
+            if not involved or source.label in involved
+            for value in re.findall(r"\b\d+(?:[.,]\d+)?%?\b", source.content)
+        )
+    )
+    value_text = " / ".join(values)
+    details = {
+        "english": f" The stated values are {value_text}." if value_text else "",
+        "arabic": f" القيم المذكورة هي {value_text}." if value_text else "",
+        "lebanese_arabic": f" القيم المذكورة هي {value_text}." if value_text else "",
+        "franco_arabic": f" El values el mazkurin henne {value_text}."
+        if value_text
+        else "",
+        "mixed": f" The stated values هي {value_text}." if value_text else "",
+    }
+    replies = {
+        "english": (
+            "I found conflicting information in the trusted sources."
+            f"{details['english']} Please clarify which information is current or "
+            "update the knowledge base."
+        ),
+        "arabic": (
+            "وجدت معلومات متعارضة في المصادر الموثوقة."
+            f"{details['arabic']} يرجى توضيح أي معلومات هي "
+            "الحالية أو تحديث قاعدة المعرفة."
+        ),
+        "lebanese_arabic": (
+            "لقيت معلومات متعارضة بالمصادر الموثوقة."
+            f"{details['lebanese_arabic']} فيك توضّح أي معلومة هي "
+            "الحالية أو تحدّث قاعدة المعرفة؟"
+        ),
+        "franco_arabic": (
+            "La2et ma3loumet met3arda bel trusted sources."
+            f"{details['franco_arabic']} Fik twaddi7 ayya "
+            "ma3loume hiye el current aw t7addet el knowledge base?"
+        ),
+        "mixed": (
+            "I found معلومات متعارضة in the trusted sources."
+            f"{details['mixed']} Please وضّح أي "
+            "معلومة هي current أو update the knowledge base."
+        ),
+    }
+    return replies[language]
+
+
+def _enforce_conflict_result(
+    result: OwnerChatResult,
+    message: str,
+    default_language: str,
+    sources: tuple[ProviderSource, ...],
+    conflict_labels: tuple[str, ...],
+) -> OwnerChatResult:
+    text = _normalized_safety_text(result.reply)
+    clarification_markers = (
+        "clarif",
+        "confirm which",
+        "which information",
+        "which policy",
+        "وض",
+        "شرح",
+        "أي سياسة",
+        "اي سياسة",
+        "waddi7",
+        "twaddi7",
+        "2akked",
+        "ayya siyese",
+        "ayye siyese",
+    )
+    citations_are_complete = len(result.cited_source_ids) == len(
+        conflict_labels
+    ) and set(result.cited_source_ids) == set(conflict_labels)
+    reply = (
+        result.reply
+        if citations_are_complete
+        and any(marker in text for marker in clarification_markers)
+        else _conflict_reply(
+            message,
+            default_language,
+            sources,
+            conflict_labels,
+        )
+    )
+    return OwnerChatResult(
+        reply=reply,
+        cited_source_ids=conflict_labels,
+        usage=result.usage,
+        provider_identifier=result.provider_identifier,
+        model_identifier=result.model_identifier,
+    )
 
 
 def _mark_failed(
@@ -811,7 +1120,7 @@ def _persist_result(
     result: OwnerChatResult,
     reservation: AIUsageReservationClaim | None,
     usage: TokenUsage | None,
-    request: OwnerChatRequest,
+    sources: tuple[ProviderSource, ...],
 ) -> None:
     owner_message = session.scalar(
         select(OwnerChatMessage)
@@ -835,7 +1144,7 @@ def _persist_result(
     )
     session.add(assistant)
     session.flush()
-    source_by_label = {source.label: source for source in request.sources}
+    source_by_label = {source.label: source for source in sources}
     session.add_all(
         OwnerChatCitation(
             business_id=business_id,
@@ -886,11 +1195,24 @@ def _generate_claimed_turn(
 ) -> None:
     reservation: AIUsageReservationClaim | None = None
     try:
+        owner_message = session.get(OwnerChatMessage, claim.message_id)
+        business = session.get(Business, business_id)
+        if owner_message is None or business is None:
+            raise _provider_unavailable()
+        if _is_live_operational_request(owner_message.content):
+            live_result = OwnerChatResult(
+                reply=_live_operational_reply(
+                    owner_message.content, business.default_language
+                )
+            )
+            _persist_result(session, business_id, claim, live_result, None, None, ())
+            return
         prepared = _build_provider_request(
             session, user, business_id, claim.message_id, settings
         )
         request = prepared.request
         business = prepared.business
+        conflict_labels = _conflicting_source_labels(request.sources)
         if not prepared.has_usable_evidence:
             fallback = OwnerChatResult(
                 reply=_missing_knowledge_reply(
@@ -904,12 +1226,9 @@ def _generate_claimed_turn(
                 fallback,
                 None,
                 None,
-                request,
+                request.sources,
             )
             return
-        owner_message = session.get(OwnerChatMessage, claim.message_id)
-        if owner_message is None:
-            raise _provider_unavailable()
         generation_attempt = owner_message.generation_attempts
         try:
             reservation = reserve_owner_chat_usage(
@@ -929,6 +1248,14 @@ def _generate_claimed_turn(
                 )
             raise
         result = _validate_result(provider.generate(request), request)
+        if conflict_labels:
+            result = _enforce_conflict_result(
+                result,
+                request.messages[-1].content,
+                business.default_language,
+                request.sources,
+                conflict_labels,
+            )
         usage = result.usage
         if usage is None:
             input_tokens = provider.estimate_input_tokens(request)
@@ -976,7 +1303,7 @@ def _generate_claimed_turn(
         raise _provider_unavailable() from None
     try:
         _persist_result(
-            session, business_id, claim, result, reservation, usage, request
+            session, business_id, claim, result, reservation, usage, request.sources
         )
     except Exception as exc:
         session.rollback()

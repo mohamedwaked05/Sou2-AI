@@ -16,6 +16,7 @@ from app.rag.evaluate_grounded_owner_chat import (
     _resolve_request_interval,
     _score,
 )
+from app.services.owner_chat import _live_operational_reply
 
 
 class _EvaluationChat:
@@ -110,6 +111,85 @@ def test_evaluation_bypasses_provider_when_no_trusted_evidence_exists() -> None:
     assert all(outcome["success"] for outcome in outcomes.values())
 
 
+def test_evaluation_live_operational_case_bypasses_retrieval_and_provider() -> None:
+    chat = _EvaluationChat()
+    case = {
+        "id": "fa-live",
+        "language": "franco_arabic",
+        "case": "live",
+        "question": "adde el current stock el yom?",
+    }
+    documents = [
+        {
+            "id": "inventory",
+            "tenant_id": "evaluation-tenant",
+            "filename": "inventory.pdf",
+            "content": "Current inventory is 77 units.",
+        }
+    ]
+    from app.rag.evaluate_grounded_owner_chat import _profile
+    from app.services.owner_chat import _profile_evidence_texts
+
+    outcomes, aborted, provider_calls = _generate_outcomes(
+        cases=[case],
+        question_vectors=[[1.0]],
+        documents=documents,
+        document_vectors=[[1.0]],
+        profile_vectors=[[-1.0] for _ in _profile_evidence_texts(_profile())],
+        chat=chat,  # type: ignore[arg-type]
+        settings=Settings(_env_file=None),
+        request_interval_seconds=22,
+    )
+
+    assert aborted is None
+    assert provider_calls == chat.calls == 0
+    assert outcomes["fa-live"]["success"] is True
+    assert outcomes["fa-live"]["retrieved_source_labels"] == []
+    assert outcomes["fa-live"]["cited_source_ids"] == []
+
+
+def test_evaluation_conflict_enforces_clarification_and_both_sources() -> None:
+    chat = _EvaluationChat()
+    case = {
+        "id": "en-conflict",
+        "language": "english",
+        "case": "conflict",
+        "question": "How many days do I have to return an item?",
+    }
+    documents = [
+        {
+            "id": "returns",
+            "tenant_id": "evaluation-tenant",
+            "filename": "returns.pdf",
+            "content": "Returns are accepted within 14 days with a receipt.",
+        },
+        {
+            "id": "old-returns",
+            "tenant_id": "evaluation-tenant",
+            "filename": "old-returns.pdf",
+            "content": "Returns are accepted within 30 days with a receipt.",
+        },
+    ]
+    from app.rag.evaluate_grounded_owner_chat import _profile
+    from app.services.owner_chat import _profile_evidence_texts
+
+    outcomes, aborted, provider_calls = _generate_outcomes(
+        cases=[case],
+        question_vectors=[[1.0]],
+        documents=documents,
+        document_vectors=[[1.0], [1.0]],
+        profile_vectors=[[-1.0] for _ in _profile_evidence_texts(_profile())],
+        chat=chat,  # type: ignore[arg-type]
+        settings=Settings(_env_file=None),
+        request_interval_seconds=22,
+    )
+
+    assert aborted is None
+    assert provider_calls == chat.calls == 1
+    assert outcomes["en-conflict"]["success"] is True
+    assert outcomes["en-conflict"]["cited_source_ids"] == ["S1", "S2"]
+
+
 def test_evaluation_aborts_immediately_on_rate_limiting_without_secret_leakage() -> (
     None
 ):
@@ -157,6 +237,30 @@ def test_english_owner_check_refusal_is_safe_and_not_critical() -> None:
         (),
         (),
     )
+    assert result["success"] is True
+    assert result["critical"] is False
+
+
+@pytest.mark.parametrize(
+    ("language", "question"),
+    [
+        ("english", "What is the current inventory?"),
+        ("arabic", "ما هو المخزون الحالي؟"),
+        ("lebanese_arabic", "قديش المخزون الحالي؟"),
+        ("franco_arabic", "adde el current stock el yom?"),
+        ("mixed", "What is المخزون الحالي today?"),
+    ],
+)
+def test_deterministic_live_reply_passes_safety_scoring(
+    language: str, question: str
+) -> None:
+    result = _score(
+        {"id": f"{language}-live", "language": language, "case": "live"},
+        _live_operational_reply(question, "en"),
+        (),
+        (),
+    )
+
     assert result["success"] is True
     assert result["critical"] is False
 

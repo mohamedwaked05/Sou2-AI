@@ -110,6 +110,13 @@ labels against supplied sources, and atomically persists the assistant message a
 its citation snapshots. It states naturally that information is unavailable when
 trusted context does not support an answer.
 
+General multilingual concept expansion improves retrieval for Arabic, Lebanese
+Arabic, Franco-Arabic, and mixed questions while the provider still receives the
+user's original text. If authorized relevant sources materially disagree on a
+value or polarity, the final answer must identify the conflict, ask for
+clarification, and cite exactly every involved source; ordinary complementary
+sources do not trigger that path.
+
 ## 8. Platform data versus operational business data
 
 Sou2AI PostgreSQL stores data the platform owns: users, business profiles,
@@ -122,6 +129,12 @@ system. This avoids stale copies and preserves the business's source of truth.
 
 Unstructured RAG data is stored separately and covers approved documents such as
 policies, descriptions, warranties, FAQs, and business notes.
+
+Until the future operational adapters exist, owner chat detects requests for
+current inventory, sales, orders, revenue, best sellers, restocking, and
+appointment availability before retrieval. It persists a localized
+live-data-unavailable reply with no citations, provider request, AI-token
+reservation, or charge, even if a document appears to contain such a value.
 
 ## 9. Planned Milestones 16–17 agent flow
 

@@ -273,9 +273,14 @@ evaluation; production provider approval remains future work.
 The grounded flow and its offline security, provider-contract, retrieval, and
 atomic-persistence coverage are implemented. Unsupported questions now return a
 language-appropriate persisted fallback with no citations, provider request, or AI
-token reservation. Completion still requires the fixed 35-scenario live Gemini
-evaluation to meet every documented quality and security gate after a successful
-smoke request.
+token reservation. Requests for unavailable live operational data are likewise
+answered by a localized deterministic bypass before retrieval or generation.
+Material conflicts among authorized relevant sources require a clarification and
+citations for every conflicting source. Multilingual retrieval expands general
+Arabic, Lebanese Arabic, and Franco-Arabic concepts without changing the user's
+original provider message. Completion still requires the fixed 35-scenario live
+Gemini evaluation to meet every documented quality and security gate after a
+successful smoke set.
 
 The single paced live evaluation on 2026-08-23 completed without rate limiting or
 execution failures. Citation validity was 100% in every language group, with zero
@@ -284,6 +289,14 @@ fabricated citations and zero cross-tenant leakage. Grounded-answer success was
 71.4% mixed; critical-failure counts were 1, 0, 2, 2, and 0 respectively.
 Because the grounding and critical-failure gates did not pass, Milestone 14
 remains In Progress.
+
+On 2026-08-24, all offline gates passed after the operational-data, conflict, and
+multilingual grounding repairs. The single allowed smoke set made three Gemini
+requests: conflict and Lebanese Arabic passed, while the Franco-Arabic request was
+rate-limited. The live-data case bypassed Gemini; its natural refusal exposed and
+led to an offline evaluator-recognition repair. Per the no-retry policy, neither
+the smoke nor the 35-scenario evaluation was rerun. External quota is the remaining
+completion blocker, so Milestone 14 remains In Progress.
 
 RAG covers relatively stable knowledge such as policies, delivery information, FAQs, warranties, and documents. It is not the source of truth for current stock, today's sales, orders, or other changing facts.
 

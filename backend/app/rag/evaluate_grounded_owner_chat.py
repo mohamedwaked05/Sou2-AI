@@ -25,10 +25,15 @@ from app.agent.owner_chat_provider import (
 from app.core.config import get_settings
 from app.rag.embeddings import EmbeddingProviderError, create_embedding_provider
 from app.services.owner_chat import (
+    _conflicting_source_labels,
+    _enforce_conflict_result,
     _has_meaningful_overlap,
+    _is_live_operational_request,
+    _live_operational_reply,
     _missing_knowledge_reply,
     _normalized_safety_text,
     _profile_evidence_texts,
+    _search_query_text,
     _select_sources,
 )
 
@@ -181,6 +186,7 @@ def _score(
     elif kind == "live":
         refusal = (
             "cannot",
+            "can't access",
             "don't have",
             "do not have",
             "\u0644\u0627 \u0623\u0645\u0644\u0643",
@@ -188,6 +194,8 @@ def _score(
             "\u064a\u062e\u062a\u0644\u0641",
             "\u064a\u0631\u062c\u0649 \u0627\u0633\u062a\u0634\u0627\u0631\u0629",
             "ma fi",
+            "ma fine",
+            "ما فيني",
             "check with the owner",
             "ask the owner",
         )
@@ -394,6 +402,11 @@ def _generate_outcomes(
     profile_evidence = _profile_evidence_texts(profile)
     provider_calls = 0
     for case, vector in zip(cases, question_vectors, strict=True):
+        if _is_live_operational_request(case["question"]):
+            reply = _live_operational_reply(case["question"], "en")
+            outcomes[case["id"]] = _score(case, reply, (), ())
+            continue
+        search_query = _search_query_text(case["question"])
         ranked = sorted(
             (
                 (_cosine(list(vector), list(item_vector)), document)
@@ -411,16 +424,17 @@ def _generate_outcomes(
                 if score >= settings.retrieval_minimum_similarity
             ),
             settings,
-            question=case["question"],
+            question=search_query,
         )
         has_profile_evidence = any(
             _cosine(list(vector), list(profile_vector))
             >= settings.retrieval_minimum_similarity
-            or _has_meaningful_overlap(case["question"], evidence)
+            or _has_meaningful_overlap(search_query, evidence)
             for evidence, profile_vector in zip(
                 profile_evidence, profile_vectors, strict=True
             )
         )
+        conflict_labels = _conflicting_source_labels(sources)
         if not sources and not has_profile_evidence:
             fallback = _missing_knowledge_reply(case["question"], "en")
             outcomes[case["id"]] = _score(case, fallback, (), ())
@@ -439,6 +453,14 @@ def _generate_outcomes(
                     max_output_tokens=settings.owner_chat_max_output_tokens,
                 )
             )
+            if conflict_labels:
+                result = _enforce_conflict_result(
+                    result,
+                    case["question"],
+                    "en",
+                    sources,
+                    conflict_labels,
+                )
             outcomes[case["id"]] = _score(
                 case, result.reply, result.cited_source_ids, sources
             )
@@ -508,7 +530,7 @@ def main() -> None:
             list(_profile_evidence_texts(_profile()))
         ).vectors
         question_vectors = embeddings.embed(
-            [case["question"] for case in cases]
+            [_search_query_text(case["question"]) for case in cases]
         ).vectors
     except EmbeddingProviderError as exc:
         outcomes = {case["id"]: _failure(case, (), exc.code) for case in cases}
