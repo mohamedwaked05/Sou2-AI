@@ -225,7 +225,7 @@ def test_provider_failures_release_or_charge_reported_usage(
 
 
 @pytest.mark.parametrize(
-    ("transport", "expected_status", "expected_total"),
+    ("transport", "expected_status", "expected_total", "expected_error_code"),
     [
         (
             httpx.MockTransport(
@@ -235,6 +235,7 @@ def test_provider_failures_release_or_charge_reported_usage(
             ),
             "released",
             0,
+            "assistant_transport_failure",
         ),
         (
             httpx.MockTransport(
@@ -244,6 +245,7 @@ def test_provider_failures_release_or_charge_reported_usage(
             ),
             "released",
             0,
+            "assistant_transport_failure",
         ),
         (
             httpx.MockTransport(
@@ -256,6 +258,7 @@ def test_provider_failures_release_or_charge_reported_usage(
             ),
             "charged",
             None,
+            "assistant_transport_failure",
         ),
         (
             httpx.MockTransport(
@@ -265,6 +268,7 @@ def test_provider_failures_release_or_charge_reported_usage(
             ),
             "charged",
             None,
+            "assistant_transport_failure",
         ),
         (
             httpx.MockTransport(
@@ -279,6 +283,7 @@ def test_provider_failures_release_or_charge_reported_usage(
             ),
             "charged",
             38,
+            "assistant_transport_failure",
         ),
         (
             httpx.MockTransport(
@@ -288,6 +293,7 @@ def test_provider_failures_release_or_charge_reported_usage(
             ),
             "charged",
             None,
+            "assistant_transport_failure",
         ),
         (
             httpx.MockTransport(
@@ -297,6 +303,7 @@ def test_provider_failures_release_or_charge_reported_usage(
             ),
             "charged",
             None,
+            "assistant_timeout",
         ),
         (
             httpx.MockTransport(
@@ -307,6 +314,7 @@ def test_provider_failures_release_or_charge_reported_usage(
             ),
             "charged",
             None,
+            "assistant_invalid_response",
         ),
         (
             httpx.MockTransport(
@@ -321,6 +329,7 @@ def test_provider_failures_release_or_charge_reported_usage(
             ),
             "charged",
             53,
+            "assistant_invalid_response",
         ),
     ],
 )
@@ -331,16 +340,14 @@ def test_ollama_failure_reservation_accounting(
     transport: httpx.MockTransport,
     expected_status: str,
     expected_total: int | None,
+    expected_error_code: str,
 ) -> None:
     user, business = active_business(api_client, db_session)
     provider = ollama_accounting_provider(transport)
     app.dependency_overrides[get_owner_chat_provider] = lambda: provider
     response = submit(api_client, user, business["id"], "provider accounting")
     assert response.status_code == 503
-    assert response.json()["error"]["code"] == "assistant_unavailable"
-    assert response.json()["error"]["message"] == (
-        "The assistant is temporarily unavailable. Please retry."
-    )
+    assert response.json()["error"]["code"] == expected_error_code
     assert "private-provider-detail" not in response.text
     with migration_engine.connect() as connection:
         reservation = connection.execute(

@@ -117,6 +117,13 @@ value or polarity, the final answer must identify the conflict, ask for
 clarification, and cite exactly every involved source; ordinary complementary
 sources do not trigger that path.
 
+Owner chat routes each claimed turn in a fixed order: unavailable live operations,
+simple localized casual conversation, business questions with trusted evidence,
+general conversation or advice, then business-specific missing knowledge. Simple
+casual replies bypass embeddings and generation. General advice uses the same
+provider boundary in a context-isolated conversation mode with no business
+profile, knowledge, source citations, or permission to invent business facts.
+
 ## 8. Platform data versus operational business data
 
 Sou2AI PostgreSQL stores data the platform owns: users, business profiles,
@@ -326,7 +333,9 @@ The Gemini REST provider sends one non-streaming structured-generation request,
 keeps its API key in the request header, excludes hidden thinking from the parsed
 answer, and normalizes authentication, transport, timeout, rate-limit, blocked,
 truncated, malformed, and invalid-schema responses. Neither provider retries or
-falls back automatically, and owner-facing errors never expose provider payloads.
+falls back automatically. Owner-facing errors safely distinguish rate limiting,
+timeouts, transport failures, and unusable responses without naming a provider or
+exposing payloads, URLs, credentials, or internal exceptions.
 
 For grounded turns, retrieval re-authorizes `FULL_ACCESS` to the active business
 and filters candidates by the same `business_id`, ready document state, and active

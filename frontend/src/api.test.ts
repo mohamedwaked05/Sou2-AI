@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { api, resetApiSessionForTests } from "./api";
+import { api, ApiError, ownerChatErrorMessage, resetApiSessionForTests } from "./api";
 
 function response(body: unknown, status = 200) {
   return new Response(body === undefined ? null : JSON.stringify(body), {
@@ -121,5 +121,34 @@ describe("authentication session handling", () => {
     expect(new Headers(fetchMock.mock.calls[2][1]?.headers).has("Authorization")).toBe(
       false,
     );
+  });
+});
+
+describe("owner-chat error messages", () => {
+  it.each([
+    [
+      "assistant_rate_limited",
+      "The assistant is handling too many requests right now. Please try again later.",
+    ],
+    ["assistant_timeout", "The assistant took too long to respond. Please try again."],
+    [
+      "assistant_transport_failure",
+      "The assistant can't be reached right now. Please try again shortly.",
+    ],
+    [
+      "assistant_invalid_response",
+      "The assistant couldn't produce a usable response. Please try again.",
+    ],
+  ])("maps %s without exposing provider details", (code, expected) => {
+    const error = new ApiError(503, code, "private provider response body");
+
+    expect(ownerChatErrorMessage(error)).toBe(expected);
+    expect(ownerChatErrorMessage(error)).not.toContain("private provider");
+  });
+
+  it("keeps safe API messages for unrelated chat failures", () => {
+    expect(
+      ownerChatErrorMessage(new ApiError(429, "owner_chat_rate_limited", "Try later.")),
+    ).toBe("Try later.");
   });
 });

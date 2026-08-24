@@ -93,6 +93,22 @@ export class ApiError extends Error {
   }
 }
 
+export function ownerChatErrorMessage(error: unknown) {
+  if (!(error instanceof ApiError)) {
+    return "We couldn't reach the assistant. Please try again.";
+  }
+  const messages: Record<string, string> = {
+    assistant_rate_limited:
+      "The assistant is handling too many requests right now. Please try again later.",
+    assistant_timeout: "The assistant took too long to respond. Please try again.",
+    assistant_transport_failure:
+      "The assistant can't be reached right now. Please try again shortly.",
+    assistant_invalid_response:
+      "The assistant couldn't produce a usable response. Please try again.",
+  };
+  return messages[error.code] ?? error.message;
+}
+
 const configuredBase = import.meta.env.VITE_API_BASE_URL?.trim();
 const base = (configuredBase || "/api/v1").replace(/\/$/, "");
 let accessToken: string | null = null;

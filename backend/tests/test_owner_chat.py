@@ -309,7 +309,7 @@ def test_provider_failure_keeps_one_owner_message_and_retry_reuses_it(
     app.dependency_overrides[get_owner_chat_provider] = lambda: TimeoutProvider()
     failed = submit(api_client, user, business["id"], "Please remember this")
     assert failed.status_code == 503
-    assert failed.json()["error"]["code"] == "assistant_unavailable"
+    assert failed.json()["error"]["code"] == "assistant_timeout"
     messages = db_session.scalars(select(OwnerChatMessage)).all()
     assert len(messages) == 1
     assert messages[0].role == ChatMessageRole.OWNER
@@ -346,7 +346,7 @@ def test_ollama_connection_failure_is_safe_and_retry_is_idempotent(
     )
 
     assert failed.status_code == 503
-    assert failed.json()["error"]["code"] == "assistant_unavailable"
+    assert failed.json()["error"]["code"] == "assistant_transport_failure"
     messages = db_session.scalars(select(OwnerChatMessage)).all()
     assert len(messages) == 1
     assert messages[0].role == ChatMessageRole.OWNER

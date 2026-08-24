@@ -34,6 +34,7 @@ import {
   Business,
   ChatMessage,
   Document,
+  ownerChatErrorMessage,
   Usage,
   User,
   WorkingDay,
@@ -651,7 +652,7 @@ function ChatPage({ business }: { business: Business }) {
       setText("");
       await load();
     } catch (caught) {
-      setError(errorMessage(caught));
+      setError(ownerChatErrorMessage(caught));
     } finally {
       setSending(false);
     }

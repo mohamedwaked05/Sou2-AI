@@ -328,6 +328,75 @@ def test_mock_provider_is_network_free(
     assert result.provider_identifier == "mock"
 
 
+@pytest.mark.parametrize("adapter", ["ollama", "gemini"])
+def test_conversation_mode_omits_business_context_and_requires_empty_outputs(
+    adapter: str,
+) -> None:
+    captured: dict[str, object] = {}
+    request = replace(
+        provider_request(),
+        mode="conversation",
+        knowledge=(),
+        sources=(),
+        messages=(ProviderMessage(role="owner", content="How can I stay focused?"),),
+    )
+    structured = {
+        "reply": "Break the work into small steps.",
+        "cited_source_ids": [],
+        "proposed_knowledge": [],
+    }
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        payload = json.loads(http_request.content)
+        captured["payload"] = payload
+        if adapter == "ollama":
+            return httpx.Response(
+                200,
+                json={
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(structured),
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {"content": {"parts": [{"text": json.dumps(structured)}]}}
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 20,
+                    "candidatesTokenCount": 5,
+                    "totalTokenCount": 25,
+                },
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    provider: OwnerChatProvider = (
+        ollama_provider(transport)
+        if adapter == "ollama"
+        else gemini_provider(transport)
+    )
+    result = provider.generate(request)
+
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    system = (
+        payload["messages"][0]["content"]
+        if adapter == "ollama"
+        else payload["systemInstruction"]["parts"][0]["text"]
+    )
+    assert "Answer only general conversation or advice" in system
+    assert "empty cited_source_ids" in system
+    assert "Tenant Market" not in system
+    assert "return_policy" not in system
+    assert "returns.pdf" not in system
+    assert result.reply == "Break the work into small steps."
+    assert result.cited_source_ids == ()
+
+
 def test_mock_provider_honors_small_output_limit() -> None:
     request = replace(provider_request(), max_output_tokens=1)
 
@@ -841,13 +910,19 @@ def test_invalid_response_without_usage_is_uncertain() -> None:
 
 
 @pytest.mark.parametrize(
-    ("status_code", "expected_reason"),
-    [(404, "model_missing"), (500, "http_error")],
+    ("status_code", "expected_reason", "expected_error"),
+    [
+        (404, "model_missing", OwnerChatProviderUnavailable),
+        (408, "http_timeout", OwnerChatProviderTimeout),
+        (429, "rate_limited", OwnerChatProviderUnavailable),
+        (500, "http_error", OwnerChatProviderUnavailable),
+    ],
 )
 def test_http_errors_log_only_safe_machine_reason(
     monkeypatch: pytest.MonkeyPatch,
     status_code: int,
     expected_reason: str,
+    expected_error: type[OwnerChatProviderError],
 ) -> None:
     logged: list[tuple[object, ...]] = []
     monkeypatch.setattr(
@@ -860,9 +935,10 @@ def test_http_errors_log_only_safe_machine_reason(
         lambda request: httpx.Response(status_code, json={"error": private_error})
     )
 
-    with pytest.raises(OwnerChatProviderUnavailable):
+    with pytest.raises(expected_error) as raised:
         ollama_provider(transport).generate(provider_request())
 
+    assert raised.value.reason == expected_reason
     assert logged == [("Owner chat provider failed: reason=%s", expected_reason)]
     assert private_error not in repr(logged)
 

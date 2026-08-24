@@ -22,6 +22,8 @@ from app.agent.owner_chat_provider import (
     OwnerChatProvider,
     OwnerChatProviderError,
     OwnerChatProviderInvalidResponse,
+    OwnerChatProviderTimeout,
+    OwnerChatProviderUnavailable,
     OwnerChatRequest,
     OwnerChatResult,
     ProviderBusinessProfile,
@@ -101,6 +103,29 @@ def _provider_unavailable() -> ApplicationError:
         "The assistant is temporarily unavailable. Please retry.",
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         error_code="assistant_unavailable",
+    )
+
+
+def _safe_provider_failure(exc: OwnerChatProviderError) -> ApplicationError:
+    if isinstance(exc, OwnerChatProviderTimeout):
+        message = "The assistant took too long to respond. Please try again."
+        error_code = "assistant_timeout"
+    elif isinstance(exc, OwnerChatProviderInvalidResponse):
+        message = "The assistant returned an unusable response. Please try again."
+        error_code = "assistant_invalid_response"
+    elif isinstance(exc, OwnerChatProviderUnavailable) and exc.reason == "rate_limited":
+        message = (
+            "The assistant is handling too many requests right now. "
+            "Please try again later."
+        )
+        error_code = "assistant_rate_limited"
+    else:
+        message = "The assistant cannot be reached right now. Please try again."
+        error_code = "assistant_transport_failure"
+    return ApplicationError(
+        message,
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        error_code=error_code,
     )
 
 
@@ -457,6 +482,32 @@ def _search_query_text(value: str) -> str:
     return value if not expanded else f"{value}\nSearch concepts: {expanded}"
 
 
+def _is_general_conversation_request(value: str) -> bool:
+    concepts = _query_concepts(value)
+    if concepts - {
+        "inventory",
+        "sales",
+        "orders",
+        "revenue",
+        "restocking",
+        "appointments",
+    }:
+        return False
+    text = _normalized_classifier_text(value)
+    patterns = (
+        r"\bhow (?:can|could|do|should) (?:i|we)\b",
+        r"\b(?:give|offer) me (?:advice|tips|ideas)\b",
+        r"\b(?:brainstorm|explain|motivate|summarize)\b",
+        r"\b(?:tell|write) me (?:a |some )?(?:joke|story|ideas?)\b",
+        r"\bwhat do you think about\b",
+        r"(?:كيف فيني|كيف يمكنني|كيف فينا|شو بتنصح|اعطني نصائح|أعطني نصائح|"
+        r"نصائح|افكار|أفكار|اشرح|فسر)",
+        r"\b(?:kif fini|kif fine|kif fina|shu btensa7|nasi7a|nase7a|afkar|"
+        r"brainstorm|explain)\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
 def _is_live_operational_request(value: str) -> bool:
     operational = {
         "inventory",
@@ -466,7 +517,30 @@ def _is_live_operational_request(value: str) -> bool:
         "restocking",
         "appointments",
     }
-    return bool(_query_concepts(value) & operational)
+    concepts = _query_concepts(value) & operational
+    if not concepts:
+        return False
+    text = _normalized_classifier_text(value)
+    explicit_live = (
+        r"\b(?:current|today|tonight|now|latest|live|this (?:day|week|month)|"
+        r"how many|how much|best sell\w*|top sell\w*|in stock|available now)\b",
+        r"(?:الحالي|الحالية|اليوم|هلق|الان|الآن|قديش|كم|الأكثر مبيعا|"
+        r"الاكثر مبيعا|متوفر حاليا)",
+        r"\b(?:el yom|lyom|halla2|hala2|adde|current|latest|in stock)\b",
+    )
+    if any(re.search(pattern, text) for pattern in explicit_live):
+        return True
+    advice_markers = (
+        r"\b(?:advice|tips|ideas|strategy|strategies|plan|planning|manage|"
+        r"management|improve|increase|explain)\b",
+        r"(?:نصيحة|نصائح|افكار|أفكار|استراتيجية|خطة|ادارة|إدارة|تحسين|اشرح)",
+        r"\b(?:nasi7a|nase7a|afkar|strategy|plan|idara|ta7sin)\b",
+    )
+    if _is_general_conversation_request(value) and any(
+        re.search(pattern, text) for pattern in advice_markers
+    ):
+        return False
+    return True
 
 
 def _profile_evidence_texts(profile: ProviderBusinessProfile) -> tuple[str, ...]:
@@ -554,48 +628,8 @@ def _select_relevant_knowledge(
     )
 
 
-def _build_provider_request(
-    session: Session,
-    user: User,
-    business_id: uuid.UUID,
-    owner_message_id: uuid.UUID,
-    settings: Settings,
-) -> _PreparedTurn:
-    owner_message = session.get(OwnerChatMessage, owner_message_id)
-    business = session.scalar(
-        select(Business)
-        .where(Business.id == business_id)
-        .options(
-            selectinload(Business.opening_days).selectinload(BusinessOpeningDay.shifts)
-        )
-        .execution_options(populate_existing=True)
-    )
-    if owner_message is None or business is None:
-        raise _provider_unavailable()
-    messages = session.scalars(
-        select(OwnerChatMessage)
-        .where(
-            OwnerChatMessage.conversation_id == owner_message.conversation_id,
-            OwnerChatMessage.sequence_number <= owner_message.sequence_number,
-        )
-        .order_by(OwnerChatMessage.sequence_number.desc(), OwnerChatMessage.id.desc())
-        .limit(CHAT_CONTEXT_MESSAGE_LIMIT)
-    ).all()
-    messages.reverse()
-    now = utc_now()
-    knowledge = session.scalars(
-        select(BusinessKnowledge)
-        .where(
-            BusinessKnowledge.business_id == business_id,
-            or_(
-                BusinessKnowledge.expires_at.is_(None),
-                BusinessKnowledge.expires_at > now,
-            ),
-        )
-        .order_by(BusinessKnowledge.updated_at.desc(), BusinessKnowledge.id.desc())
-        .limit(settings.owner_chat_knowledge_context_limit)
-    ).all()
-    profile = ProviderBusinessProfile(
+def _provider_profile(business: Business) -> ProviderBusinessProfile:
+    return ProviderBusinessProfile(
         name=business.name,
         description=business.description or "",
         category=str(business.category or ""),
@@ -616,6 +650,88 @@ def _build_provider_request(
             for day in sorted(business.opening_days, key=lambda item: item.day_of_week)
         ),
     )
+
+
+def _provider_messages(
+    session: Session, owner_message: OwnerChatMessage
+) -> tuple[ProviderMessage, ...]:
+    messages = session.scalars(
+        select(OwnerChatMessage)
+        .where(
+            OwnerChatMessage.conversation_id == owner_message.conversation_id,
+            OwnerChatMessage.sequence_number <= owner_message.sequence_number,
+        )
+        .order_by(OwnerChatMessage.sequence_number.desc(), OwnerChatMessage.id.desc())
+        .limit(CHAT_CONTEXT_MESSAGE_LIMIT)
+    ).all()
+    messages.reverse()
+    return tuple(
+        ProviderMessage(role=str(message.role), content=message.content)
+        for message in messages
+    )
+
+
+def _load_provider_business(
+    session: Session, business_id: uuid.UUID
+) -> Business | None:
+    return session.scalar(
+        select(Business)
+        .where(Business.id == business_id)
+        .options(
+            selectinload(Business.opening_days).selectinload(BusinessOpeningDay.shifts)
+        )
+        .execution_options(populate_existing=True)
+    )
+
+
+def _build_conversation_request(
+    session: Session,
+    business_id: uuid.UUID,
+    owner_message_id: uuid.UUID,
+    settings: Settings,
+) -> _PreparedTurn:
+    owner_message = session.get(OwnerChatMessage, owner_message_id)
+    business = _load_provider_business(session, business_id)
+    if owner_message is None or business is None:
+        raise _provider_unavailable()
+    request = OwnerChatRequest(
+        profile=_provider_profile(business),
+        knowledge=(),
+        sources=(),
+        messages=_provider_messages(session, owner_message),
+        requested_at=utc_now(),
+        max_output_tokens=settings.owner_chat_max_output_tokens,
+        mode="conversation",
+    )
+    session.commit()
+    return _PreparedTurn(request=request, business=business, has_usable_evidence=True)
+
+
+def _build_provider_request(
+    session: Session,
+    user: User,
+    business_id: uuid.UUID,
+    owner_message_id: uuid.UUID,
+    settings: Settings,
+) -> _PreparedTurn:
+    owner_message = session.get(OwnerChatMessage, owner_message_id)
+    business = _load_provider_business(session, business_id)
+    if owner_message is None or business is None:
+        raise _provider_unavailable()
+    now = utc_now()
+    knowledge = session.scalars(
+        select(BusinessKnowledge)
+        .where(
+            BusinessKnowledge.business_id == business_id,
+            or_(
+                BusinessKnowledge.expires_at.is_(None),
+                BusinessKnowledge.expires_at > now,
+            ),
+        )
+        .order_by(BusinessKnowledge.updated_at.desc(), BusinessKnowledge.id.desc())
+        .limit(settings.owner_chat_knowledge_context_limit)
+    ).all()
+    profile = _provider_profile(business)
     profile_evidence = _profile_evidence_texts(profile)
     knowledge_evidence = tuple(
         f"{record.subject_key}: {record.content}" for record in knowledge
@@ -659,10 +775,7 @@ def _build_provider_request(
         profile=profile,
         knowledge=selected_knowledge,
         sources=sources,
-        messages=tuple(
-            ProviderMessage(role=str(message.role), content=message.content)
-            for message in messages
-        ),
+        messages=_provider_messages(session, owner_message),
         requested_at=now,
         max_output_tokens=settings.owner_chat_max_output_tokens,
     )
@@ -805,6 +918,10 @@ def _fallback_language(message: str, default_language: str) -> str:
             "فيني",
             "فيك",
             "مش",
+            "كيفك",
+            "أهلين",
+            "مرسي",
+            "تمام",
         )
         return (
             "lebanese_arabic"
@@ -813,12 +930,150 @@ def _fallback_language(message: str, default_language: str) -> str:
         )
     franco_markers = re.search(
         r"(?i)\b(?:shu|shou|wen|wein|emta|adde|addesh|kif|leish|lesh|"
-        r"nhar|fina|fine|fik|bte[a-z]*|bt[a-z]+|hal|mawdu3)\b",
+        r"nhar|fina|fine|fik|bte[a-z]*|bt[a-z]+|hal|mawdu3|marhaba|"
+        r"ahla|ahlein|merci|shukran|chokran|tamam|fhemet|kifak|kifik|"
+        r"bshoufak|yalla)\b",
         message,
     )
     if re.search(r"(?i)(?:[a-z][2356789]|[2356789][a-z])", message) or franco_markers:
         return "franco_arabic"
+    if latin_count:
+        return "english"
     return "arabic" if default_language == "ar" else "english"
+
+
+def _casual_intent(message: str) -> str | None:
+    normalized = _normalized_classifier_text(message)
+    text = " ".join(
+        part for part in re.split(r"[\W_]+", normalized, flags=re.UNICODE) if part
+    )
+    phrases = {
+        "greeting": {
+            "hi",
+            "hello",
+            "hey",
+            "good morning",
+            "good evening",
+            "مرحبا",
+            "اهلا",
+            "اهلين",
+            "السلام عليكم",
+            "صباح الخير",
+            "مساء الخير",
+            "marhaba",
+            "ahla",
+            "ahlein",
+            "salam",
+            "saba7 el kheir",
+            "hi مرحبا",
+            "hello مرحبا",
+        },
+        "thanks": {
+            "thanks",
+            "thank you",
+            "many thanks",
+            "شكرا",
+            "مشكور",
+            "يسلمو",
+            "مرسي",
+            "merci",
+            "shukran",
+            "chokran",
+            "thanks شكرا",
+        },
+        "acknowledgement": {
+            "ok",
+            "okay",
+            "got it",
+            "sounds good",
+            "great",
+            "yes",
+            "حسنا",
+            "تمام",
+            "موافق",
+            "فهمت",
+            "اي",
+            "ايوه",
+            "tamam",
+            "fhemet",
+            "eh",
+            "okay تمام",
+        },
+        "wellbeing": {
+            "how are you",
+            "how is it going",
+            "hows it going",
+            "كيف حالك",
+            "كيفك",
+            "شو الاخبار",
+            "kifak",
+            "kifik",
+            "shu el akhbar",
+            "hi how are you",
+            "مرحبا كيفك",
+            "hi كيفك",
+        },
+        "goodbye": {
+            "bye",
+            "goodbye",
+            "see you",
+            "talk later",
+            "مع السلامة",
+            "الى اللقاء",
+            "باي",
+            "يلا باي",
+            "bye bye",
+            "yalla bye",
+            "bshoufak",
+            "bshoufik",
+            "bye باي",
+        },
+    }
+    return next(
+        (intent for intent, options in phrases.items() if text in options), None
+    )
+
+
+def _casual_reply(message: str, default_language: str, intent: str) -> str:
+    language = _fallback_language(message, default_language)
+    replies = {
+        "english": {
+            "greeting": "Hi! How can I help?",
+            "thanks": "You're welcome!",
+            "acknowledgement": "Got it.",
+            "wellbeing": "I'm doing well, thanks! How can I help?",
+            "goodbye": "Goodbye! Talk soon.",
+        },
+        "arabic": {
+            "greeting": "مرحباً! كيف يمكنني مساعدتك؟",
+            "thanks": "على الرحب والسعة!",
+            "acknowledgement": "حسناً، فهمت.",
+            "wellbeing": "أنا بخير، شكراً! كيف يمكنني مساعدتك؟",
+            "goodbye": "إلى اللقاء!",
+        },
+        "lebanese_arabic": {
+            "greeting": "أهلين! كيف فيني ساعدك؟",
+            "thanks": "أهلا وسهلا!",
+            "acknowledgement": "تمام، فهمت.",
+            "wellbeing": "منيح، شكراً! كيف فيني ساعدك؟",
+            "goodbye": "يلا باي، بشوفك!",
+        },
+        "franco_arabic": {
+            "greeting": "Ahlein! Kif fine se3dak?",
+            "thanks": "Ahla w sahla!",
+            "acknowledgement": "Tamam, fhemet.",
+            "wellbeing": "Mnih, merci! Kif fine se3dak?",
+            "goodbye": "Yalla bye, bshoufak!",
+        },
+        "mixed": {
+            "greeting": "Hi! كيف فيني help?",
+            "thanks": "You're welcome، أهلا وسهلا!",
+            "acknowledgement": "Got it، تمام.",
+            "wellbeing": "I'm doing well، شكراً! كيف فيني help?",
+            "goodbye": "Goodbye، يلا باي!",
+        },
+    }
+    return replies[language][intent]
 
 
 def _missing_knowledge_reply(message: str, default_language: str) -> str:
@@ -1207,9 +1462,25 @@ def _generate_claimed_turn(
             )
             _persist_result(session, business_id, claim, live_result, None, None, ())
             return
-        prepared = _build_provider_request(
-            session, user, business_id, claim.message_id, settings
-        )
+        casual_intent = _casual_intent(owner_message.content)
+        if casual_intent is not None:
+            casual_result = OwnerChatResult(
+                reply=_casual_reply(
+                    owner_message.content,
+                    business.default_language,
+                    casual_intent,
+                )
+            )
+            _persist_result(session, business_id, claim, casual_result, None, None, ())
+            return
+        if _is_general_conversation_request(owner_message.content):
+            prepared = _build_conversation_request(
+                session, business_id, claim.message_id, settings
+            )
+        else:
+            prepared = _build_provider_request(
+                session, user, business_id, claim.message_id, settings
+            )
         request = prepared.request
         business = prepared.business
         conflict_labels = _conflicting_source_labels(request.sources)
@@ -1248,6 +1519,13 @@ def _generate_claimed_turn(
                 )
             raise
         result = _validate_result(provider.generate(request), request)
+        if request.mode == "conversation":
+            result = OwnerChatResult(
+                reply=result.reply,
+                usage=result.usage,
+                provider_identifier=result.provider_identifier,
+                model_identifier=result.model_identifier,
+            )
         if conflict_labels:
             result = _enforce_conflict_result(
                 result,
@@ -1289,7 +1567,7 @@ def _generate_claimed_turn(
             provider_identifier=exc.provider_identifier,
             model_identifier=exc.model_identifier,
         )
-        raise _provider_unavailable() from None
+        raise _safe_provider_failure(exc) from None
     except ApplicationError:
         raise
     except Exception:

@@ -3,7 +3,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { App } from "./App";
-import { api } from "./api";
+import { api, ApiError } from "./api";
 
 afterEach(() => {
   cleanup();
@@ -83,4 +83,55 @@ it("renders only the supported tenant-scoped workspace navigation", async () => 
     within(menu).getByRole("menuitem", { name: /profile and theme/i }),
   ).toHaveFocus();
   expect(within(menu).getByRole("menuitem", { name: /sign out/i })).toBeInTheDocument();
+});
+
+it("shows the classified owner-chat provider error", async () => {
+  vi.spyOn(api, "restoreSession").mockResolvedValueOnce({
+    id: "owner-1",
+    email: "owner@example.com",
+    first_name: "Maya",
+    last_name: "Haddad",
+    email_verified_at: "2026-08-23T08:00:00Z",
+    status: "ACTIVE",
+  });
+  vi.spyOn(api, "business").mockResolvedValueOnce({
+    id: "business-1",
+    name: "Maya Bakery",
+    description: "A neighborhood bakery.",
+    category: "BAKERY",
+    custom_category: null,
+    default_language: "en",
+    governorate: "Beirut",
+    district: "Beirut",
+    city: "Beirut",
+    address_line: "Hamra Street",
+    status: "ACTIVE",
+    is_active: true,
+    profile_complete: true,
+    first_incomplete_section: null,
+    onboarding_submitted_at: "2026-08-23T08:00:00Z",
+    working_hours: [],
+  });
+  vi.spyOn(api, "messages").mockResolvedValue({ items: [], next_cursor: null });
+  vi.spyOn(api, "send").mockRejectedValueOnce(
+    new ApiError(503, "assistant_timeout", "generic error"),
+  );
+
+  render(
+    <MemoryRouter initialEntries={["/businesses/business-1/chat"]}>
+      <App />
+    </MemoryRouter>,
+  );
+
+  await screen.findByRole("heading", { name: "AI Chat", level: 1 });
+  fireEvent.change(screen.getByRole("textbox", { name: "Message Sou2AI" }), {
+    target: { value: "How can I stay focused?" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+  expect(
+    await screen.findByText(
+      "The assistant took too long to respond. Please try again.",
+    ),
+  ).toBeInTheDocument();
 });
