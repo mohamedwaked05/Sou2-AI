@@ -122,6 +122,8 @@ class MetaWhatsAppAdapter:
         return tuple(events)
 
     def send_text(self, recipient: str, text: str) -> SendTextResult:
+        if not self.profile.access_token:
+            raise ChannelError("channel.configuration_unavailable", retryable=False)
         try:
             with httpx.Client(
                 base_url="https://graph.facebook.com",

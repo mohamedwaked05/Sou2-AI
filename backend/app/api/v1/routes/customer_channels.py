@@ -71,7 +71,7 @@ def verify_webhook(
         )
     try:
         adapter = MetaWhatsAppAdapter(
-            _registry(settings).resolve("meta_whatsapp_cloud")
+            _registry(settings).resolve("meta_whatsapp_cloud", require_outbound=False)
         )
     except ChannelProfileUnavailable:
         raise ApplicationError(
@@ -122,7 +122,7 @@ async def receive_webhook(
         )
     try:
         adapter = MetaWhatsAppAdapter(
-            _registry(settings).resolve("meta_whatsapp_cloud")
+            _registry(settings).resolve("meta_whatsapp_cloud", require_outbound=False)
         )
     except ChannelProfileUnavailable:
         raise ApplicationError(
