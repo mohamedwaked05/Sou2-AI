@@ -30,6 +30,20 @@ Milestone 14 connects that retrieval to grounded owner chat and Gemini; Mileston
 operational dashboards, write tools, payments, invitations, and additional
 roles remain outside the current implementation boundary.
 
+Milestone 19 adds WhatsApp customer messaging. Meta Cloud API webhooks are
+admitted through content-type, body-size, and constant-time HMAC-SHA-256 signature
+gates before any parsing. Customer phone numbers are stored only as an HMAC lookup
+identifier plus an AES-256-GCM encrypted reversible identifier; a masked label is
+the only form exposed in API responses or logs. Business knowledge and documents are
+private by default (`customer_visible = false`) and must be explicitly made visible.
+The inbound worker enforces handoff, private-operational, and prompt-injection guards;
+per-conversation and per-business hourly rate limits; and owner-reserve protection
+at the database level. The outbound outbox retries on transient channel errors and
+marks messages permanently failed after three attempts. Two new environment
+variables are required: `CUSTOMER_IDENTITY_ENCRYPTION_KEY` (32-character minimum)
+and `CUSTOMER_IDENTITY_HMAC_KEY` (32-character minimum). Set them in the local
+`.env` file, which is git-ignored. Never commit their values.
+
 ## Requirements
 
 Use Python 3.14. The selected package versions declare Python 3.14 support.
