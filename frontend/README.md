@@ -15,6 +15,12 @@ with confirmation. Archived history remains readable and the AI Chat composer is
 disabled for it. Layouts adapt to desktop, tablet, and mobile, and internal rolling
 summaries are never returned or displayed.
 
+The WhatsApp page (Milestone 19) lists customer conversations for the active
+channel connection. Each conversation shows the masked customer label, AI or
+handoff state, and the message thread. The owner can send a manual reply (with
+explicit confirmation), trigger human handoff, or resume AI handling. Customer
+identities are shown only as masked labels; raw phone numbers are never displayed.
+
 Run `npm install`, then `npm run dev`. Checks: `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm test`, and `npm run build`.
 
 Place the user-provided final transparent royal-blue logo at `public/sou2ai-logo.png`; no replacement logo is included here.

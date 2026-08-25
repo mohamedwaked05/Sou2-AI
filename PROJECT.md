@@ -428,7 +428,7 @@ allowance. Current operational results, profile data, authorized RAG evidence, a
 the current owner message always outrank recent conversation and untrusted summary
 memory. No customer or external-channel conversation work is included.
 
-### Milestone 19: External customer messaging integrations
+### Milestone 19: In Progress — WhatsApp customer messaging
 
 * Add channels such as WhatsApp only after the core assistant is reliable.
 * Verify webhooks and map each channel connection and conversation to one business.
@@ -444,6 +444,27 @@ memory. No customer or external-channel conversation work is included.
   customers from consuming the owner reserve.
 * Decide exact customer and WhatsApp ceilings when their webhook and concurrency
   architecture is implemented.
+
+The Meta Cloud API webhook is verified (constant-time HMAC-SHA-256 on the raw
+body) and admitted through content-type, body-size, and signature gates before
+any parsing occurs. Each business's WhatsApp connection references an allowlisted
+deployment profile; raw credentials are never stored or returned. Customer phone
+numbers are stored only as an HMAC lookup identifier plus an AES-256-GCM
+encrypted reversible identifier; the only form ever exposed in API responses or
+logs is a masked label (`WhatsApp ••••NNNN`). The inbound worker enforces handoff,
+private-operational, and prompt-injection pattern guards before any AI call;
+per-conversation and per-business hourly admission gates block further customer
+traffic without consuming AI tokens; owner-reserved tokens are protected at the
+database function level so customer requests cannot consume them. Outbound
+messages are committed before being enqueued, retried up to three times on
+transient channel errors, and marked permanently failed on non-retryable errors or
+ceiling exhaustion. Delivery and read status updates are idempotent. Customer AI
+requests receive `mode="customer"` with no owner rolling summary, no owner
+conversation history, and no operational tools; private knowledge and documents
+are excluded by default and must be explicitly marked `customer_visible`.
+Eleven management routes cover connection lifecycle, conversation listing, manual
+reply with explicit confirmation, human handoff, and AI resume. The React
+workspace UI and API client are complete.
 
 ### Milestone 20: Production readiness and cloud deployment
 

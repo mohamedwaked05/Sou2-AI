@@ -627,14 +627,127 @@ chat, deterministic mock, Gemini, and
 optional local Ollama generation providers, managed permanent/temporary learned
 knowledge, pgvector/BGE-M3 retrieval, private document ingestion and processing,
 grounded answers with persisted citations, PostgreSQL-backed API limits and AI
-budgets, the HTTP/logging security boundary, the React business interface, and
+budgets, the HTTP/logging security boundary, the React business interface,
 Milestone 16's provider-neutral contracts, fake-store PostgreSQL adapter,
-tenant-scoped lifecycle API, and responsive Data Sources UI, plus Milestone 17's
+tenant-scoped lifecycle API, and responsive Data Sources UI, Milestone 17's
 four-tool read-only registry, centralized executor, bounded owner-chat loop, and
-privacy-minimal tool auditing. Customer chat, WhatsApp, operational writes,
-billing, and activation/admin APIs remain future work.
+privacy-minimal tool auditing, Milestone 18's multi-conversation history, rolling
+memory, and tenant-scoped summarization, and Milestone 19's WhatsApp customer
+messaging channel with provider-neutral adapter contracts, HMAC identity and
+encrypted phone storage, customer-visible knowledge isolation, per-conversation
+and per-business hourly rate limiting with owner-reserve protection, and the
+outbound outbox with retry and deduplication. Operational writes, billing, and
+activation/admin APIs remain future work.
 
-## 17. Milestone 12 document ingestion
+## 17. WhatsApp customer messaging channel
+
+### 17.1 Messaging channel boundary
+
+Each business may register at most one active WhatsApp connection per channel type.
+A `MessagingChannelConnection` binds the business to an allowlisted deployment
+profile key; raw credentials (access token, app secret, verify token) are never
+stored and are never returned by any API response. The connection advances through
+`PENDING → VALIDATED → ACTIVE → DISABLED` states; only `ACTIVE` connections
+receive inbound events or send outbound messages. The `MessagingConnectionStatus`
+guard trigger rejects immutable scope fields (business, provider type, profile key,
+and creation timestamp) on update.
+
+### 17.2 Webhook verification and admission
+
+The Meta Cloud API sends `GET` verification challenges and `POST` event payloads
+to `/api/v1/channels/whatsapp/webhook`. Challenge verification compares the
+supplied `hub.verify_token` to the value in the allowlisted profile using constant-
+time comparison; challenges for unknown or disabled channels return 404 without
+leaking the expected token.
+
+Every `POST` is admitted in order:
+
+1. `Content-Type` must be `application/json`; any other value is rejected with 400
+   before reading the body.
+2. A declared `Content-Length` header above `whatsapp_webhook_max_bytes` (default
+   65 536) is rejected immediately without reading the body.
+3. The raw body is read in full; if it exceeds the limit after reading it is
+   rejected.
+4. `X-Hub-Signature-256` is validated with constant-time HMAC-SHA-256 against the
+   raw body using the profile app secret; missing or invalid signatures return 401.
+5. Parsed events are deduplicated by `provider_event_id` before any work is
+   queued.
+
+Signature verification always uses the raw body before any parsing. A bad
+signature prevents parsing. A bad parse after a valid signature returns 422; no
+customer record is created and no queue job is submitted.
+
+### 17.3 Customer conversation and outbox lifecycle
+
+Each inbound text event identifies the business through the allowlisted
+`phone_number_id` only — the payload business ID is ignored. The customer's phone
+number is stored only as an HMAC lookup identifier and an encrypted reversible
+identifier (AES-256-GCM with a per-encryption random IV). A masked label of the
+form `WhatsApp ••••NNNN` is the only customer identity ever exposed in API
+responses, logs, or error messages. Raw phone numbers and decrypted identities are
+never logged, never returned by any endpoint, and never stored in plaintext.
+Delivery webhook payloads (including status codes, error codes, and response
+bodies) are never stored.
+
+After deduplication an `InboundWebhookDelivery` record is written and the message
+ID is queued. The worker:
+
+1. Claims the inbound message with `SELECT … FOR UPDATE SKIP LOCKED` to prevent
+   concurrent duplicate processing.
+2. Checks for handoff intent (regex), private/operational intent (regex), and
+   prompt-injection patterns (regex); each triggers a deterministic static reply
+   and queues it for delivery without calling the AI provider and without
+   consuming any token reservation.
+3. Enforces hourly per-conversation and per-business rate admission using a
+   database advisory lock; rejected messages are marked `FAILED` with
+   `customer.rate_limited` and consume no AI tokens.
+4. Reserves AI tokens via `sou2ai_reserve_customer_message_usage`, which
+   delegates to `sou2ai_reserve_ai_usage`. The customer effective limit is
+   `allowance − (allowance × owner_reserve_percent / 100)`, so customer traffic
+   can never consume the owner-reserved portion of the daily allowance.
+5. Calls the AI provider with `mode="customer"`: no rolling summary, no owner
+   conversation history, no operational tools.
+6. Strips source-label tokens from the reply, truncates at 4 000 characters,
+   and writes the outbound message in the same transaction as the usage
+   reconciliation. The commit happens before the outbound queue job is submitted.
+
+The outbound worker decrypts the recipient identity only at send time, sends
+the message through the Meta Graph API, and on transient failure schedules a
+retry with `delay_seconds = retry_after_seconds ?? (5 × attempts)`. Permanent
+failure (non-retryable `ChannelError` or exhausted `whatsapp_outbound_max_attempts`,
+default 3) marks the message `FAILED` immediately with no further retry. Outbound
+delivery is best-effort; exactly-once external delivery is not guaranteed.
+Delivery and read status events from Meta update the outbound message status
+monotonically (sent → delivered → read); duplicate or out-of-order events are
+safe and idempotent.
+
+### 17.4 Customer-visible knowledge boundary
+
+`BusinessKnowledge` rows and `KnowledgeDocument` rows each carry a
+`customer_visible` column that defaults to `false` at both the application and
+database level. The customer AI request path filters knowledge and documents
+exclusively on `customer_visible = true`. The owner request path remains
+unchanged and reads all knowledge regardless of visibility. No private knowledge,
+owner memory, owner rolling summary, or operational tool output can reach the
+customer AI request.
+
+### 17.5 Customer rate limiting and accounting
+
+Rate admission (`_admit_rate`) acquires a PostgreSQL advisory lock on the business
+ID, checks the last hour of `CustomerGenerationRateEvent` records for both the
+conversation and the business, and rejects the request if either ceiling is met.
+The event row is written in the same transaction as the admission check, making
+the counter durable. A repeated attempt on the same `customer_message_id` returns
+`True` immediately (idempotency guard) without inserting a duplicate row.
+
+Token accounting reuses the owner-chat reservation/reconcile pair. The DB
+function checks the existing reservation for the same `customer_message_id` and
+returns it on a duplicate call, so concurrent or replayed workers cannot double-
+charge a single generation. The channel is always `whatsapp` and the capability
+always `customer_chat`; `owner_message_id` and `user_id` are always `NULL` to
+prevent cross-channel attribution.
+
+## 18. Milestone 12 document ingestion
 
 An authenticated full-access member of an `ACTIVE` business submits a PDF, DOCX,
 or UTF-8 TXT source document to the API. The API streams it into a temporary file
