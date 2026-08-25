@@ -8,12 +8,16 @@ from app.api.dependencies import get_current_user
 from app.core.config import Settings, get_settings
 from app.database.models import User
 from app.database.session import get_db_session
-from app.schemas.knowledge_documents import KnowledgeDocumentResponse
+from app.schemas.knowledge_documents import (
+    KnowledgeDocumentResponse,
+    KnowledgeDocumentVisibilityRequest,
+)
 from app.services.knowledge_documents import (
     get_document,
     list_documents,
     remove,
     retry,
+    set_customer_visibility,
     upload,
 )
 
@@ -53,6 +57,21 @@ def detail(
     user: AuthenticatedUser,
 ) -> KnowledgeDocumentResponse:
     return get_document(session, user, business_id, document_id)
+
+
+@router.patch(
+    "/{document_id}/customer-visibility", response_model=KnowledgeDocumentResponse
+)
+def visibility(
+    business_id: uuid.UUID,
+    document_id: uuid.UUID,
+    body: KnowledgeDocumentVisibilityRequest,
+    session: DatabaseSession,
+    user: AuthenticatedUser,
+) -> KnowledgeDocumentResponse:
+    return set_customer_visibility(
+        session, user, business_id, document_id, body.customer_visible
+    )
 
 
 @router.post(

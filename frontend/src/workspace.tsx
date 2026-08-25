@@ -19,8 +19,10 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Plus,
+  RefreshCw,
   Send,
   Settings,
+  Smartphone,
   Store,
   Trash2,
   Upload,
@@ -43,10 +45,13 @@ import {
   Business,
   ChatMessage,
   Conversation,
+  CustomerConversation,
+  CustomerMessage,
   Document,
   ownerChatErrorMessage,
   Usage,
   User,
+  WhatsAppConnection,
   WorkingDay,
 } from "./api";
 import { ScheduleEditor } from "./businesses";
@@ -924,6 +929,7 @@ function Message({ message }: { message: ChatMessage }) {
 }
 
 function ConversationsPage({ business }: { business: Business }) {
+  const [channel, setChannel] = useState<"owner" | "whatsapp">("owner");
   const [conversations, setConversations] = useState<Conversation[] | null>(null);
   const [selected, setSelected] = useState<Conversation | null>(null);
   const [messages, setMessages] = useState<ChatMessage[] | null>(null);
@@ -937,6 +943,7 @@ function ConversationsPage({ business }: { business: Business }) {
     selected?.id ?? business.id,
   );
   const loadConversations = useCallback(async () => {
+    if (channel !== "owner") return;
     try {
       const response = await api.conversations(business.id, true);
       setConversations(response.items);
@@ -952,11 +959,12 @@ function ConversationsPage({ business }: { business: Business }) {
       setConversations([]);
       setError(errorMessage(caught));
     }
-  }, [business.id]);
+  }, [business.id, channel]);
   useEffect(() => {
     void loadConversations();
   }, [loadConversations]);
   useEffect(() => {
+    if (channel !== "owner") return;
     if (!selectedConversationId) {
       setMessages([]);
       return;
@@ -969,7 +977,7 @@ function ConversationsPage({ business }: { business: Business }) {
         setMessages([]);
         setError(errorMessage(caught));
       });
-  }, [business.id, selectedConversationId]);
+  }, [business.id, channel, selectedConversationId]);
 
   async function createNewConversation() {
     setBusy("create");
@@ -1004,6 +1012,15 @@ function ConversationsPage({ business }: { business: Business }) {
     }
   }
 
+  if (channel === "whatsapp") {
+    return (
+      <WhatsAppConversations
+        business={business}
+        onSelectOwner={() => setChannel("owner")}
+      />
+    );
+  }
+
   return (
     <>
       <PageHeading
@@ -1025,6 +1042,7 @@ function ConversationsPage({ business }: { business: Business }) {
           </button>
         }
       />
+      <ConversationChannelTabs channel="owner" onChange={setChannel} />
       {error && <Alert>{error}</Alert>}
       {conversations === null ? (
         <div className="conversation-workspace">
@@ -1173,6 +1191,345 @@ function ConversationsPage({ business }: { business: Business }) {
                 onClick={() => void archiveSelected()}
               >
                 <BusyLabel busy={busy === "archive"} idle="Archive conversation" />
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function ConversationChannelTabs({
+  channel,
+  onChange,
+}: {
+  channel: "owner" | "whatsapp";
+  onChange: (channel: "owner" | "whatsapp") => void;
+}) {
+  return (
+    <div className="channel-tabs" role="tablist" aria-label="Conversation channel">
+      <button
+        type="button"
+        role="tab"
+        aria-selected={channel === "owner"}
+        className={channel === "owner" ? "selected" : ""}
+        onClick={() => onChange("owner")}
+      >
+        <MessageSquare size={17} /> Owner
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={channel === "whatsapp"}
+        className={channel === "whatsapp" ? "selected" : ""}
+        onClick={() => onChange("whatsapp")}
+      >
+        <Smartphone size={17} /> WhatsApp
+      </button>
+    </div>
+  );
+}
+
+function WhatsAppConversations({
+  business,
+  onSelectOwner,
+}: {
+  business: Business;
+  onSelectOwner: () => void;
+}) {
+  const [conversations, setConversations] = useState<CustomerConversation[] | null>(
+    null,
+  );
+  const [selected, setSelected] = useState<CustomerConversation | null>(null);
+  const [messages, setMessages] = useState<CustomerMessage[] | null>(null);
+  const [reply, setReply] = useState("");
+  const [confirmReply, setConfirmReply] = useState(false);
+  const [busy, setBusy] = useState<"reply" | "handoff" | "resume" | "">("");
+  const [error, setError] = useState("");
+  const selectedId = selected?.id ?? null;
+  const scroll = usePinnedToBottom(
+    messages,
+    messages !== null,
+    selectedId ?? business.id,
+  );
+
+  const load = useCallback(async () => {
+    setError("");
+    try {
+      const result = await api.customerConversations(business.id);
+      setConversations(result.items);
+      setSelected((current) =>
+        current
+          ? (result.items.find((item) => item.id === current.id) ?? null)
+          : (result.items[0] ?? null),
+      );
+    } catch (caught) {
+      setConversations([]);
+      setError(errorMessage(caught));
+    }
+  }, [business.id]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  useEffect(() => {
+    if (!selectedId) {
+      setMessages([]);
+      return;
+    }
+    setMessages(null);
+    api
+      .customerMessages(business.id, selectedId)
+      .then((result) => setMessages(result.items))
+      .catch((caught) => {
+        setMessages([]);
+        setError(errorMessage(caught));
+      });
+  }, [business.id, selectedId]);
+
+  async function changeHandoff(handoff: boolean) {
+    if (!selected) return;
+    setBusy(handoff ? "handoff" : "resume");
+    setError("");
+    try {
+      const updated = handoff
+        ? await api.handoffCustomerConversation(business.id, selected.id)
+        : await api.resumeCustomerConversation(business.id, selected.id);
+      setSelected(updated);
+      setConversations(
+        (items) =>
+          items?.map((item) => (item.id === updated.id ? updated : item)) ?? [],
+      );
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function sendConfirmedReply() {
+    if (!selected || !reply.trim()) return;
+    setBusy("reply");
+    setError("");
+    try {
+      const created = await api.sendCustomerReply(
+        business.id,
+        selected.id,
+        reply.trim(),
+      );
+      setMessages((items) => [...(items ?? []), created]);
+      setReply("");
+      setConfirmReply(false);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <>
+      <PageHeading
+        title="Conversations"
+        description="View customer-safe WhatsApp conversations and delivery states."
+      />
+      <ConversationChannelTabs
+        channel="whatsapp"
+        onChange={(next) => next === "owner" && onSelectOwner()}
+      />
+      {error && <Alert>{error}</Alert>}
+      {conversations === null ? (
+        <div className="conversation-workspace">
+          <Skeleton className="h-64" />
+          <Skeleton className="h-64" />
+        </div>
+      ) : conversations.length ? (
+        <div className="conversation-workspace">
+          <aside className="panel conversation-index" aria-label="WhatsApp customers">
+            <div className="panel-heading">
+              <div>
+                <h2>WhatsApp customers</h2>
+                <p>Customer identities stay masked.</p>
+              </div>
+              <span className="count-badge">{conversations.length}</span>
+            </div>
+            <div className="conversation-index-list">
+              {conversations.map((conversation) => (
+                <button
+                  type="button"
+                  key={conversation.id}
+                  className={conversation.id === selected?.id ? "selected" : ""}
+                  aria-pressed={conversation.id === selected?.id}
+                  onClick={() => setSelected(conversation)}
+                >
+                  <span>
+                    <strong>{conversation.masked_customer_label}</strong>
+                    <em>
+                      {conversation.state === "HUMAN_HANDOFF" ? "Handoff" : "AI active"}
+                    </em>
+                  </span>
+                  <p>{conversation.latest_message_preview ?? "No messages yet"}</p>
+                  <time
+                    dateTime={conversation.last_message_at ?? conversation.created_at}
+                  >
+                    {formatDateTime(
+                      conversation.last_message_at ?? conversation.created_at,
+                    )}
+                  </time>
+                </button>
+              ))}
+            </div>
+          </aside>
+          <section className="panel conversation-history customer-history">
+            {selected && (
+              <div className="panel-heading conversation-detail-heading">
+                <div>
+                  <h2>{selected.masked_customer_label}</h2>
+                  <p>
+                    {selected.state === "HUMAN_HANDOFF"
+                      ? "Human handoff · AI replies paused"
+                      : "AI active · customer-visible knowledge only"}
+                  </p>
+                </div>
+                <div className="conversation-actions">
+                  {selected.state === "HUMAN_HANDOFF" ? (
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      disabled={Boolean(busy)}
+                      onClick={() => void changeHandoff(false)}
+                    >
+                      <BusyLabel busy={busy === "resume"} idle="Resume AI" />
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      disabled={Boolean(busy)}
+                      onClick={() => void changeHandoff(true)}
+                    >
+                      <BusyLabel busy={busy === "handoff"} idle="Enter handoff" />
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+            {messages === null ? (
+              <Skeleton className="h-64" />
+            ) : messages.length ? (
+              <div
+                ref={scroll.viewportRef}
+                className="conversation-list customer-message-list"
+                role="log"
+                aria-label="WhatsApp conversation history"
+                onScroll={scroll.onScroll}
+              >
+                {messages.map((message) => (
+                  <article
+                    key={message.id}
+                    className={`customer-message customer-message-${message.direction}`}
+                  >
+                    <div>
+                      <strong>
+                        {message.sender === "customer"
+                          ? selected?.masked_customer_label
+                          : message.sender === "owner"
+                            ? "Owner"
+                            : "Sou2AI"}
+                      </strong>
+                      <p>{message.content}</p>
+                      <span>
+                        {message.direction === "outbound"
+                          ? message.status.toLowerCase().replace("_", " ")
+                          : "received"}
+                      </span>
+                      <time dateTime={message.created_at}>
+                        {formatDateTime(message.created_at)}
+                      </time>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <TruthfulEmpty
+                icon={Smartphone}
+                title="No WhatsApp messages"
+                text="Verified inbound text messages will appear here."
+              />
+            )}
+            {selected && (
+              <div className="customer-reply-composer">
+                <label className="field-label">
+                  Manual reply
+                  <textarea
+                    className="input"
+                    rows={3}
+                    maxLength={4000}
+                    value={reply}
+                    placeholder="Write a customer-safe text reply"
+                    onChange={(event) => setReply(event.target.value)}
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={!reply.trim() || Boolean(busy)}
+                  onClick={() => setConfirmReply(true)}
+                >
+                  <Send size={17} /> Send manual reply
+                </button>
+              </div>
+            )}
+          </section>
+        </div>
+      ) : (
+        <section className="panel conversation-history">
+          <TruthfulEmpty
+            icon={Smartphone}
+            title="No WhatsApp conversations"
+            text="Connect and activate WhatsApp in Business Settings. Verified customer messages will appear here."
+          />
+        </section>
+      )}
+      {confirmReply && selected && (
+        <div className="dialog-layer" role="presentation">
+          <button
+            type="button"
+            className="dialog-scrim"
+            aria-label="Cancel manual reply"
+            onClick={() => setConfirmReply(false)}
+          />
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="manual-reply-title"
+            className="dialog"
+          >
+            <span className="dialog-danger">
+              <Send />
+            </span>
+            <h2 id="manual-reply-title">Send this WhatsApp reply?</h2>
+            <p>
+              This explicitly sends an external text message to{" "}
+              {selected.masked_customer_label}.
+            </p>
+            <div className="dialog-actions">
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => setConfirmReply(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={busy === "reply"}
+                onClick={() => void sendConfirmedReply()}
+              >
+                <BusyLabel busy={busy === "reply"} idle="Confirm and send" />
               </button>
             </div>
           </div>
@@ -1357,6 +1714,27 @@ function KnowledgePage({ business }: { business: Business }) {
                     </div>
                     <DocumentStatus status={document.status} />
                     <div className="document-actions">
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        disabled={Boolean(busy)}
+                        onClick={() =>
+                          void act(
+                            document.id,
+                            () =>
+                              api.setDocumentCustomerVisibility(
+                                business.id,
+                                document.id,
+                                !document.customer_visible,
+                              ),
+                            document.customer_visible
+                              ? "Document is private again."
+                              : "Document is now approved for customer answers.",
+                          )
+                        }
+                      >
+                        {document.customer_visible ? "Customer-visible" : "Private"}
+                      </button>
                       {document.status === "FAILED" && (
                         <button
                           type="button"
@@ -1509,6 +1887,274 @@ function formatDateTime(value: string) {
   return dateTimeFormatter.format(new Date(value));
 }
 
+function WhatsAppSettings({ business }: { business: Business }) {
+  const [connection, setConnection] = useState<WhatsAppConnection | null | undefined>(
+    undefined,
+  );
+  const [displayName, setDisplayName] = useState("Customer WhatsApp");
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+  const [confirmDisable, setConfirmDisable] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const rows = await api.whatsAppConnections(business.id);
+      setConnection(rows[0] ?? null);
+    } catch (caught) {
+      setConnection(null);
+      setError(errorMessage(caught));
+    }
+  }, [business.id]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function act(
+    name: string,
+    action: () => Promise<WhatsAppConnection>,
+    message: string,
+  ) {
+    setBusy(name);
+    setError("");
+    setSuccess("");
+    try {
+      setConnection(await action());
+      setSuccess(message);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <section className="panel whatsapp-settings">
+      <div className="panel-heading">
+        <div>
+          <h2>WhatsApp customer messaging</h2>
+          <p>Meta WhatsApp Cloud API · text only · deployment-managed credentials.</p>
+        </div>
+        {connection && (
+          <span
+            className={`channel-status channel-status-${connection.status.toLowerCase()}`}
+          >
+            {connection.status.toLowerCase()}
+          </span>
+        )}
+      </div>
+      {connection === undefined ? (
+        <Skeleton className="h-24" />
+      ) : connection === null ? (
+        <div className="whatsapp-connect-grid">
+          <div>
+            <strong>Connect the supported WhatsApp source</strong>
+            <p>
+              Sou2AI accepts only the allowlisted Meta profile. Tokens, app secrets,
+              phone numbers, arbitrary URLs, and webhook credentials are never entered
+              here.
+            </p>
+          </div>
+          <label className="field-label">
+            Safe display name
+            <input
+              className="input"
+              minLength={2}
+              maxLength={120}
+              value={displayName}
+              onChange={(event) => setDisplayName(event.target.value)}
+            />
+          </label>
+          <label className="field-label">
+            Connection profile
+            <select className="input" value="meta_whatsapp_cloud" disabled>
+              <option value="meta_whatsapp_cloud">Meta WhatsApp Cloud</option>
+            </select>
+          </label>
+          <button
+            type="button"
+            className="btn"
+            disabled={busy === "connect" || displayName.trim().length < 2}
+            onClick={() =>
+              void act(
+                "connect",
+                () => api.configureWhatsApp(business.id, displayName.trim()),
+                "WhatsApp configuration created. Validate it before activation.",
+              )
+            }
+          >
+            <BusyLabel busy={busy === "connect"} idle="Connect WhatsApp" />
+          </button>
+        </div>
+      ) : (
+        <div className="whatsapp-connection-detail">
+          <div className="whatsapp-connection-meta">
+            <div>
+              <span>Display name</span>
+              <strong>{connection.display_name}</strong>
+            </div>
+            <div>
+              <span>Last validation</span>
+              <strong>
+                {connection.last_validated_at
+                  ? formatDateTime(connection.last_validated_at)
+                  : "Not validated"}
+              </strong>
+            </div>
+            <div>
+              <span>Last healthy check</span>
+              <strong>
+                {connection.last_successful_health_check_at
+                  ? formatDateTime(connection.last_successful_health_check_at)
+                  : "No successful check"}
+              </strong>
+            </div>
+          </div>
+          {connection.failure_code && (
+            <Alert>Connection check failed safely: {connection.failure_code}</Alert>
+          )}
+          <div className="whatsapp-actions">
+            {connection.status !== "ACTIVE" && (
+              <button
+                type="button"
+                className="btn-secondary"
+                disabled={Boolean(busy)}
+                onClick={() =>
+                  void act(
+                    "validate",
+                    () => api.validateWhatsApp(business.id, connection.id),
+                    "Connection profile validated.",
+                  )
+                }
+              >
+                <BusyLabel busy={busy === "validate"} idle="Validate" />
+              </button>
+            )}
+            {connection.status === "VALIDATED" && (
+              <button
+                type="button"
+                className="btn"
+                disabled={Boolean(busy) || !business.is_active}
+                onClick={() =>
+                  void act(
+                    "activate",
+                    () => api.activateWhatsApp(business.id, connection.id),
+                    "WhatsApp customer messaging activated.",
+                  )
+                }
+              >
+                <BusyLabel busy={busy === "activate"} idle="Activate" />
+              </button>
+            )}
+            {connection.status === "ACTIVE" && (
+              <>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  disabled={Boolean(busy)}
+                  onClick={() =>
+                    void act(
+                      "health",
+                      () => api.checkWhatsApp(business.id, connection.id),
+                      "Connection check completed.",
+                    )
+                  }
+                >
+                  <RefreshCw size={16} /> Test connection
+                </button>
+                <label className="auto-reply-toggle">
+                  <input
+                    type="checkbox"
+                    checked={connection.auto_reply_enabled}
+                    disabled={Boolean(busy)}
+                    onChange={(event) =>
+                      void act(
+                        "auto-reply",
+                        () =>
+                          api.setWhatsAppAutoReply(
+                            business.id,
+                            connection.id,
+                            event.target.checked,
+                          ),
+                        event.target.checked
+                          ? "Automatic replies enabled."
+                          : "Automatic replies paused.",
+                      )
+                    }
+                  />
+                  Automatic customer replies
+                </label>
+              </>
+            )}
+            {connection.status !== "DISABLED" && (
+              <button
+                type="button"
+                className="btn-quiet-danger"
+                disabled={Boolean(busy)}
+                onClick={() => setConfirmDisable(true)}
+              >
+                Disable
+              </button>
+            )}
+          </div>
+          <p className="safe-note">
+            Customer answers use only public profile fields and explicitly
+            customer-visible knowledge. Owner memory and operational tools stay private.
+          </p>
+        </div>
+      )}
+      {error && <Alert>{error}</Alert>}
+      {success && <Alert tone="success">{success}</Alert>}
+      {confirmDisable && connection && (
+        <div className="dialog-layer" role="presentation">
+          <button
+            type="button"
+            className="dialog-scrim"
+            aria-label="Cancel WhatsApp disable"
+            onClick={() => setConfirmDisable(false)}
+          />
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="disable-whatsapp-title"
+            className="dialog"
+          >
+            <span className="dialog-danger">
+              <AlertCircle />
+            </span>
+            <h2 id="disable-whatsapp-title">Disable WhatsApp?</h2>
+            <p>Inbound events will remain safely acknowledged without AI replies.</p>
+            <div className="dialog-actions">
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => setConfirmDisable(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn-quiet-danger"
+                onClick={() => {
+                  setConfirmDisable(false);
+                  void act(
+                    "disable",
+                    () => api.disableWhatsApp(business.id, connection.id),
+                    "WhatsApp customer messaging disabled.",
+                  );
+                }}
+              >
+                Disable WhatsApp
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function BusinessSettingsPage({
   business,
   onSaved,
@@ -1564,6 +2210,7 @@ function BusinessSettingsPage({
         </div>
         <p>Lifecycle is read-only. Confirmation does not activate a business.</p>
       </div>
+      <WhatsAppSettings business={business} />
       <form onSubmit={submit} className="settings-form">
         <section className="panel">
           <div className="panel-heading">

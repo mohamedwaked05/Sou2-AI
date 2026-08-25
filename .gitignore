@@ -28,6 +28,9 @@ data/generated/*
 *.sqlite
 *.sqlite3
 
+# Visual review tooling (local Chromium profile)
+frontend/.visual-review/
+
 # OS files
 .DS_Store
 Thumbs.db

@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.database.models import (
+    Business,
     BusinessStatus,
     KnowledgeDocument,
     KnowledgeDocumentChunk,
@@ -46,7 +47,7 @@ class RetrievalResult:
 
 def retrieve(
     session: Session,
-    user: User,
+    user: User | None,
     business_id: uuid.UUID,
     question: str,
     provider: EmbeddingProvider,
@@ -54,14 +55,22 @@ def retrieve(
     *,
     request_id: str | None = None,
     question_embedding: Sequence[float] | None = None,
+    customer_visible_only: bool = False,
 ) -> RetrievalResult:
     """Embed and exactly rank only current-model chunks for an authorized tenant."""
     started = time.monotonic()
-    business = load_full_access_business(session, user, business_id)
+    if user is None:
+        if not customer_visible_only:
+            raise PermissionError("customer_visibility_required")
+        business = session.get(Business, business_id)
+        if business is None:
+            raise PermissionError("business_not_found")
+    else:
+        business = load_full_access_business(session, user, business_id)
     if business.status is not BusinessStatus.ACTIVE:
         raise PermissionError("business_not_active")
     try:
-        has_candidates = session.scalar(
+        candidate_query = (
             select(KnowledgeDocumentChunk.id)
             .join(
                 KnowledgeDocument,
@@ -73,8 +82,12 @@ def retrieve(
                 KnowledgeDocumentChunk.embedding.is_not(None),
                 KnowledgeDocumentChunk.embedding_model == settings.embedding_model,
             )
-            .limit(1)
         )
+        if customer_visible_only:
+            candidate_query = candidate_query.where(
+                KnowledgeDocument.customer_visible.is_(True)
+            )
+        has_candidates = session.scalar(candidate_query.limit(1))
         if has_candidates is None:
             result = RetrievalResult(status="NO_RELEVANT_KNOWLEDGE", chunks=())
             _log(
@@ -93,7 +106,7 @@ def retrieve(
         )
         distance = KnowledgeDocumentChunk.embedding.cosine_distance(vector)
         similarity = (1 - distance).label("similarity")
-        rows = session.execute(
+        ranked_query = (
             select(KnowledgeDocumentChunk, KnowledgeDocument, similarity)
             .join(
                 KnowledgeDocument,
@@ -105,13 +118,18 @@ def retrieve(
                 KnowledgeDocumentChunk.embedding.is_not(None),
                 KnowledgeDocumentChunk.embedding_model == settings.embedding_model,
             )
-            .order_by(
+        )
+        if customer_visible_only:
+            ranked_query = ranked_query.where(
+                KnowledgeDocument.customer_visible.is_(True)
+            )
+        rows = session.execute(
+            ranked_query.order_by(
                 distance,
                 KnowledgeDocumentChunk.document_id,
                 KnowledgeDocumentChunk.chunk_index,
                 KnowledgeDocumentChunk.id,
-            )
-            .limit(settings.retrieval_candidate_limit)
+            ).limit(settings.retrieval_candidate_limit)
         ).all()
         chunks = tuple(
             RetrievedChunk(

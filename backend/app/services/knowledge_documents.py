@@ -229,6 +229,20 @@ def get_document(
     return _document(session, business_id, document_id)
 
 
+def set_customer_visibility(
+    session: Session,
+    user: User,
+    business_id: uuid.UUID,
+    document_id: uuid.UUID,
+    customer_visible: bool,
+) -> KnowledgeDocument:
+    _active(session, user, business_id)
+    document = _document(session, business_id, document_id, True)
+    document.customer_visible = customer_visible
+    session.commit()
+    return document
+
+
 def retry(
     session: Session,
     user: User,

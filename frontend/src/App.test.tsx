@@ -10,7 +10,15 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { App } from "./App";
-import { api, ApiError, ChatMessage, Conversation } from "./api";
+import {
+  api,
+  ApiError,
+  ChatMessage,
+  Conversation,
+  CustomerConversation,
+  CustomerMessage,
+  WhatsAppConnection,
+} from "./api";
 
 afterEach(() => {
   cleanup();
@@ -96,12 +104,62 @@ function mockActiveWorkspace(...messagePages: ChatMessage[][]) {
   return messages;
 }
 
-function renderWorkspace(path: "chat" | "conversations") {
+function renderWorkspace(path: "chat" | "conversations" | "settings") {
   render(
     <MemoryRouter initialEntries={[`/businesses/business-1/${path}`]}>
       <App />
     </MemoryRouter>,
   );
+}
+
+function whatsAppConnection(
+  overrides: Partial<WhatsAppConnection> = {},
+): WhatsAppConnection {
+  return {
+    id: "channel-1",
+    display_name: "Customer WhatsApp",
+    provider_type: "meta_whatsapp",
+    connection_profile_key: "meta_whatsapp_cloud",
+    status: "ACTIVE",
+    auto_reply_enabled: true,
+    last_validated_at: "2026-08-25T10:00:00Z",
+    last_successful_health_check_at: "2026-08-25T10:00:00Z",
+    failure_code: null,
+    capabilities: ["inbound_text", "outbound_text", "delivery_status"],
+    created_at: "2026-08-25T09:00:00Z",
+    updated_at: "2026-08-25T10:00:00Z",
+    ...overrides,
+  };
+}
+
+function customerConversation(
+  overrides: Partial<CustomerConversation> = {},
+): CustomerConversation {
+  return {
+    id: "customer-conversation-1",
+    masked_customer_label: "WhatsApp ••••3456",
+    state: "HUMAN_HANDOFF",
+    last_message_at: "2026-08-25T10:00:00Z",
+    latest_message_preview: "Can I speak with someone?",
+    created_at: "2026-08-25T09:00:00Z",
+    updated_at: "2026-08-25T10:00:00Z",
+    ...overrides,
+  };
+}
+
+function customerMessage(overrides: Partial<CustomerMessage> = {}): CustomerMessage {
+  return {
+    id: "customer-message-1",
+    direction: "inbound",
+    sender: "customer",
+    content: "Can I speak with someone?",
+    status: "COMPLETED",
+    reply_to_message_id: null,
+    failure_code: null,
+    created_at: "2026-08-25T10:00:00Z",
+    updated_at: "2026-08-25T10:00:00Z",
+    ...overrides,
+  };
 }
 
 function mockScrollMetrics() {
@@ -437,6 +495,121 @@ it("confirms archiving and keeps the conversation readable", async () => {
   );
   expect(await screen.findByText(/Archived · read-only/)).toBeInTheDocument();
   expect(screen.getByText("Plan autumn")).toBeInTheDocument();
+});
+
+it("shows masked WhatsApp conversations and confirms a manual reply", async () => {
+  mockActiveWorkspace([]);
+  vi.spyOn(api, "conversations").mockResolvedValueOnce({
+    items: [],
+    next_cursor: null,
+  });
+  const conversation = customerConversation();
+  vi.spyOn(api, "customerConversations").mockResolvedValueOnce({
+    items: [conversation],
+    next_cursor: null,
+  });
+  vi.spyOn(api, "customerMessages").mockResolvedValueOnce({
+    items: [customerMessage()],
+    next_cursor: null,
+  });
+  const sent = customerMessage({
+    id: "manual-1",
+    direction: "outbound",
+    sender: "owner",
+    content: "I can help you.",
+    status: "PENDING_SEND",
+  });
+  vi.spyOn(api, "sendCustomerReply").mockResolvedValueOnce(sent);
+
+  renderWorkspace("conversations");
+  fireEvent.click(await screen.findByRole("tab", { name: "WhatsApp" }));
+  expect((await screen.findAllByText("WhatsApp ••••3456"))[0]).toBeVisible();
+  expect(screen.getByText("Human handoff · AI replies paused")).toBeVisible();
+  fireEvent.change(screen.getByLabelText("Manual reply"), {
+    target: { value: "I can help you." },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send manual reply" }));
+  expect(
+    screen.getByRole("alertdialog", { name: "Send this WhatsApp reply?" }),
+  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Confirm and send" }));
+  await waitFor(() =>
+    expect(api.sendCustomerReply).toHaveBeenCalledWith(
+      "business-1",
+      "customer-conversation-1",
+      "I can help you.",
+    ),
+  );
+  expect(await screen.findByText("pending send")).toBeVisible();
+});
+
+it("configures only the allowlisted WhatsApp profile in Business Settings", async () => {
+  mockActiveWorkspace([]);
+  vi.spyOn(api, "whatsAppConnections").mockResolvedValueOnce([]);
+  vi.spyOn(api, "configureWhatsApp").mockResolvedValueOnce(
+    whatsAppConnection({
+      status: "CONFIGURED",
+      auto_reply_enabled: false,
+      last_validated_at: null,
+      last_successful_health_check_at: null,
+    }),
+  );
+
+  renderWorkspace("settings");
+  expect(
+    await screen.findByText(
+      "Meta WhatsApp Cloud API · text only · deployment-managed credentials.",
+    ),
+  ).toBeVisible();
+  expect(screen.queryByLabelText(/token|secret|host|url/i)).not.toBeInTheDocument();
+  fireEvent.click(await screen.findByRole("button", { name: "Connect WhatsApp" }));
+  await waitFor(() =>
+    expect(api.configureWhatsApp).toHaveBeenCalledWith(
+      "business-1",
+      "Customer WhatsApp",
+    ),
+  );
+  expect(await screen.findByText("configured")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Validate" })).toBeEnabled();
+});
+
+it("tests, pauses, and confirms disabling an active WhatsApp connection", async () => {
+  mockActiveWorkspace([]);
+  const active = whatsAppConnection();
+  vi.spyOn(api, "whatsAppConnections").mockResolvedValueOnce([active]);
+  vi.spyOn(api, "checkWhatsApp").mockResolvedValueOnce(active);
+  vi.spyOn(api, "setWhatsAppAutoReply").mockResolvedValueOnce({
+    ...active,
+    auto_reply_enabled: false,
+  });
+  vi.spyOn(api, "disableWhatsApp").mockResolvedValueOnce({
+    ...active,
+    status: "DISABLED",
+    auto_reply_enabled: false,
+  });
+
+  renderWorkspace("settings");
+  fireEvent.click(await screen.findByRole("button", { name: "Test connection" }));
+  await waitFor(() =>
+    expect(api.checkWhatsApp).toHaveBeenCalledWith("business-1", "channel-1"),
+  );
+  fireEvent.click(screen.getByLabelText("Automatic customer replies"));
+  await waitFor(() =>
+    expect(api.setWhatsAppAutoReply).toHaveBeenCalledWith(
+      "business-1",
+      "channel-1",
+      false,
+    ),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Disable" }));
+  expect(
+    screen.getByRole("alertdialog", { name: "Disable WhatsApp?" }),
+  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Disable WhatsApp" }));
+  await waitFor(() =>
+    expect(api.disableWhatsApp).toHaveBeenCalledWith("business-1", "channel-1"),
+  );
+  expect(await screen.findByText("disabled")).toBeVisible();
 });
 
 it("opens a selected archived conversation in read-only AI Chat", async () => {

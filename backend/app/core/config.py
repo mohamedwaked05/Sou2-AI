@@ -127,6 +127,7 @@ class Settings(BaseSettings):
     knowledge_storage_root: str = "../data/knowledge"
     redis_url: str = "redis://127.0.0.1:6379/0"
     knowledge_queue_name: str = "knowledge"
+    customer_message_queue_name: str = "customer-messages"
     knowledge_worker_timeout_seconds: int = Field(default=120, ge=1, le=120)
     api_docs_enabled: bool | None = None
     hsts_enabled: bool = False
@@ -165,6 +166,20 @@ class Settings(BaseSettings):
     operational_max_reporting_days: int = Field(default=366, ge=1, le=366)
     tool_call_audit_retention_days: int = Field(default=90, ge=1)
     tool_call_audit_hmac_secret: SecretStr | None = None
+    whatsapp_access_token: SecretStr | None = None
+    meta_app_secret: SecretStr | None = None
+    whatsapp_webhook_verify_token: SecretStr | None = None
+    whatsapp_phone_number_id: str | None = None
+    whatsapp_graph_api_version: str = "v23.0"
+    customer_identity_encryption_key: SecretStr | None = None
+    customer_identity_hmac_key: SecretStr | None = None
+    whatsapp_webhook_max_bytes: int = Field(default=65_536, ge=1, le=262_144)
+    customer_generation_lease_seconds: int = Field(default=150, ge=5, le=300)
+    customer_chat_max_output_tokens: int = Field(default=384, ge=1, le=1024)
+    customer_conversation_hourly_limit: int = Field(default=12, ge=1, le=120)
+    customer_business_hourly_limit: int = Field(default=120, ge=1, le=2000)
+    whatsapp_outbound_max_attempts: int = Field(default=3, ge=1, le=3)
+    whatsapp_request_timeout_seconds: int = Field(default=15, ge=1, le=30)
     auth_event_retention_hours: int = Field(
         default=24,
         ge=AUTH_EVENT_MINIMUM_RETENTION_HOURS,

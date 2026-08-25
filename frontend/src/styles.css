@@ -1753,6 +1753,36 @@ textarea::placeholder {
 .conversation-history {
   min-height: 460px;
 }
+.channel-tabs {
+  display: inline-flex;
+  gap: 4px;
+  margin-bottom: 18px;
+  border: 1px solid #dbe3ef;
+  border-radius: 12px;
+  background: #f8fafc;
+  padding: 4px;
+}
+.channel-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  padding: 8px 13px;
+  color: #64748b;
+  font-size: 0.82rem;
+  font-weight: 650;
+}
+.channel-tabs button.selected {
+  background: #fff;
+  color: #1d4ed8;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+}
+.channel-tabs button:focus-visible {
+  outline: 3px solid rgba(37, 99, 235, 0.3);
+  outline-offset: 2px;
+}
 .conversation-workspace {
   display: grid;
   grid-template-columns: minmax(250px, 0.8fr) minmax(0, 2fr);
@@ -1835,6 +1865,51 @@ textarea::placeholder {
   overflow-y: auto;
   overscroll-behavior: contain;
 }
+.customer-message-list {
+  padding-bottom: 18px;
+}
+.customer-message {
+  display: flex;
+}
+.customer-message > div {
+  max-width: min(78%, 660px);
+  border-radius: 14px;
+  background: #f1f5f9;
+  padding: 12px 14px;
+}
+.customer-message-outbound {
+  justify-content: flex-end;
+}
+.customer-message-outbound > div {
+  background: #eff6ff;
+}
+.customer-message strong,
+.customer-message span,
+.customer-message time {
+  display: block;
+}
+.customer-message strong {
+  margin-bottom: 4px;
+  font-size: 0.74rem;
+}
+.customer-message p {
+  white-space: pre-wrap;
+}
+.customer-message span,
+.customer-message time {
+  margin-top: 6px;
+  color: #64748b;
+  font-size: 0.67rem;
+}
+.customer-reply-composer {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid #e2e8f0;
+  padding-top: 16px;
+}
+.customer-reply-composer .btn {
+  justify-self: end;
+}
 .dark .chat-panel {
   border-color: #263246;
   background: #0b1322;
@@ -1874,6 +1949,23 @@ textarea::placeholder {
 .dark .conversation-index-list em {
   background: #263246;
   color: #cbd5e1;
+}
+.dark .channel-tabs {
+  border-color: #263246;
+  background: #101827;
+}
+.dark .channel-tabs button.selected {
+  background: #172033;
+  color: #60a5fa;
+}
+.dark .customer-message > div {
+  background: #172033;
+}
+.dark .customer-message-outbound > div {
+  background: rgba(37, 99, 235, 0.16);
+}
+.dark .customer-reply-composer {
+  border-color: #263246;
 }
 
 .upload-panel {
@@ -2537,6 +2629,110 @@ textarea::placeholder {
   margin-bottom: 18px;
   padding: 16px 20px;
 }
+.whatsapp-settings {
+  display: grid;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+.channel-status {
+  border-radius: 999px;
+  padding: 5px 9px;
+  background: #e2e8f0;
+  color: #475569;
+  font-size: 0.7rem;
+  font-weight: 750;
+  text-transform: capitalize;
+}
+.channel-status-active,
+.channel-status-validated {
+  background: #dcfce7;
+  color: #166534;
+}
+.channel-status-unhealthy {
+  background: #fee2e2;
+  color: #991b1b;
+}
+.whatsapp-connect-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(180px, 0.8fr) minmax(180px, 0.8fr);
+  align-items: end;
+  gap: 14px;
+}
+.whatsapp-connect-grid > div p,
+.safe-note {
+  margin-top: 5px;
+  color: #64748b;
+  font-size: 0.78rem;
+  line-height: 1.55;
+}
+.whatsapp-connect-grid .btn {
+  grid-column: 3;
+  justify-self: end;
+}
+.whatsapp-connection-detail {
+  display: grid;
+  gap: 14px;
+}
+.whatsapp-connection-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.whatsapp-connection-meta > div {
+  border: 1px solid #e2e8f0;
+  border-radius: 11px;
+  padding: 12px;
+}
+.whatsapp-connection-meta span,
+.whatsapp-connection-meta strong {
+  display: block;
+}
+.whatsapp-connection-meta span {
+  color: #64748b;
+  font-size: 0.7rem;
+}
+.whatsapp-connection-meta strong {
+  margin-top: 4px;
+  font-size: 0.84rem;
+}
+.whatsapp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px;
+}
+.auto-reply-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #334155;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+.dark .channel-status {
+  background: #263246;
+  color: #cbd5e1;
+}
+.dark .channel-status-active,
+.dark .channel-status-validated {
+  background: rgba(22, 163, 74, 0.2);
+  color: #86efac;
+}
+.dark .channel-status-unhealthy {
+  background: rgba(220, 38, 38, 0.2);
+  color: #fca5a5;
+}
+.dark .whatsapp-connect-grid > div p,
+.dark .safe-note,
+.dark .whatsapp-connection-meta span {
+  color: #94a3b8;
+}
+.dark .whatsapp-connection-meta > div {
+  border-color: #334155;
+}
+.dark .auto-reply-toggle {
+  color: #cbd5e1;
+}
 .settings-status > div {
   display: flex;
   align-items: center;
@@ -2775,6 +2971,13 @@ textarea::placeholder {
     grid-column: 2 / -1;
     justify-content: flex-end;
   }
+  .whatsapp-connect-grid,
+  .whatsapp-connection-meta {
+    grid-template-columns: 1fr 1fr;
+  }
+  .whatsapp-connect-grid > div {
+    grid-column: 1 / -1;
+  }
 }
 
 @media (max-width: 767px) {
@@ -2798,6 +3001,27 @@ textarea::placeholder {
   }
   .conversation-actions .btn,
   .conversation-actions .btn-secondary {
+    width: 100%;
+  }
+  .channel-tabs {
+    display: flex;
+  }
+  .channel-tabs button {
+    flex: 1;
+    justify-content: center;
+  }
+  .customer-message > div {
+    max-width: 90%;
+  }
+  .customer-reply-composer .btn {
+    width: 100%;
+  }
+  .whatsapp-connect-grid,
+  .whatsapp-connection-meta {
+    grid-template-columns: 1fr;
+  }
+  .whatsapp-connect-grid .btn {
+    grid-column: auto;
     width: 100%;
   }
   .auth-page,
