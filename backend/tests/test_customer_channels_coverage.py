@@ -933,3 +933,110 @@ def test_no_pii_in_log_records(
     ]
     for secret in forbidden:
         assert secret not in all_log, f"Secret leaked in logs: {secret!r}"
+
+
+# ---------------------------------------------------------------------------
+# 10. Inbound webhook works without an outbound access token (D01 fix)
+# ---------------------------------------------------------------------------
+
+
+def _blank_token_settings() -> Settings:
+    """Settings identical to channel_settings() but with no access token."""
+    return Settings(
+        _env_file=None,
+        whatsapp_access_token="",
+        meta_app_secret=APP_SECRET,
+        whatsapp_webhook_verify_token="offline-verify-token",
+        whatsapp_phone_number_id="15550001111",
+        customer_identity_encryption_key=IDENTITY_ENCRYPTION_KEY,
+        customer_identity_hmac_key=IDENTITY_HMAC_KEY,
+    )
+
+
+def test_webhook_challenge_succeeds_with_blank_access_token(
+    api_client: TestClient,
+) -> None:
+    settings = _blank_token_settings()
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        resp = api_client.get(
+            "/api/v1/channels/whatsapp/webhook",
+            params={
+                "hub.mode": "subscribe",
+                "hub.verify_token": "offline-verify-token",
+                "hub.challenge": "echo-me-back",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.text == "echo-me-back"
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+
+def test_inbound_webhook_accepted_with_blank_access_token(
+    api_client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(customer_messaging, "_queue_inbound", lambda *_: None)
+    # Use valid settings for management setup (validate + activate need access token).
+    app.dependency_overrides[get_settings] = lambda: channel_settings()
+    _active_channel(api_client, db_session)
+    # Switch to blank-token settings: inbound reception must still work.
+    blank = _blank_token_settings()
+    app.dependency_overrides[get_settings] = lambda: blank
+    try:
+        body = _inbound_with_text("Do you deliver?", message_id="wamid.blank-token-1")
+        resp = _post_webhook(api_client, body)
+        assert resp.status_code == 200
+        assert resp.json()["events"] == 1
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+
+def test_invalid_signature_rejected_with_blank_access_token(
+    api_client: TestClient,
+) -> None:
+    settings = _blank_token_settings()
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        body = _inbound_with_text("Hello", message_id="wamid.blank-token-sig")
+        resp = _post_webhook(api_client, body, override_signature="sha256=" + "0" * 64)
+        assert resp.status_code == 401
+        assert resp.json()["error"]["code"] == "webhook_signature_invalid"
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+
+def test_send_text_with_blank_token_raises_non_retryable_error() -> None:
+    from app.channels.contracts import ChannelProfile
+    from app.channels.meta import MetaWhatsAppAdapter
+
+    profile = ChannelProfile(
+        key="meta_whatsapp_cloud",
+        provider_type="meta_whatsapp",
+        access_token="",
+        app_secret=APP_SECRET,
+        verify_token="offline-verify-token",
+        phone_number_id="15550001111",
+        graph_api_version="v23.0",
+        request_timeout_seconds=5,
+    )
+    adapter = MetaWhatsAppAdapter(profile)
+    with pytest.raises(ChannelError) as exc_info:
+        adapter.send_text("96170123456", "Hello")
+    assert exc_info.value.code == "channel.configuration_unavailable"
+    assert exc_info.value.retryable is False
+
+
+def test_management_validate_fails_with_blank_access_token() -> None:
+    from app.channels.profiles import ChannelProfileRegistry, ChannelProfileUnavailable
+
+    settings = _blank_token_settings()
+    registry = ChannelProfileRegistry(settings)
+    # inbound-only resolution succeeds
+    profile = registry.resolve("meta_whatsapp_cloud", require_outbound=False)
+    assert profile.access_token == ""
+    # management resolution (require_outbound=True) must fail
+    with pytest.raises(ChannelProfileUnavailable):
+        registry.resolve("meta_whatsapp_cloud")
