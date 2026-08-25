@@ -428,7 +428,7 @@ allowance. Current operational results, profile data, authorized RAG evidence, a
 the current owner message always outrank recent conversation and untrusted summary
 memory. No customer or external-channel conversation work is included.
 
-### Milestone 19: In Progress — WhatsApp customer messaging
+### Milestone 19: Complete — WhatsApp customer messaging
 
 * Add channels such as WhatsApp only after the core assistant is reliable.
 * Verify webhooks and map each channel connection and conversation to one business.

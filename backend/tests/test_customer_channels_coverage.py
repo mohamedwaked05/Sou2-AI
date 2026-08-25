@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
-from unittest.mock import patch
+from datetime import UTC, datetime
 
 import pytest
 from app.agent.owner_chat_provider import (
@@ -25,14 +23,11 @@ from app.channels.contracts import (
 from app.core.config import Settings, get_settings
 from app.database.models import (
     AIUsageReservation,
-    BusinessAIAllowanceConfig,
     BusinessKnowledge,
     CustomerConversation,
-    CustomerGenerationRateEvent,
     CustomerMessage,
     CustomerMessageStatus,
     InboundWebhookDelivery,
-    KnowledgeDocumentStatus,
     MessagingChannelConnection,
 )
 from app.main import app
@@ -42,8 +37,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, select, text
 from sqlalchemy.orm import Session
 
-from tests.test_business_api import change_business_status, headers
-from tests.test_business_lifecycle import complete_and_confirm
+from tests.test_business_api import headers
 from tests.test_customer_channels import (
     APP_SECRET,
     IDENTITY_ENCRYPTION_KEY,
@@ -79,9 +73,9 @@ def _post_webhook(
 
 def _inbound_with_text(text_content: str, message_id: str = "wamid.test") -> bytes:
     payload = json.loads(_webhook_body(message_id=message_id))
-    payload["entry"][0]["changes"][0]["value"]["messages"][0]["text"][
-        "body"
-    ] = text_content
+    payload["entry"][0]["changes"][0]["value"]["messages"][0]["text"]["body"] = (
+        text_content
+    )
     return json.dumps(payload, separators=(",", ":")).encode()
 
 
@@ -544,7 +538,9 @@ class _AlwaysTransientAdapter:
     provider_type = "meta_whatsapp"
 
     def send_text(self, recipient: str, text: str) -> SendTextResult:
-        raise ChannelError("channel.transient_failure", retryable=True, retry_after_seconds=1)
+        raise ChannelError(
+            "channel.transient_failure", retryable=True, retry_after_seconds=1
+        )
 
 
 def test_three_attempt_ceiling(
@@ -640,7 +636,7 @@ def test_delivery_status_idempotency(
     db_session.add(outbound)
     db_session.commit()
 
-    ts = datetime.now(tz=timezone.utc)
+    ts = datetime.now(tz=UTC)
     event = DeliveryStatusEvent(
         provider_event_id="evt-delivered-1",
         provider_message_id="wamid.out-1",
@@ -684,7 +680,6 @@ def test_per_conversation_rate_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Override limit to 1 so we can hit it immediately
-    base = channel_settings()
     settings = Settings(
         _env_file=None,
         whatsapp_access_token="offline-access-token",
