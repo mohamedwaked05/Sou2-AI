@@ -1380,6 +1380,12 @@ class GeminiOwnerChatProvider:
             model_identifier=self.model,
         )
 
+    def _thinking_config(self) -> dict[str, Any]:
+        # 3.x: string-enum thinkingLevel; 2.x and later: numeric thinkingBudget.
+        if self.model.startswith("gemini-3"):
+            return {"thinkingLevel": "LOW", "includeThoughts": False}
+        return {"thinkingBudget": 0}
+
     def _summary_payload(self, request: ConversationSummaryRequest) -> dict[str, Any]:
         return {
             "systemInstruction": {"parts": [{"text": _summary_instructions(request)}]},
@@ -1388,7 +1394,7 @@ class GeminiOwnerChatProvider:
                 "maxOutputTokens": request.max_output_tokens,
                 "responseMimeType": "application/json",
                 "responseJsonSchema": _SummaryStructuredResult.model_json_schema(),
-                "thinkingConfig": {"thinkingLevel": "LOW", "includeThoughts": False},
+                "thinkingConfig": self._thinking_config(),
             },
         }
 
@@ -1565,10 +1571,7 @@ class GeminiOwnerChatProvider:
                     "responseJsonSchema": (
                         _ConversationStructuredResult.model_json_schema()
                     ),
-                    "thinkingConfig": {
-                        "thinkingLevel": "LOW",
-                        "includeThoughts": False,
-                    },
+                    "thinkingConfig": self._thinking_config(),
                 },
             }
         if request.mode == "operational":
@@ -1589,10 +1592,7 @@ class GeminiOwnerChatProvider:
                     "responseJsonSchema": (
                         _OperationalStructuredResult.model_json_schema()
                     ),
-                    "thinkingConfig": {
-                        "thinkingLevel": "LOW",
-                        "includeThoughts": False,
-                    },
+                    "thinkingConfig": self._thinking_config(),
                 },
             }
         if request.mode == "customer":
@@ -1607,10 +1607,7 @@ class GeminiOwnerChatProvider:
                     "maxOutputTokens": request.max_output_tokens,
                     "responseMimeType": "application/json",
                     "responseJsonSchema": _OllamaStructuredResult.model_json_schema(),
-                    "thinkingConfig": {
-                        "thinkingLevel": "LOW",
-                        "includeThoughts": False,
-                    },
+                    "thinkingConfig": self._thinking_config(),
                 },
             }
         context = {
@@ -1657,10 +1654,7 @@ class GeminiOwnerChatProvider:
                 "maxOutputTokens": request.max_output_tokens,
                 "responseMimeType": "application/json",
                 "responseJsonSchema": _OllamaStructuredResult.model_json_schema(),
-                "thinkingConfig": {
-                    "thinkingLevel": "LOW",
-                    "includeThoughts": False,
-                },
+                "thinkingConfig": self._thinking_config(),
             },
         }
 

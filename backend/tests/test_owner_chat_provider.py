@@ -1235,6 +1235,41 @@ def test_gemini_sends_key_only_in_header_and_never_logs_it(
     assert logged == []
 
 
+def test_gemini_thinking_config_varies_by_model_generation() -> None:
+    """gemini-3-* uses thinkingLevel enum; all other models use thinkingBudget int."""
+    captured_configs: dict[str, object] = {}
+
+    def make_handler(key: str) -> httpx.MockTransport:
+        def handler(request: httpx.Request) -> httpx.Response:
+            payload = json.loads(request.content)
+            captured_configs[key] = payload["generationConfig"]["thinkingConfig"]
+            return gemini_successful_transport(
+                {"reply": "ok", "cited_source_ids": [], "proposed_knowledge": []}
+            ).handle_request(request)
+
+        return httpx.MockTransport(handler)
+
+    GeminiOwnerChatProvider(
+        api_key="test-key-not-production",
+        model="gemini-3-flash-preview",
+        timeout_seconds=120,
+        transport=make_handler("gen3"),
+    ).generate(provider_request())
+
+    GeminiOwnerChatProvider(
+        api_key="test-key-not-production",
+        model="gemini-2.5-flash",
+        timeout_seconds=120,
+        transport=make_handler("gen25"),
+    ).generate(provider_request())
+
+    assert captured_configs["gen3"] == {
+        "thinkingLevel": "LOW",
+        "includeThoughts": False,
+    }
+    assert captured_configs["gen25"] == {"thinkingBudget": 0}
+
+
 def test_gemini_usage_counts_thoughts_as_billed_output() -> None:
     transport = httpx.MockTransport(
         lambda request: httpx.Response(
