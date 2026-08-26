@@ -90,7 +90,7 @@ def test_product_resolution_exact_identifiers_names_and_aliases(
     assert resolution.candidates == ()
 
 
-def test_exact_resolution_precedes_partial_and_partial_codes_do_not_match(
+def test_exact_resolution_precedes_partial_and_partial_codes_match_source_fields(
     operational_adapter: PostgreSQLOperationalAdapter,
 ) -> None:
     exact = operational_adapter.resolve_product(
@@ -104,7 +104,9 @@ def test_exact_resolution_precedes_partial_and_partial_codes_do_not_match(
     assert exact.matched_by == "name"
     assert exact.product is not None
     assert exact.product.external_product_id == "P1007"
-    assert partial_code.status == "not_found"
+    assert partial_code.status == "ambiguous"
+    assert partial_code.matched_by == "partial_name"
+    assert partial_code.candidates
 
 
 def test_partial_product_name_is_ambiguous_with_bounded_safe_candidates(
@@ -125,6 +127,20 @@ def test_partial_product_name_is_ambiguous_with_bounded_safe_candidates(
         <= {"external_product_id", "sku", "barcode", "name"}
         for candidate in resolution.candidates
     )
+
+
+def test_natural_language_product_reference_is_resolved_by_source_tokens(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    resolution = operational_adapter.resolve_product(
+        ProductResolutionQuery(reference="how many pepsi we have left")
+    )
+
+    assert resolution.status == "ambiguous"
+    assert {candidate.name for candidate in resolution.candidates} == {
+        "Pepsi Can 330 ml",
+        "Pepsi Bottle 1.5 L",
+    }
 
 
 def test_unknown_product_is_explicitly_not_found(

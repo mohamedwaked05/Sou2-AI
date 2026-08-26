@@ -213,6 +213,61 @@ _PRODUCT_RESOLUTION_PARTIAL_SQL = text(
     """
 )
 
+_PRODUCT_RESOLUTION_TOKEN_SQL = text(
+    r"""
+    WITH reference_terms AS (
+        SELECT DISTINCT lower(btrim(term)) AS term
+        FROM regexp_split_to_table(:reference, '\s+') AS split(term)
+        WHERE char_length(btrim(term)) >= 3
+    ), matches AS (
+        SELECT
+            item.item_id,
+            item.item_code AS external_product_id,
+            item.merchant_sku AS sku,
+            item.ean_barcode AS barcode,
+            item.display_label AS product_name,
+            category.label AS category,
+            COUNT(DISTINCT reference_terms.term) AS matched_terms
+        FROM minimarket.catalog_items AS item
+        LEFT JOIN minimarket.categories AS category
+            ON category.category_id = item.category_id
+        CROSS JOIN reference_terms
+        WHERE item.active = true
+          AND (
+              position(reference_terms.term IN lower(item.item_code)) > 0
+              OR position(reference_terms.term IN lower(item.merchant_sku)) > 0
+              OR position(reference_terms.term IN lower(item.ean_barcode)) > 0
+              OR position(
+                  reference_terms.term IN lower(
+                      regexp_replace(btrim(item.display_label), '\s+', ' ', 'g')
+                  )
+              ) > 0
+              OR EXISTS (
+                  SELECT 1
+                  FROM minimarket.catalog_item_aliases AS alias
+                  WHERE alias.item_id = item.item_id
+                    AND alias.approved = true
+                    AND position(reference_terms.term IN lower(
+                        regexp_replace(btrim(alias.alias), '\s+', ' ', 'g')
+                    )) > 0
+              )
+          )
+        GROUP BY
+            item.item_id,
+            item.item_code,
+            item.merchant_sku,
+            item.ean_barcode,
+            item.display_label,
+            category.label
+    )
+    SELECT *, 'partial_name' AS match_type
+    FROM matches
+    WHERE matched_terms > 0
+    ORDER BY matched_terms DESC, product_name, external_product_id
+    LIMIT :row_limit
+    """
+)
+
 _CATEGORY_RESOLUTION_SQL = text(
     """
     SELECT category_id::text AS external_category_id, label
@@ -474,6 +529,16 @@ class PostgreSQLOperationalAdapter:
                                 "partial_reference": self._escaped_search(
                                     normalized_reference
                                 ),
+                                "row_limit": query.candidate_limit + 1,
+                            },
+                        ).mappings()
+                    )
+                if not rows:
+                    rows = list(
+                        connection.execute(
+                            _PRODUCT_RESOLUTION_TOKEN_SQL,
+                            {
+                                "reference": normalized_reference,
                                 "row_limit": query.candidate_limit + 1,
                             },
                         ).mappings()

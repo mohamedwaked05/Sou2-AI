@@ -730,7 +730,7 @@ def test_owner_loop_executes_live_tool_aggregates_usage_and_replays_without_work
     ("message", "reference"),
     [
         ("How many Pepsi do we have left?", "Pepsi"),
-        ("How many Pepsi we have left?", "Pepsi"),
+        ("How many Pepsi we have left?", "how many pepsi we have left"),
         ("قديش عنا بيبسي", "بيبسي"),
         ("كم آيباد باقي", "آيباد"),
         ("adde 3anna Pepsi?", "Pepsi"),
