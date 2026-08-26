@@ -1030,3 +1030,93 @@ def test_security_retention_uses_24h_48h_90d_and_12_month_cutoffs(
             )
             == 1
         )
+
+
+class _RateLimitedProvider:
+    """Provider stub that raises rate_limited with default usage_uncertain=True."""
+
+    def estimate_input_tokens(self, request: OwnerChatRequest) -> int:
+        return 100
+
+    def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
+        raise OwnerChatProviderUnavailable(reason="rate_limited")
+
+
+def test_rate_limited_provider_releases_reservation_not_charges(
+    api_client: TestClient,
+    db_session: Session,
+    migration_engine: Engine,
+) -> None:
+    # Before the fix: usage_uncertain=True (the default) → outcome="uncertain" →
+    # sou2ai_reconcile_ai_usage charged estimated_input + max_output permanently
+    # to total_tokens_used, burning the daily budget even though the provider never
+    # processed the request. After the fix: reason="rate_limited" forces
+    # outcome="release" regardless of usage_uncertain, so no tokens are charged.
+    user, business = active_business(
+        api_client, db_session, email="rate-limit-accounting@example.com"
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: _RateLimitedProvider()
+    response = submit(api_client, user, business["id"], "rate limited message")
+    assert response.status_code == 503
+    with migration_engine.connect() as connection:
+        reservation = connection.execute(
+            text("SELECT * FROM ai_usage_reservations")
+        ).one()
+        summary = connection.execute(
+            text("SELECT * FROM business_ai_usage_daily")
+        ).one()
+    assert reservation.status == "released"
+    assert reservation.total_tokens == 0
+    assert summary.total_tokens_used == 0
+    assert summary.tokens_reserved == 0
+
+
+def test_provider_error_logs_type_and_reason(
+    api_client: TestClient,
+    db_session: Session,
+) -> None:
+    from unittest.mock import MagicMock, patch
+
+    user, business = active_business(
+        api_client, db_session, email="provider-error-log@example.com"
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: _RateLimitedProvider()
+    mock_logger = MagicMock()
+    with patch("app.services.owner_chat._logger", mock_logger):
+        response = submit(api_client, user, business["id"], "log check provider error")
+    assert response.status_code == 503
+    assert mock_logger.error.called, "Expected _logger.error on provider error"
+    all_args = " ".join(
+        str(a) for call in mock_logger.error.call_args_list for a in call.args
+    )
+    assert "OwnerChatProviderUnavailable" in all_args
+    assert "rate_limited" in all_args
+
+
+def test_unexpected_exception_in_generate_logs_traceback(
+    api_client: TestClient,
+    db_session: Session,
+) -> None:
+    from unittest.mock import MagicMock, patch
+
+    class _BoomProvider:
+        def estimate_input_tokens(self, request: OwnerChatRequest) -> int:
+            return 100
+
+        def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
+            raise ValueError("simulated programming error in generate")
+
+    user, business = active_business(
+        api_client, db_session, email="unexpected-exc-log@example.com"
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: _BoomProvider()
+    mock_logger = MagicMock()
+    with patch("app.services.owner_chat._logger", mock_logger):
+        response = submit(api_client, user, business["id"], "log check unexpected exc")
+    assert response.status_code == 503
+    assert mock_logger.error.called, "Expected _logger.error on unexpected exception"
+    all_args = " ".join(
+        str(a) for call in mock_logger.error.call_args_list for a in call.args
+    )
+    assert "ValueError" in all_args
+    assert "simulated programming error in generate" in all_args

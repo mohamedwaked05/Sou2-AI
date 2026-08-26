@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import math
 import re
 import time
+import traceback
 import unicodedata
 import uuid
 from dataclasses import dataclass
@@ -82,6 +84,8 @@ from app.tools.operational import (
     OperationalToolExecutor,
     ToolExecutionError,
 )
+
+_logger = logging.getLogger(__name__)
 
 CHAT_CONTEXT_MESSAGE_LIMIT = 12
 MAX_OPERATIONAL_TOOL_EXECUTIONS = 2
@@ -2021,12 +2025,25 @@ def _generate_claimed_turn(
                 model_identifier=result.model_identifier,
             )
     except OwnerChatProviderError as exc:
+        _logger.error(
+            "owner-chat provider error: %s reason=%s usage_uncertain=%s",
+            type(exc).__name__,
+            exc.reason,
+            exc.usage_uncertain,
+        )
+        # rate_limited is an explicit HTTP rejection — the provider never processed
+        # the request so no tokens were consumed; release the reservation instead of
+        # charging the worst-case estimate with outcome="uncertain".
+        rate_limited = (
+            isinstance(exc, OwnerChatProviderUnavailable)
+            and exc.reason == "rate_limited"
+        )
         outcome = (
             "reported_failure"
             if exc.usage is not None
-            else "uncertain"
-            if exc.usage_uncertain
             else "release"
+            if not exc.usage_uncertain or rate_limited
+            else "uncertain"
         )
         _mark_failed(
             session,
@@ -2064,6 +2081,10 @@ def _generate_claimed_turn(
         )
         raise _provider_unavailable() from None
     except Exception:
+        _logger.error(
+            "unexpected exception in _generate_claimed_turn:\n%s",
+            traceback.format_exc(),
+        )
         session.rollback()
         _mark_failed(
             session,
