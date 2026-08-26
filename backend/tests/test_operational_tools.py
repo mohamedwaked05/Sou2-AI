@@ -705,9 +705,7 @@ def test_owner_loop_executes_live_tool_aggregates_usage_and_replays_without_work
     assert replay.status_code == 200
     assert replay.json()["replayed"] is True
     assert len(provider.requests) == 2
-    assert [tool.name for tool in provider.requests[0].tools] == [
-        CURRENT_INVENTORY_TOOL
-    ]
+    assert CURRENT_INVENTORY_TOOL in {tool.name for tool in provider.requests[0].tools}
     assert provider.requests[0].tool_results == ()
     supplied = provider.requests[1].tool_results[0]
     assert supplied.tool_name == CURRENT_INVENTORY_TOOL
@@ -732,6 +730,7 @@ def test_owner_loop_executes_live_tool_aggregates_usage_and_replays_without_work
     ("message", "reference"),
     [
         ("How many Pepsi do we have left?", "Pepsi"),
+        ("How many Pepsi we have left?", "Pepsi"),
         ("قديش عنا بيبسي", "بيبسي"),
         ("كم آيباد باقي", "آيباد"),
         ("adde 3anna Pepsi?", "Pepsi"),
@@ -772,9 +771,7 @@ def test_multilingual_quantity_turn_reaches_inventory_with_product_reference(
     )
 
     assert response.status_code == 200, response.text
-    assert [tool.name for tool in provider.requests[0].tools] == [
-        CURRENT_INVENTORY_TOOL
-    ]
+    assert CURRENT_INVENTORY_TOOL in {tool.name for tool in provider.requests[0].tools}
     assert source.resolution_references == [reference]
     assert source.calls == [CURRENT_INVENTORY_TOOL]
 

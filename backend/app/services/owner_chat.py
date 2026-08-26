@@ -1898,7 +1898,22 @@ def _generate_claimed_turn(
         business = session.get(Business, business_id)
         if owner_message is None or business is None:
             raise _provider_unavailable()
-        if _is_live_operational_request(owner_message.content):
+        # Operational intent is selected by the provider from approved typed
+        # capabilities. The classifier remains only a fast path for legacy live
+        # turns; source-backed non-casual turns also receive the planner so a
+        # product or category reference is not lost before tool selection.
+        is_live_operational = _is_live_operational_request(owner_message.content)
+        has_active_operational_source = False
+        if profiles is not None and not _is_general_conversation_request(
+            owner_message.content
+        ):
+            probe_executor = OperationalToolExecutor(session, profiles, settings)
+            has_active_operational_source = (
+                probe_executor._active_source(business_id) is not None
+            )
+        if is_live_operational or (
+            profiles is not None and has_active_operational_source
+        ):
             executor = (
                 OperationalToolExecutor(session, profiles, settings)
                 if profiles is not None
@@ -1909,12 +1924,13 @@ def _generate_claimed_turn(
                 if executor is not None
                 else ()
             )
-            matching_names = _matching_operational_tools(owner_message.content)
-            available = tuple(
-                definition
-                for definition in available
-                if definition.name in matching_names
-            )
+            if is_live_operational:
+                matching_names = _matching_operational_tools(owner_message.content)
+                available = tuple(
+                    definition
+                    for definition in available
+                    if definition.name in matching_names
+                )
             if not available:
                 live_result = OwnerChatResult(
                     reply=_live_operational_reply(
@@ -1994,6 +2010,77 @@ def _generate_claimed_turn(
         business = prepared.business
         conflict_labels = _conflicting_source_labels(request.sources)
         if not prepared.has_usable_evidence:
+            # A connected operational source is the authoritative fallback for
+            # business questions that retrieval cannot answer. The provider still
+            # performs typed intent selection; no message vocabulary is routed here.
+            operational_executor = (
+                OperationalToolExecutor(session, profiles, settings)
+                if profiles is not None
+                else None
+            )
+            operational_definitions = (
+                operational_executor.available_definitions(user, business_id)
+                if operational_executor is not None
+                else ()
+            )
+            if operational_definitions:
+                provider_definitions = tuple(
+                    ProviderToolDefinition(**definition.provider_schema())
+                    for definition in operational_definitions
+                )
+                initial = _build_operational_request(
+                    session,
+                    business_id,
+                    claim.message_id,
+                    settings,
+                    provider_definitions,
+                )
+                generation_attempt = _admit_provider_generation(
+                    session, business_id, claim
+                )
+                try:
+                    reservation = reserve_owner_chat_usage(
+                        session,
+                        business=initial.business,
+                        user=user,
+                        owner_message_id=claim.message_id,
+                        generation_attempt=generation_attempt,
+                        estimated_input_tokens=(
+                            provider.estimate_input_tokens(initial.request)
+                            * MAX_OPERATIONAL_PROVIDER_CALLS
+                        ),
+                        max_output_tokens=(
+                            initial.request.max_output_tokens
+                            * MAX_OPERATIONAL_PROVIDER_CALLS
+                        ),
+                        lease_seconds=settings.owner_chat_generation_lease_seconds,
+                    )
+                except Exception:
+                    session.rollback()
+                    _undo_pre_provider_admission(
+                        session, business_id, claim, generation_attempt
+                    )
+                    raise
+                result, aggregate_usage = _run_operational_loop(
+                    session,
+                    business_id,
+                    claim,
+                    user,
+                    provider,
+                    settings,
+                    operational_executor,
+                    provider_definitions,
+                )
+                _persist_result(
+                    session,
+                    business_id,
+                    claim,
+                    result,
+                    reservation,
+                    aggregate_usage,
+                    (),
+                )
+                return
             fallback = OwnerChatResult(
                 reply=_missing_knowledge_reply(
                     request.messages[-1].content, business.default_language
