@@ -23,6 +23,8 @@ from app.schemas.operational import (
     BestSellersQuery,
     BestSellingProduct,
     BestSellingProductsResult,
+    CategoryCandidate,
+    CategoryResolution,
     IntegrationHealth,
     InventoryItem,
     InventoryReadQuery,
@@ -88,6 +90,10 @@ _INVENTORY_SQL = text(
           AND (
               CAST(:external_product_id AS text) IS NULL
               OR item.item_code = :external_product_id
+          )
+          AND (
+              CAST(:category_filter AS text) IS NULL
+              OR lower(category.label) = lower(:category_filter)
           )
           AND (
               CAST(:branch_code AS text) IS NULL
@@ -203,6 +209,17 @@ _PRODUCT_RESOLUTION_PARTIAL_SQL = text(
           )
       )
     ORDER BY product_name, external_product_id
+    LIMIT :row_limit
+    """
+)
+
+_CATEGORY_RESOLUTION_SQL = text(
+    """
+    SELECT category_id::text AS external_category_id, label
+    FROM minimarket.categories
+    WHERE lower(regexp_replace(btrim(label), '\\s+', ' ', 'g'))
+        LIKE :reference ESCAPE '\\'
+    ORDER BY label, category_id
     LIMIT :row_limit
     """
 )
@@ -469,6 +486,51 @@ class PostgreSQLOperationalAdapter:
                 "Operational source data is invalid."
             ) from None
 
+    def resolve_category(self, query: ProductResolutionQuery) -> CategoryResolution:
+        try:
+            with self._engine.connect() as connection:
+                self._prepare_read(connection)
+                source = self._source_configuration(connection)
+                rows = list(
+                    connection.execute(
+                        _CATEGORY_RESOLUTION_SQL,
+                        {
+                            "reference": self._escaped_search(
+                                self._normalized_reference(query.reference)
+                            ),
+                            "row_limit": query.candidate_limit + 1,
+                        },
+                    ).mappings()
+                )
+            limited = rows[: query.candidate_limit]
+            metadata = self._metadata(
+                source,
+                row_count=len(limited),
+                requested_limit=query.candidate_limit,
+                is_truncated=len(rows) > query.candidate_limit,
+            )
+            if not limited:
+                return CategoryResolution(status="not_found", metadata=metadata)
+            candidates = tuple(
+                CategoryCandidate(
+                    external_category_id=row["external_category_id"], label=row["label"]
+                )
+                for row in limited
+            )
+            if len(rows) == 1:
+                return CategoryResolution(
+                    status="resolved", category=candidates[0], metadata=metadata
+                )
+            return CategoryResolution(
+                status="ambiguous", candidates=candidates, metadata=metadata
+            )
+        except (SQLAlchemyError, RuntimeError) as exc:
+            self._raise_safe_database_error(exc)
+        except ValidationError, KeyError, TypeError, ArithmeticError:
+            raise OperationalDataInvalid(
+                "Operational source data is invalid."
+            ) from None
+
     def get_current_inventory(self, query: InventoryReadQuery) -> InventoryResult:
         try:
             with self._engine.connect() as connection:
@@ -527,6 +589,7 @@ class PostgreSQLOperationalAdapter:
                 refund_amount=refund_amount,
                 net_revenue=gross_revenue - refund_amount,
                 currency=source["currency_code"],
+                metric=query.metric,
                 metadata=self._metadata(source, row_count=1),
             )
         except (SQLAlchemyError, RuntimeError) as exc:
@@ -667,6 +730,7 @@ class PostgreSQLOperationalAdapter:
                 _INVENTORY_SQL,
                 {
                     "external_product_id": query.external_product_id,
+                    "category_filter": query.category_filter,
                     "branch_code": query.branch_external_id,
                     "warehouse_code": query.warehouse_external_id,
                     "restock_only": restock_only,

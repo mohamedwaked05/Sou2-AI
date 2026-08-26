@@ -5,6 +5,7 @@ from typing import Protocol, runtime_checkable
 from app.schemas.operational import (
     BestSellersQuery,
     BestSellingProductsResult,
+    CategoryResolution,
     IntegrationHealth,
     InventoryReadQuery,
     InventoryResult,
@@ -45,6 +46,8 @@ class OperationalDataSource(Protocol):
         ...
 
     def resolve_product(self, query: ProductResolutionQuery) -> ProductResolution: ...
+
+    def resolve_category(self, query: ProductResolutionQuery) -> CategoryResolution: ...
 
     def get_current_inventory(self, query: InventoryReadQuery) -> InventoryResult: ...
 

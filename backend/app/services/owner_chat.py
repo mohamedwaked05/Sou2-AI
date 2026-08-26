@@ -1518,20 +1518,11 @@ def _product_resolution_reply(
             candidate.get("name"), str
         ):
             continue
-        identifiers = [
-            f"SKU {candidate['sku']}"
-            if isinstance(candidate.get("sku"), str)
-            else None,
-            f"barcode {candidate['barcode']}"
-            if isinstance(candidate.get("barcode"), str)
-            else None,
-            f"ID {candidate['external_product_id']}"
-            if isinstance(candidate.get("external_product_id"), str)
-            else None,
-        ]
-        details = ", ".join(item for item in identifiers if item is not None)
+        sku = candidate.get("sku")
         labels.append(
-            f"{candidate['name']} ({details})" if details else candidate["name"]
+            f"{candidate['name']} ({sku})"
+            if isinstance(sku, str)
+            else candidate["name"]
         )
     if not labels:
         return None
@@ -1547,6 +1538,43 @@ def _product_resolution_reply(
             f"La2et aktar men product: {candidate_text}. Ayya wa7ad 2asdak?"
         ),
         "mixed": f"I found أكتر من منتج: {candidate_text}. Which one do you mean?",
+    }
+    return replies[language]
+
+
+def _category_resolution_reply(
+    tool_results: list[ProviderToolResult],
+    message: str,
+    default_language: str,
+) -> str | None:
+    if not tool_results:
+        return None
+    resolution = tool_results[-1].output.get("category_resolution")
+    if not isinstance(resolution, dict) or resolution.get("status") != "ambiguous":
+        return None
+    candidates = resolution.get("candidates")
+    if not isinstance(candidates, list):
+        return None
+    labels = tuple(
+        candidate["label"]
+        for candidate in candidates[:5]
+        if isinstance(candidate, dict) and isinstance(candidate.get("label"), str)
+    )
+    if len(labels) < 2:
+        return None
+    candidate_text = "; ".join(labels)
+    language = _fallback_language(message, default_language)
+    replies = {
+        "english": (
+            f"I found several matching categories: {candidate_text}. "
+            "Which one do you mean?"
+        ),
+        "arabic": f"وجدت عدة فئات مطابقة: {candidate_text}. أي فئة تقصد؟",
+        "lebanese_arabic": f"لقيت أكتر من فئة مطابقة: {candidate_text}. أي فئة قصدك؟",
+        "franco_arabic": (
+            f"La2et aktar men category: {candidate_text}. Ayya wa7de 2asdak?"
+        ),
+        "mixed": f"I found أكتر من category: {candidate_text}. Which one do you mean?",
     }
     return replies[language]
 
@@ -1604,6 +1632,20 @@ def _run_operational_loop(
         if resolution_reply is not None:
             resolved_result = OwnerChatResult(
                 reply=resolution_reply,
+                usage=aggregate_usage,
+                provider_identifier=result.provider_identifier,
+                model_identifier=result.model_identifier,
+                decision="final",
+            )
+            return resolved_result, aggregate_usage
+        category_reply = _category_resolution_reply(
+            tool_results,
+            request.messages[-1].content,
+            prepared.business.default_language,
+        )
+        if category_reply is not None:
+            resolved_result = OwnerChatResult(
+                reply=category_reply,
                 usage=aggregate_usage,
                 provider_identifier=result.provider_identifier,
                 model_identifier=result.model_identifier,

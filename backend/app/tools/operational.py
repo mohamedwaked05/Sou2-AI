@@ -147,18 +147,29 @@ def _inventory(source: OperationalDataSource, query: BaseModel) -> BaseModel:
         return InventoryResult(
             items=(), metadata=resolution.metadata, resolution=resolution
         )
+    category_resolution = _resolve_category_filter(source, query.category_filter)
+    if category_resolution is not None and category_resolution.status != "resolved":
+        return InventoryResult(
+            items=(),
+            metadata=category_resolution.metadata,
+            resolution=resolution,
+            category_resolution=category_resolution,
+        )
     read_query = InventoryReadQuery(
         external_product_id=(
             resolution.product.external_product_id
             if resolution is not None and resolution.product is not None
             else None
         ),
+        category_filter=query.category_filter,
         branch_external_id=query.branch_external_id,
         warehouse_external_id=query.warehouse_external_id,
         limit=query.limit,
     )
     result = source.get_current_inventory(read_query)
-    return result.model_copy(update={"resolution": resolution})
+    return result.model_copy(
+        update={"resolution": resolution, "category_resolution": category_resolution}
+    )
 
 
 def _sales_summary(source: OperationalDataSource, query: BaseModel) -> BaseModel:
@@ -178,12 +189,18 @@ def _restocking(source: OperationalDataSource, query: BaseModel) -> BaseModel:
         return RestockingRecommendationsResult(
             items=(), metadata=resolution.metadata, resolution=resolution
         )
+    category_resolution = _resolve_category_filter(source, query.category_filter)
+    if category_resolution is not None and category_resolution.status != "resolved":
+        return RestockingRecommendationsResult(
+            items=(), metadata=category_resolution.metadata, resolution=resolution
+        )
     read_query = RestockingReadQuery(
         external_product_id=(
             resolution.product.external_product_id
             if resolution is not None and resolution.product is not None
             else None
         ),
+        category_filter=query.category_filter,
         branch_external_id=query.branch_external_id,
         warehouse_external_id=query.warehouse_external_id,
         limit=query.limit,
@@ -200,6 +217,14 @@ def _resolve_product_filter(
     return source.resolve_product(ProductResolutionQuery(reference=product_filter))
 
 
+def _resolve_category_filter(
+    source: OperationalDataSource, category_filter: str | None
+):
+    if category_filter is None:
+        return None
+    return source.resolve_category(ProductResolutionQuery(reference=category_filter))
+
+
 def build_operational_tool_registry(
     *,
     timeout_seconds: int,
@@ -212,7 +237,8 @@ def build_operational_tool_registry(
             description=(
                 "Retrieve current product inventory, quantities, reservations, and "
                 "availability for an optional exact ID, SKU, barcode, product name, "
-                "or approved alias and one branch or warehouse. Product resolution "
+                "approved alias, or source-resolved category and one branch or "
+                "warehouse. Product resolution "
                 "can explicitly be resolved, ambiguous, or not found."
             ),
             input_schema=CurrentInventoryToolInput,
@@ -226,7 +252,9 @@ def build_operational_tool_registry(
             name=SALES_SUMMARY_TOOL,
             description=(
                 "Summarize completed sales and finalized returns/refunds for a "
-                "bounded source-local date range and optional branch."
+                "bounded source-local date range and optional branch. Revenue and "
+                "sales count are supported only when selected by the typed metric; "
+                "profit requires a separate mapped cost/expense capability."
             ),
             input_schema=SalesQuery,
             output_schema=SalesSummary,
@@ -253,7 +281,8 @@ def build_operational_tool_registry(
             description=(
                 "Calculate deterministic replenishment quantities from available "
                 "stock, reorder points, and target stock for an optional exact ID, "
-                "SKU, barcode, product name, or approved alias. Product resolution "
+                "SKU, barcode, product name, approved alias, or source-resolved "
+                "category. Product resolution "
                 "can explicitly be resolved, ambiguous, or not found."
             ),
             input_schema=RestockingRecommendationsToolInput,
@@ -428,6 +457,11 @@ class OperationalToolExecutor:
             )
             if mapping is None:
                 raise ToolExecutionError("integration_unavailable")
+            if (
+                definition.name == SALES_SUMMARY_TOOL
+                and getattr(query, "metric", "revenue") not in mapping.supported_metrics
+            ):
+                raise ToolExecutionError("capability_unavailable")
             self._session.commit()
             health = adapter.check_health()
             mapping.validate_health(health)

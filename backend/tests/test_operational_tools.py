@@ -39,6 +39,8 @@ from app.main import app
 from app.schemas.operational import (
     BestSellingProduct,
     BestSellingProductsResult,
+    CategoryCandidate,
+    CategoryResolution,
     IntegrationHealth,
     InventoryItem,
     InventoryResult,
@@ -133,6 +135,15 @@ class StubSource:
     def resolve_product(self, query: object) -> ProductResolution:
         self.resolution_references.append(cast(Any, query).reference)
         return self.resolution
+
+    def resolve_category(self, query: object) -> CategoryResolution:
+        return CategoryResolution(
+            status="resolved",
+            category=CategoryCandidate(
+                external_category_id="category-1", label="Pantry"
+            ),
+            metadata=metadata(),
+        )
 
     def check_health(self) -> IntegrationHealth:
         if self.health_error is not None:
@@ -437,6 +448,43 @@ def test_product_scoped_tools_resolve_then_query_the_stable_external_id(
     )
     assert read_query.external_product_id == "P1001"
     assert not hasattr(read_query, "product_filter")
+
+
+def test_category_scoped_inventory_resolves_before_read_query(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business, registry, executor = executor_setup(api_client, db_session)
+
+    result = executor.execute(
+        user=user,
+        business_id=business.id,
+        tool_name=CURRENT_INVENTORY_TOOL,
+        arguments={"category_filter": "Pantry", "limit": 5},
+    )
+
+    assert isinstance(result.output, InventoryResult)
+    assert registry.source.last_inventory_query.category_filter == "Pantry"
+    assert registry.source.resolution_references == []
+
+
+def test_profit_metric_is_rejected_when_mapping_has_no_cost_capability(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business, _registry, executor = executor_setup(api_client, db_session)
+
+    with pytest.raises(ToolExecutionError) as caught:
+        executor.execute(
+            user=user,
+            business_id=business.id,
+            tool_name=SALES_SUMMARY_TOOL,
+            arguments={
+                "start_date": "2026-08-20",
+                "end_date": "2026-08-23",
+                "metric": "gross_profit",
+            },
+        )
+
+    assert caught.value.code == "capability_unavailable"
 
 
 @pytest.mark.parametrize(

@@ -21,6 +21,14 @@ MAX_BEST_SELLER_ROWS = 50
 MAX_REPORTING_DAYS = 366
 MAX_PRODUCT_RESOLUTION_CANDIDATES = 5
 
+OperationalMetric = Literal[
+    "revenue",
+    "gross_profit",
+    "net_profit",
+    "sales_count",
+    "inventory_value",
+]
+
 
 def _validate_source_timezone(value: str) -> str:
     try:
@@ -181,10 +189,37 @@ class ProductResolution(OperationalContract):
         return self
 
 
+class CategoryCandidate(OperationalContract):
+    external_category_id: str = Field(min_length=1, max_length=128)
+    label: str = Field(min_length=1, max_length=255)
+
+
+class CategoryResolution(OperationalContract):
+    status: ProductResolutionStatus
+    category: CategoryCandidate | None = None
+    candidates: tuple[CategoryCandidate, ...] = Field(default=(), max_length=5)
+    metadata: OperationalResultMetadata
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> CategoryResolution:
+        if self.status == "resolved" and (self.category is None or self.candidates):
+            raise ValueError("Resolved categories require exactly one category.")
+        if self.status == "ambiguous" and (
+            self.category is not None or len(self.candidates) < 2
+        ):
+            raise ValueError("Ambiguous categories require candidates.")
+        if self.status == "not_found" and (
+            self.category is not None or self.candidates
+        ):
+            raise ValueError("Not-found categories cannot contain matches.")
+        return self
+
+
 class InventoryResult(OperationalContract):
     items: tuple[InventoryItem, ...]
     metadata: OperationalResultMetadata
     resolution: ProductResolution | None = None
+    category_resolution: CategoryResolution | None = None
 
 
 class SalesSummary(OperationalContract):
@@ -200,6 +235,7 @@ class SalesSummary(OperationalContract):
     refund_amount: Decimal = Field(ge=0)
     net_revenue: Decimal
     currency: str = Field(pattern=r"^[A-Z]{3}$")
+    metric: OperationalMetric = "revenue"
     metadata: OperationalResultMetadata
 
     @model_validator(mode="after")
@@ -285,13 +321,27 @@ class InventoryQuery(OperationalContract):
             "product ID, SKU, barcode, name, or approved alias."
         ),
     )
+    category_filter: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description=(
+            "Category label resolved by the connected source. This is not an "
+            "application-maintained category or synonym list."
+        ),
+    )
     branch_external_id: str | None = Field(default=None, min_length=1, max_length=128)
     warehouse_external_id: str | None = Field(
         default=None, min_length=1, max_length=128
     )
     limit: int = Field(default=50, ge=1, le=MAX_OPERATIONAL_ROWS)
 
-    @field_validator("product_filter", "branch_external_id", "warehouse_external_id")
+    @field_validator(
+        "product_filter",
+        "category_filter",
+        "branch_external_id",
+        "warehouse_external_id",
+    )
     @classmethod
     def strip_filter(cls, value: str | None) -> str | None:
         if value is None:
@@ -329,6 +379,7 @@ class InventoryReadQuery(OperationalContract):
     """Trusted adapter query containing only an exact resolved product ID."""
 
     external_product_id: str | None = Field(default=None, min_length=1, max_length=128)
+    category_filter: str | None = Field(default=None, min_length=1, max_length=128)
     branch_external_id: str | None = Field(default=None, min_length=1, max_length=128)
     warehouse_external_id: str | None = Field(
         default=None, min_length=1, max_length=128
@@ -336,7 +387,10 @@ class InventoryReadQuery(OperationalContract):
     limit: int = Field(default=50, ge=1, le=MAX_OPERATIONAL_ROWS)
 
     @field_validator(
-        "external_product_id", "branch_external_id", "warehouse_external_id"
+        "external_product_id",
+        "category_filter",
+        "branch_external_id",
+        "warehouse_external_id",
     )
     @classmethod
     def strip_filter(cls, value: str | None) -> str | None:
@@ -358,6 +412,13 @@ class SalesQuery(OperationalContract):
     start_date: date
     end_date: date
     branch_external_id: str | None = Field(default=None, min_length=1, max_length=128)
+    metric: OperationalMetric = Field(
+        default="revenue",
+        description=(
+            "Requested financial measure. Profit measures require mapped cost "
+            "or expense data and must never be inferred from revenue."
+        ),
+    )
 
     @field_validator("branch_external_id")
     @classmethod

@@ -225,6 +225,36 @@ def test_inventory_limit_is_enforced_and_reports_truncation(
     assert result.metadata.is_truncated is True
 
 
+def test_category_resolution_and_inventory_filter_use_source_labels(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    resolution = operational_adapter.resolve_category(
+        ProductResolutionQuery(reference="Beverages")
+    )
+
+    assert resolution.status == "resolved"
+    assert resolution.category is not None
+    assert resolution.category.label == "Beverages"
+
+    result = operational_adapter.get_current_inventory(
+        InventoryReadQuery(category_filter=resolution.category.label, limit=100)
+    )
+
+    assert result.items
+    assert {item.product.category for item in result.items} == {"Beverages"}
+
+
+def test_category_resolution_reports_ambiguous_source_matches(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    resolution = operational_adapter.resolve_category(
+        ProductResolutionQuery(reference="a")
+    )
+
+    assert resolution.status == "ambiguous"
+    assert len(resolution.candidates) >= 2
+
+
 def test_sales_totals_statuses_returns_currency_and_timezone(
     operational_adapter: PostgreSQLOperationalAdapter,
 ) -> None:

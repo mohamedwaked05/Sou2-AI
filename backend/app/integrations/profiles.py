@@ -46,6 +46,7 @@ class OperationalMappingProfile:
     currency: str
     source_timezone: str
     required_capabilities: tuple[str, ...]
+    supported_metrics: tuple[str, ...] = ("revenue", "sales_count")
 
     def validate_definition(self) -> None:
         required_text = (
@@ -72,6 +73,14 @@ class OperationalMappingProfile:
             raise MappingProfileError(
                 "Operational reservation semantics are incomplete."
             )
+        if not self.supported_metrics or not set(self.supported_metrics) <= {
+            "revenue",
+            "sales_count",
+            "gross_profit",
+            "net_profit",
+            "inventory_value",
+        }:
+            raise MappingProfileError("Operational metric semantics are incomplete.")
         if set(self.required_capabilities) != set(OPERATIONAL_CAPABILITIES):
             raise MappingProfileError("Operational capability mapping is incomplete.")
 
