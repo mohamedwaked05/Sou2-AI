@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 import uuid
@@ -49,6 +50,8 @@ from app.schemas.operational import (
 )
 from app.services.businesses import load_full_access_business
 from app.utils.argument_hashing import hash_tool_arguments
+
+_logger = logging.getLogger(__name__)
 
 CURRENT_INVENTORY_TOOL = "current_inventory"
 SALES_SUMMARY_TOOL = "sales_summary"
@@ -339,7 +342,11 @@ class OperationalToolExecutor:
                 for definition in self.registry.values()
                 if definition.capability in capabilities
             )
-        except Exception:
+        except Exception as exc:
+            _logger.warning(
+                "available_definitions returning empty: %s",
+                type(exc).__name__,
+            )
             self._session.rollback()
             return ()
 
