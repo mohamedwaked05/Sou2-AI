@@ -120,6 +120,9 @@ class StubSource:
         self.last_restocking_query: Any | None = None
         self.error: Exception | None = None
         self.health_error: Exception | None = None
+        self.categories = (
+            CategoryCandidate(external_category_id="category-1", label="Pantry"),
+        )
         self.timeout_seconds = 2
         self.resolution = ProductResolution(
             status="resolved",
@@ -144,6 +147,9 @@ class StubSource:
             ),
             metadata=metadata(),
         )
+
+    def list_categories(self, *, limit: int) -> tuple[CategoryCandidate, ...]:
+        return self.categories[:limit]
 
     def check_health(self) -> IntegrationHealth:
         if self.health_error is not None:
@@ -467,6 +473,47 @@ def test_category_scoped_inventory_resolves_before_read_query(
     assert registry.source.resolution_references == []
 
 
+def test_operational_planner_receives_bounded_source_categories(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"category-plan-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.categories = (
+        CategoryCandidate(external_category_id="category-7", label="Beverages"),
+        CategoryCandidate(external_category_id="category-8", label="Pantry"),
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"category_filter": "Beverages", "limit": 5},
+            ),
+            usage_result(reply="There are products in that category."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "what drinks do we have?",
+        f"category-plan-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert [
+        candidate.label for candidate in provider.requests[0].category_candidates
+    ] == [
+        "Beverages",
+        "Pantry",
+    ]
+    assert provider.requests[0].rolling_summary is None
+
+
 def test_profit_metric_is_rejected_when_mapping_has_no_cost_capability(
     api_client: TestClient, db_session: Session
 ) -> None:
@@ -668,7 +715,10 @@ def configure_operational_chat(
 
 
 def test_owner_loop_executes_live_tool_aggregates_usage_and_replays_without_work(
-    api_client: TestClient, db_session: Session, migration_engine: Engine
+    api_client: TestClient,
+    db_session: Session,
+    migration_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     user, business = active_business(api_client, db_session)
     source = StubSource()
@@ -685,6 +735,12 @@ def test_owner_loop_executes_live_tool_aggregates_usage_and_replays_without_work
         ]
     )
     configure_operational_chat(db_session, business["id"], source, provider)
+    enqueued: list[uuid.UUID] = []
+    monkeypatch.setattr(
+        owner_chat,
+        "_enqueue_summary_safely",
+        lambda conversation_id, _settings: enqueued.append(conversation_id),
+    )
 
     first = submit(
         api_client,
@@ -712,6 +768,7 @@ def test_owner_loop_executes_live_tool_aggregates_usage_and_replays_without_work
     assert supplied.output["items"][0]["available_quantity"] == "8"
     assert "connection_profile" not in str(supplied.output)
     assert source.calls == [CURRENT_INVENTORY_TOOL]
+    assert enqueued == []
     assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
     assert db_session.scalar(select(func.count()).select_from(OwnerChatCitation)) == 0
     with migration_engine.connect() as connection:

@@ -260,6 +260,18 @@ def test_category_resolution_and_inventory_filter_use_source_labels(
     assert {item.product.category for item in result.items} == {"Beverages"}
 
 
+def test_category_candidates_are_bounded_and_source_defined(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    candidates = operational_adapter.list_categories(limit=2)
+
+    assert len(candidates) == 2
+    assert all(candidate.external_category_id for candidate in candidates)
+    assert [candidate.label for candidate in candidates] == sorted(
+        candidate.label for candidate in candidates
+    )
+
+
 def test_category_resolution_reports_ambiguous_source_matches(
     operational_adapter: PostgreSQLOperationalAdapter,
 ) -> None:

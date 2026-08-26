@@ -174,6 +174,14 @@ class ProviderToolResult:
 
 
 @dataclass(frozen=True)
+class ProviderCategoryCandidate:
+    """A bounded source-defined category offered to the operational planner."""
+
+    external_category_id: str
+    label: str
+
+
+@dataclass(frozen=True)
 class OwnerChatRequest:
     profile: ProviderBusinessProfile
     knowledge: tuple[ProviderKnowledge, ...]
@@ -185,6 +193,7 @@ class OwnerChatRequest:
     mode: Literal["grounded", "conversation", "operational", "customer"] = "grounded"
     tools: tuple[ProviderToolDefinition, ...] = ()
     tool_results: tuple[ProviderToolResult, ...] = ()
+    category_candidates: tuple[ProviderCategoryCandidate, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -655,6 +664,13 @@ def _provider_neutral_request_input(request: OwnerChatRequest) -> dict[str, Any]
                 {"tool_name": result.tool_name, "output": result.output}
                 for result in request.tool_results
             ],
+            category_candidates=[
+                {
+                    "external_category_id": candidate.external_category_id,
+                    "label": candidate.label,
+                }
+                for candidate in request.category_candidates
+            ],
         )
     return payload
 
@@ -746,7 +762,13 @@ def _operational_context(request: OwnerChatRequest) -> dict[str, Any]:
             {"tool_name": result.tool_name, "output": result.output}
             for result in request.tool_results
         ],
-        "rolling_summary": request.rolling_summary,
+        "category_candidates": [
+            {
+                "external_category_id": candidate.external_category_id,
+                "label": candidate.label,
+            }
+            for candidate in request.category_candidates
+        ],
     }
 
 
@@ -773,8 +795,9 @@ def _operational_instructions(request: OwnerChatRequest) -> str:
         "status is not_found, explain naturally that the product was not found and "
         "do not use documents or assumptions. Use quantities only when resolution "
         "is resolved, and keep separate branch and warehouse rows separate. "
-        "For category inventory, pass the category label understood by the connected "
-        "source in category_filter; do not invent a category or synonym mapping. "
+        "For category inventory, choose category_filter only from the bounded "
+        "source-defined category candidates. Interpret the owner's concept against "
+        "those candidates, but do not invent a category or synonym mapping. "
         "Sales metrics are typed: revenue is not profit. Request gross_profit or "
         "net_profit only when the approved capability description explicitly supports "
         "the required cost/expense data. "

@@ -37,6 +37,7 @@ from app.integrations.profiles import ConnectionProfileRegistry, MappingProfileE
 from app.schemas.operational import (
     BestSellersQuery,
     BestSellingProductsResult,
+    CategoryCandidate,
     InventoryQuery,
     InventoryReadQuery,
     InventoryResult,
@@ -61,6 +62,7 @@ UNKNOWN_TOOL_AUDIT_NAME = "unknown_tool"
 
 MAX_TOOL_RESULT_ROWS = 50
 MAX_BEST_SELLER_RESULTS = 20
+MAX_CATEGORY_CANDIDATES = 50
 
 SAFE_TOOL_ERROR_CODES = frozenset(
     {
@@ -344,6 +346,7 @@ class OperationalToolExecutor:
         secret = self._settings.tool_call_audit_hmac_secret
         if secret is None or not secret.get_secret_value().strip():
             return ()
+
         try:
             business = load_full_access_business(self._session, user, business_id)
             if business.status is not BusinessStatus.ACTIVE:
@@ -375,6 +378,40 @@ class OperationalToolExecutor:
             _logger.warning(
                 "available_definitions returning empty: %s",
                 type(exc).__name__,
+            )
+            self._session.rollback()
+            return ()
+
+    def category_candidates(
+        self, user: User, business_id: uuid.UUID
+    ) -> tuple[CategoryCandidate, ...]:
+        """Expose only bounded source categories to the operational planner."""
+        secret = self._settings.tool_call_audit_hmac_secret
+        if secret is None or not secret.get_secret_value().strip():
+            return ()
+        try:
+            business = load_full_access_business(self._session, user, business_id)
+            if business.status is not BusinessStatus.ACTIVE:
+                self._session.rollback()
+                return ()
+            source = self._active_source(business_id)
+            if source is None or "inventory" not in self._source_capabilities(source):
+                self._session.rollback()
+                return ()
+            adapter = self._profiles.resolve(source.connection_profile_key)
+            mapping = self._profiles.get_mapping(
+                source.mapping_profile_key, source.mapping_profile_version
+            )
+            if mapping is None or not self._adapter_timeout_is_acceptable(adapter):
+                self._session.rollback()
+                return ()
+            self._session.commit()
+            health = adapter.check_health()
+            mapping.validate_health(health)
+            return adapter.list_categories(limit=MAX_CATEGORY_CANDIDATES)
+        except Exception as exc:
+            _logger.warning(
+                "category_candidates returning empty: %s", type(exc).__name__
             )
             self._session.rollback()
             return ()

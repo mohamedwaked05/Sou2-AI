@@ -28,6 +28,7 @@ from app.agent.owner_chat_provider import (
     OwnerChatRequest,
     OwnerChatResult,
     ProviderBusinessProfile,
+    ProviderCategoryCandidate,
     ProviderKnowledge,
     ProviderMessage,
     ProviderSource,
@@ -907,23 +908,25 @@ def _build_operational_request(
     results: tuple[ProviderToolResult, ...] = (),
     *,
     requested_at: datetime | None = None,
+    category_candidates: tuple[ProviderCategoryCandidate, ...] = (),
 ) -> _PreparedTurn:
     owner_message = session.get(OwnerChatMessage, owner_message_id)
     business = _load_provider_business(session, business_id)
     if owner_message is None or business is None:
         raise _provider_unavailable()
-    rolling_summary, messages = _provider_context(session, owner_message)
+    _rolling_summary, messages = _provider_context(session, owner_message)
     request = OwnerChatRequest(
         profile=_provider_profile(business),
         knowledge=(),
         sources=(),
         messages=messages,
-        rolling_summary=rolling_summary,
+        rolling_summary=None,
         requested_at=requested_at or utc_now(),
         max_output_tokens=settings.owner_chat_max_output_tokens,
         mode="operational",
         tools=definitions,
         tool_results=results,
+        category_candidates=category_candidates,
     )
     session.commit()
     return _PreparedTurn(request=request, business=business, has_usable_evidence=True)
@@ -1588,6 +1591,7 @@ def _run_operational_loop(
     settings: Settings,
     executor: OperationalToolExecutor,
     definitions: tuple[ProviderToolDefinition, ...],
+    category_candidates: tuple[ProviderCategoryCandidate, ...] = (),
 ) -> tuple[OwnerChatResult, TokenUsage]:
     tool_results: list[ProviderToolResult] = []
     call_fingerprints: set[str] = set()
@@ -1603,6 +1607,7 @@ def _run_operational_loop(
             definitions,
             tuple(tool_results),
             requested_at=requested_at,
+            category_candidates=category_candidates,
         )
         request = prepared.request
         try:
@@ -1890,7 +1895,7 @@ def _generate_claimed_turn(
     provider: OwnerChatProvider,
     settings: Settings,
     profiles: ConnectionProfileRegistry | None,
-) -> None:
+) -> bool:
     reservation: AIUsageReservationClaim | None = None
     aggregate_usage: TokenUsage | None = None
     try:
@@ -1940,10 +1945,17 @@ def _generate_claimed_turn(
                 _persist_result(
                     session, business_id, claim, live_result, None, None, ()
                 )
-                return
+                return True
             provider_definitions = tuple(
                 ProviderToolDefinition(**definition.provider_schema())
                 for definition in available
+            )
+            category_candidates = tuple(
+                ProviderCategoryCandidate(
+                    external_category_id=candidate.external_category_id,
+                    label=candidate.label,
+                )
+                for candidate in executor.category_candidates(user, business_id)
             )
             initial = _build_operational_request(
                 session,
@@ -1951,6 +1963,7 @@ def _generate_claimed_turn(
                 claim.message_id,
                 settings,
                 provider_definitions,
+                category_candidates=category_candidates,
             )
             generation_attempt = _admit_provider_generation(session, business_id, claim)
             try:
@@ -1987,6 +2000,7 @@ def _generate_claimed_turn(
                 settings,
                 executor,
                 provider_definitions,
+                category_candidates,
             )
             _persist_result(
                 session,
@@ -1997,7 +2011,7 @@ def _generate_claimed_turn(
                 aggregate_usage,
                 (),
             )
-            return
+            return True
         if _requires_business_evidence(owner_message.content):
             prepared = _build_provider_request(
                 session, user, business_id, claim.message_id, settings
@@ -2028,12 +2042,22 @@ def _generate_claimed_turn(
                     ProviderToolDefinition(**definition.provider_schema())
                     for definition in operational_definitions
                 )
+                category_candidates = tuple(
+                    ProviderCategoryCandidate(
+                        external_category_id=candidate.external_category_id,
+                        label=candidate.label,
+                    )
+                    for candidate in operational_executor.category_candidates(
+                        user, business_id
+                    )
+                )
                 initial = _build_operational_request(
                     session,
                     business_id,
                     claim.message_id,
                     settings,
                     provider_definitions,
+                    category_candidates=category_candidates,
                 )
                 generation_attempt = _admit_provider_generation(
                     session, business_id, claim
@@ -2070,6 +2094,7 @@ def _generate_claimed_turn(
                     settings,
                     operational_executor,
                     provider_definitions,
+                    category_candidates,
                 )
                 _persist_result(
                     session,
@@ -2080,7 +2105,7 @@ def _generate_claimed_turn(
                     aggregate_usage,
                     (),
                 )
-                return
+                return True
             fallback = OwnerChatResult(
                 reply=_missing_knowledge_reply(
                     request.messages[-1].content, business.default_language
@@ -2095,7 +2120,7 @@ def _generate_claimed_turn(
                 None,
                 request.sources,
             )
-            return
+            return False
         estimated_input_tokens = provider.estimate_input_tokens(request)
         generation_attempt = _admit_provider_generation(session, business_id, claim)
         try:
@@ -2240,6 +2265,7 @@ def _generate_claimed_turn(
         if isinstance(exc, ApplicationError):
             raise
         raise _provider_unavailable() from None
+    return False
 
 
 def submit_owner_message(
@@ -2271,7 +2297,7 @@ def submit_owner_message(
         raise _owner_turn_failed()
 
     if claim is not None:
-        _generate_claimed_turn(
+        operational_turn = _generate_claimed_turn(
             session, business_id, claim, user, provider, settings, profiles
         )
         session.expire_all()
@@ -2279,7 +2305,8 @@ def submit_owner_message(
         if refreshed is not None:
             completed = _completed_turn(session, refreshed, replayed)
             if completed is not None:
-                _enqueue_summary_safely(conversation.id, settings)
+                if not operational_turn:
+                    _enqueue_summary_safely(conversation.id, settings)
                 return completed
             if refreshed.generation_state == ChatGenerationState.FAILED:
                 raise _owner_turn_failed()

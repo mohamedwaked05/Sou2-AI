@@ -279,6 +279,16 @@ _CATEGORY_RESOLUTION_SQL = text(
     """
 )
 
+_CATEGORY_CANDIDATES_SQL = text(
+    """
+    SELECT category_id::text AS external_category_id, label
+    FROM minimarket.categories
+    WHERE btrim(label) <> ''
+    ORDER BY lower(label), category_id
+    LIMIT :row_limit
+    """
+)
+
 _SALES_SUMMARY_SQL = text(
     """
     WITH filtered_sales AS (
@@ -589,6 +599,30 @@ class PostgreSQLOperationalAdapter:
             return CategoryResolution(
                 status="ambiguous", candidates=candidates, metadata=metadata
             )
+        except (SQLAlchemyError, RuntimeError) as exc:
+            self._raise_safe_database_error(exc)
+        except ValidationError, KeyError, TypeError, ArithmeticError:
+            raise OperationalDataInvalid(
+                "Operational source data is invalid."
+            ) from None
+
+    def list_categories(self, *, limit: int) -> tuple[CategoryCandidate, ...]:
+        """Return a bounded, deterministic category catalogue for planning."""
+        if not 1 <= limit <= 100:
+            raise ValueError("Category candidate limit is outside the safe bound.")
+        try:
+            with self._engine.connect() as connection:
+                self._prepare_read(connection)
+                rows = connection.execute(
+                    _CATEGORY_CANDIDATES_SQL, {"row_limit": limit}
+                ).mappings()
+                return tuple(
+                    CategoryCandidate(
+                        external_category_id=row["external_category_id"],
+                        label=row["label"],
+                    )
+                    for row in rows
+                )
         except (SQLAlchemyError, RuntimeError) as exc:
             self._raise_safe_database_error(exc)
         except ValidationError, KeyError, TypeError, ArithmeticError:
