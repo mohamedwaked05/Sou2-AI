@@ -1653,7 +1653,7 @@ class MessagingChannelConnection(Base):
     __table_args__ = (
         CheckConstraint("provider_type = 'meta_whatsapp'", name="ck_channel_provider"),
         CheckConstraint(
-            "connection_profile_key = 'meta_whatsapp_cloud'",
+            "connection_profile_key ~ '^[a-z][a-z0-9_]*$'",
             name="ck_channel_profile",
         ),
         CheckConstraint(
@@ -1668,6 +1668,18 @@ class MessagingChannelConnection(Base):
             "failure_code IS NULL OR (char_length(failure_code) BETWEEN 1 AND 100 "
             "AND failure_code ~ '^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)*$')",
             name="ck_channel_failure_code",
+        ),
+        CheckConstraint(
+            "(status = 'CONFIGURED' AND external_phone_number_id IS NULL "
+            "AND last_validated_at IS NULL AND last_successful_health_check_at IS NULL "
+            "AND failure_code IS NULL AND NOT auto_reply_enabled) OR "
+            "(status IN ('VALIDATED','ACTIVE') AND external_phone_number_id IS NOT NULL "
+            "AND last_validated_at IS NOT NULL AND last_successful_health_check_at IS NOT NULL "
+            "AND failure_code IS NULL) OR "
+            "(status = 'UNHEALTHY' AND last_validated_at IS NOT NULL "
+            "AND failure_code IS NOT NULL AND NOT auto_reply_enabled) OR "
+            "(status = 'DISABLED' AND failure_code IS NULL AND NOT auto_reply_enabled)",
+            name="ck_channel_lifecycle",
         ),
         UniqueConstraint("id", "business_id", name="uq_channel_id_business"),
         UniqueConstraint(
@@ -1831,13 +1843,38 @@ class CustomerMessage(Base):
             "send_attempts BETWEEN 0 AND 3", name="ck_customer_send_attempts"
         ),
         CheckConstraint(
+            "(direction = 'inbound' AND sender = 'customer' "
+            "AND provider_message_id IS NOT NULL AND status IN "
+            "('RECEIVED','PROCESSING','COMPLETED','FAILED')) OR "
+            "(direction = 'outbound' AND sender IN ('ai','owner') AND status IN "
+            "('PENDING_SEND','SENDING','SENT','DELIVERED','READ','FAILED'))",
+            name="ck_customer_message_semantics",
+        ),
+        CheckConstraint(
             "failure_code IS NULL OR failure_code ~ '^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)*$'",
             name="ck_customer_message_failure_code",
         ),
         UniqueConstraint("provider_message_id", name="uq_customer_provider_message"),
         UniqueConstraint("reply_to_message_id", name="uq_customer_reply_once"),
+        UniqueConstraint(
+            "id", "business_id", name="uq_customer_message_business_scope"
+        ),
+        UniqueConstraint(
+            "id", "conversation_id", "business_id", name="uq_customer_message_scope"
+        ),
+        ForeignKeyConstraint(
+            ["reply_to_message_id", "conversation_id", "business_id"],
+            [
+                "customer_messages.id",
+                "customer_messages.conversation_id",
+                "customer_messages.business_id",
+            ],
+            name="fk_customer_message_reply_scope",
+            ondelete="SET NULL",
+        ),
         Index("ix_customer_messages_history", "conversation_id", "created_at", "id"),
         Index("ix_customer_messages_outbox", "status", "next_attempt_at", "id"),
+        Index("ix_customer_messages_claims", "status", "claim_expires_at", "id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1861,6 +1898,7 @@ class CustomerMessage(Base):
         Integer, nullable=False, default=0, server_default=text("0")
     )
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failure_code: Mapped[str | None] = mapped_column(String(100))
     provider_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -1885,8 +1923,26 @@ class InboundWebhookDelivery(Base):
             "status IN ('QUEUED','PROCESSED','IGNORED','FAILED')",
             name="ck_webhook_delivery_status",
         ),
+        CheckConstraint(
+            "event_kind IN ('message','status')", name="ck_webhook_delivery_kind"
+        ),
         UniqueConstraint("provider_event_id", name="uq_webhook_provider_event"),
         Index("ix_webhook_connection_received", "connection_id", "received_at", "id"),
+        ForeignKeyConstraint(
+            ["connection_id", "business_id"],
+            [
+                "messaging_channel_connections.id",
+                "messaging_channel_connections.business_id",
+            ],
+            name="fk_webhook_connection_scope",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["customer_message_id", "business_id"],
+            ["customer_messages.id", "customer_messages.business_id"],
+            name="fk_webhook_message_scope",
+            ondelete="SET NULL",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1920,6 +1976,22 @@ class CustomerGenerationRateEvent(Base):
         UniqueConstraint("customer_message_id", name="uq_customer_rate_message"),
         Index("ix_customer_rate_business_created", "business_id", "created_at"),
         Index("ix_customer_rate_conversation_created", "conversation_id", "created_at"),
+        ForeignKeyConstraint(
+            ["conversation_id", "business_id"],
+            ["customer_conversations.id", "customer_conversations.business_id"],
+            name="fk_customer_rate_conversation_scope",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["customer_message_id", "conversation_id", "business_id"],
+            [
+                "customer_messages.id",
+                "customer_messages.conversation_id",
+                "customer_messages.business_id",
+            ],
+            name="fk_customer_rate_message_scope",
+            ondelete="CASCADE",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

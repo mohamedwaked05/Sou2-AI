@@ -31,6 +31,7 @@ from app.core.config import Settings, get_settings
 from app.core.exceptions import ApplicationError
 from app.core.security import utc_now
 from app.database.models import (
+    AIUsageReservation,
     Business,
     BusinessKnowledge,
     BusinessStatus,
@@ -68,6 +69,11 @@ INJECTION_PATTERN = re.compile(
     r"reveal (?:your |the )?(?:prompt|secret|token)|تعليمات النظام|تجاهل التعليمات)"
 )
 SOURCE_LABEL_PATTERN = re.compile(r"\s*\[S[1-9][0-9]*\]")
+BUSINESS_QUESTION_PATTERN = re.compile(
+    r"(?i)\b(?:deliver(?:y|ies)?|shipping|price|cost|how much|tomorrow|when do you|"
+    r"open|hours|address|location|return|refund|warranty|menu|products?)\b|"
+    r"ØªÙˆØµÙŠÙ„|Ø§Ù„Ø³Ø¹Ø±|Ù‚Ø¯ÙŠØ´|Ø¨ÙƒØ±Ø§|Ø§Ù„Ø¹Ù†ÙˆØ§Ù†"
+)
 
 
 def _queue(settings: Settings) -> Queue:
@@ -145,6 +151,56 @@ def enqueue_outbound_message(
         )
 
 
+def recover_expired_customer_message_claims(
+    settings_override: Settings | None = None, *, batch_size: int = 50
+) -> int:
+    """Bounded, idempotent recovery for jobs lost after their state commit."""
+    now = utc_now()
+    recovered = 0
+    with get_session_factory()() as session:
+        rows = session.scalars(
+            select(CustomerMessage)
+            .where(
+                CustomerMessage.status.in_(
+                    (CustomerMessageStatus.PROCESSING, CustomerMessageStatus.SENDING)
+                ),
+                CustomerMessage.claim_expires_at.is_not(None),
+                CustomerMessage.claim_expires_at <= now,
+            )
+            .order_by(CustomerMessage.claim_expires_at, CustomerMessage.id)
+            .limit(min(max(batch_size, 1), 100))
+            .with_for_update(skip_locked=True)
+        ).all()
+        for message in rows:
+            if message.status == CustomerMessageStatus.PROCESSING:
+                reservation = session.scalar(
+                    select(AIUsageReservation)
+                    .where(
+                        AIUsageReservation.customer_message_id == message.id,
+                        AIUsageReservation.status == "reserved",
+                    )
+                    .with_for_update()
+                )
+                if reservation is not None:
+                    reconcile_ai_usage(
+                        session,
+                        reservation.id,
+                        usage=None,
+                        outcome="release",
+                        commit=False,
+                    )
+                message.status = CustomerMessageStatus.FAILED
+                message.failure_code = "customer.processing_lease_expired"
+            else:
+                message.status = CustomerMessageStatus.FAILED
+                message.failure_code = "channel.delivery_uncertain"
+            message.claim_expires_at = None
+            recovered += 1
+        if rows:
+            session.commit()
+    return recovered
+
+
 def _profile(business: Business) -> ProviderBusinessProfile:
     weekdays = (
         "monday",
@@ -203,6 +259,14 @@ def _static_reply(content: str, kind: str) -> str:
             "Sorry, private or live operational information is unavailable "
             "in customer chat."
         )
+    if kind == "missing":
+        if arabic:
+            return (
+                "Ø¹Ø°Ø±Ø§Ù‹ØŒ Ù‡ÙŠØ¯Ø§ Ø§Ù„Ù…Ø¹Ù„ÙˆÙ…Ø© Ù…Ø´ Ù…ØªÙˆÙØ±Ø© Ø­Ø§Ù„ÙŠÙ‹Ø§."
+            )
+        if franco:
+            return "Sorry, hal ma3loume mish mawjoude 3anna halla2."
+        return "Sorry, that business information is not available right now."
     if arabic:
         return "عذراً، ما فيني اتبع هالطلب أو اكشف تعليمات داخلية."
     return "Sorry, I can’t follow that request or reveal internal instructions."
@@ -354,15 +418,81 @@ def _provider_request(
                 result.chunks[: settings.rag_context_max_chunks], 1
             )
         )
+    history_rows = session.scalars(
+        select(CustomerMessage)
+        .where(
+            CustomerMessage.business_id == business.id,
+            CustomerMessage.conversation_id == message.conversation_id,
+            (
+                (CustomerMessage.id == message.id)
+                | (
+                    (CustomerMessage.direction == "inbound")
+                    & (CustomerMessage.status == CustomerMessageStatus.COMPLETED)
+                )
+                | (
+                    (CustomerMessage.direction == "outbound")
+                    & CustomerMessage.sender.in_(("ai", "owner"))
+                    & CustomerMessage.status.in_(
+                        (
+                            CustomerMessageStatus.SENT,
+                            CustomerMessageStatus.DELIVERED,
+                            CustomerMessageStatus.READ,
+                        )
+                    )
+                )
+            ),
+        )
+        .order_by(CustomerMessage.created_at.desc(), CustomerMessage.id.desc())
+        .limit(12)
+    ).all()
+    history_rows.sort(key=lambda row: (row.created_at, row.id))
     return OwnerChatRequest(
         profile=_profile(business),
         knowledge=knowledge,
-        messages=(ProviderMessage(role="owner", content=message.content),),
+        messages=tuple(
+            ProviderMessage(
+                role="owner" if row.direction == "inbound" else "assistant",
+                content=row.content,
+            )
+            for row in history_rows
+        ),
         requested_at=now,
         max_output_tokens=settings.customer_chat_max_output_tokens,
         sources=sources,
         mode="customer",
     )
+
+
+def _customer_evidence_supports(request: OwnerChatRequest, content: str) -> bool:
+    """Use a conservative lexical gate before charging unsupported business turns."""
+    if not BUSINESS_QUESTION_PATTERN.search(content):
+        return True
+    words = {
+        word.casefold()
+        for word in re.findall(r"[\w\u0600-\u06ff]+", content)
+        if len(word) > 2
+    }
+    evidence = " ".join(
+        [request.profile.name, request.profile.description]
+        + [item.content for item in request.knowledge]
+        + [item.content for item in request.sources]
+    ).casefold()
+    return any(word in evidence for word in words)
+
+
+def _validate_customer_result(result, request: OwnerChatRequest, content: str) -> str:
+    if result.proposed_knowledge:
+        raise ValueError("customer_provider_proposed_knowledge")
+    labels = tuple(result.cited_source_ids)
+    valid = {source.label for source in request.sources}
+    if len(labels) != len(set(labels)) or any(label not in valid for label in labels):
+        raise ValueError("customer_provider_invalid_citations")
+    if request.sources and BUSINESS_QUESTION_PATTERN.search(content) and not labels:
+        raise ValueError("customer_provider_missing_citation")
+    reply_text = SOURCE_LABEL_PATTERN.sub("", result.reply).strip()
+    if not reply_text:
+        raise ValueError("customer_provider_empty_reply")
+    return reply_text
 
 
 def process_inbound_message(
@@ -372,6 +502,7 @@ def process_inbound_message(
     settings_override: Settings | None = None,
 ) -> None:
     settings = settings_override or get_settings()
+    recover_expired_customer_message_claims(settings, batch_size=25)
     identifier = uuid.UUID(message_id)
     reservation_id: uuid.UUID | None = None
     resolved_provider = provider or get_owner_chat_provider(settings)
@@ -393,9 +524,13 @@ def process_inbound_message(
         if not conversation or not connection or not business:
             message.status = CustomerMessageStatus.FAILED
             message.failure_code = "customer.context_unavailable"
+            message.claim_expires_at = None
             session.commit()
             return
         message.status = CustomerMessageStatus.PROCESSING
+        message.claim_expires_at = utc_now() + timedelta(
+            seconds=settings.customer_generation_lease_seconds
+        )
         session.commit()
 
         if HANDOFF_PATTERN.search(message.content):
@@ -412,6 +547,7 @@ def process_inbound_message(
             or conversation.state == CustomerConversationState.HUMAN_HANDOFF
         ):
             message.status = CustomerMessageStatus.COMPLETED
+            message.claim_expires_at = None
             session.commit()
             return
         if PRIVATE_OPERATION_PATTERN.search(message.content):
@@ -426,21 +562,30 @@ def process_inbound_message(
             )
             enqueue_outbound_message(reply.id, settings)
             return
+        request = _provider_request(
+            session,
+            message,
+            business,
+            resolved_provider,
+            embedding_provider,
+            settings,
+        )
+        if not _customer_evidence_supports(request, message.content):
+            message.status = CustomerMessageStatus.COMPLETED
+            message.claim_expires_at = None
+            reply = _persist_reply(
+                session, message, _static_reply(message.content, "missing")
+            )
+            enqueue_outbound_message(reply.id, settings)
+            return
         if not _admit_rate(session, message, settings):
             message.status = CustomerMessageStatus.FAILED
             message.failure_code = "customer.rate_limited"
+            message.claim_expires_at = None
             session.commit()
             return
 
         try:
-            request = _provider_request(
-                session,
-                message,
-                business,
-                resolved_provider,
-                embedding_provider,
-                settings,
-            )
             claim = reserve_customer_message_usage(
                 session,
                 message=message,
@@ -450,11 +595,7 @@ def process_inbound_message(
             )
             reservation_id = claim.id
             result = resolved_provider.generate(request)
-            if result.proposed_knowledge:
-                raise ValueError("customer_provider_proposed_knowledge")
-            reply_text = SOURCE_LABEL_PATTERN.sub("", result.reply).strip()
-            if not reply_text:
-                raise ValueError("customer_provider_empty_reply")
+            reply_text = _validate_customer_result(result, request, message.content)
             reply = CustomerMessage(
                 id=uuid.uuid4(),
                 business_id=message.business_id,
@@ -467,6 +608,7 @@ def process_inbound_message(
             )
             session.add(reply)
             message.status = CustomerMessageStatus.COMPLETED
+            message.claim_expires_at = None
             reconcile_ai_usage(
                 session,
                 reservation_id,
@@ -500,6 +642,7 @@ def process_inbound_message(
                 )
             message.status = CustomerMessageStatus.FAILED
             message.failure_code = "customer.provider_failure"
+            message.claim_expires_at = None
             session.commit()
         except ApplicationError, ValueError:
             if reservation_id is not None:
@@ -508,6 +651,7 @@ def process_inbound_message(
                 )
             message.status = CustomerMessageStatus.FAILED
             message.failure_code = "customer.generation_failed"
+            message.claim_expires_at = None
             session.commit()
 
 
@@ -517,6 +661,7 @@ def process_outbound_message(
     settings_override: Settings | None = None,
 ) -> None:
     settings = settings_override or get_settings()
+    recover_expired_customer_message_claims(settings, batch_size=25)
     identifier = uuid.UUID(message_id)
     retry_delay: int | None = None
     with get_session_factory()() as session:
@@ -545,6 +690,7 @@ def process_outbound_message(
             ):
                 message.status = CustomerMessageStatus.FAILED
                 message.failure_code = "channel.not_active"
+                message.claim_expires_at = None
                 session.commit()
                 return
             try:
@@ -564,6 +710,9 @@ def process_outbound_message(
                 return
             message.status = CustomerMessageStatus.SENDING
             message.send_attempts += 1
+            message.claim_expires_at = utc_now() + timedelta(
+                seconds=settings.whatsapp_request_timeout_seconds + 5
+            )
             session.commit()
             try:
                 result = resolved_adapter.send_text(recipient, message.content)
@@ -576,16 +725,19 @@ def process_outbound_message(
                 ):
                     retry_delay = exc.retry_after_seconds or (5 * message.send_attempts)
                     message.status = CustomerMessageStatus.PENDING_SEND
+                    message.claim_expires_at = None
                     message.next_attempt_at = utc_now() + timedelta(seconds=retry_delay)
                     message.failure_code = exc.code
                 elif message is not None:
                     message.status = CustomerMessageStatus.FAILED
                     message.failure_code = exc.code
+                    message.claim_expires_at = None
                 session.commit()
             else:
                 message = session.get(CustomerMessage, identifier)
                 if message is not None:
                     message.status = CustomerMessageStatus.SENT
+                    message.claim_expires_at = None
                     message.provider_message_id = result.provider_message_id
                     message.next_attempt_at = None
                     message.failure_code = None

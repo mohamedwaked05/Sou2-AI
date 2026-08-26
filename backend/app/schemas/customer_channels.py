@@ -18,7 +18,9 @@ from app.database.models import (
 class WhatsAppConnectionCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     display_name: str = Field(min_length=2, max_length=120)
-    connection_profile_key: Literal["meta_whatsapp_cloud"]
+    connection_profile_key: str = Field(
+        min_length=2, max_length=100, pattern=r"^[a-z][a-z0-9_]*$"
+    )
 
     @field_validator("display_name")
     @classmethod
@@ -36,7 +38,7 @@ class WhatsAppConnectionResponse(BaseModel):
     id: uuid.UUID
     display_name: str
     provider_type: Literal["meta_whatsapp"]
-    connection_profile_key: Literal["meta_whatsapp_cloud"]
+    connection_profile_key: str
     status: MessagingConnectionStatus
     auto_reply_enabled: bool
     last_validated_at: datetime | None

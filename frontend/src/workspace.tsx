@@ -1243,6 +1243,9 @@ function WhatsAppConversations({
   );
   const [selected, setSelected] = useState<CustomerConversation | null>(null);
   const [messages, setMessages] = useState<CustomerMessage[] | null>(null);
+  const [conversationCursor, setConversationCursor] = useState<string | null>(null);
+  const [messageCursor, setMessageCursor] = useState<string | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [reply, setReply] = useState("");
   const [confirmReply, setConfirmReply] = useState(false);
   const [busy, setBusy] = useState<"reply" | "handoff" | "resume" | "">("");
@@ -1258,7 +1261,16 @@ function WhatsAppConversations({
     setError("");
     try {
       const result = await api.customerConversations(business.id);
-      setConversations(result.items);
+      setConversations((current) => {
+        const merged = new Map((current ?? []).map((item) => [item.id, item]));
+        result.items.forEach((item) => merged.set(item.id, item));
+        return [...merged.values()].sort(
+          (left, right) =>
+            new Date(right.last_message_at ?? right.created_at).getTime() -
+            new Date(left.last_message_at ?? left.created_at).getTime(),
+        );
+      });
+      setConversationCursor(result.next_cursor);
       setSelected((current) =>
         current
           ? (result.items.find((item) => item.id === current.id) ?? null)
@@ -1275,6 +1287,18 @@ function WhatsAppConversations({
   }, [load]);
 
   useEffect(() => {
+    const refresh = () => {
+      if (!document.hidden) void load();
+    };
+    const timer = window.setInterval(refresh, 15000);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [load]);
+
+  useEffect(() => {
     if (!selectedId) {
       setMessages([]);
       return;
@@ -1282,12 +1306,88 @@ function WhatsAppConversations({
     setMessages(null);
     api
       .customerMessages(business.id, selectedId)
-      .then((result) => setMessages(result.items))
+      .then((result) => {
+        setMessages(result.items);
+        setMessageCursor(result.next_cursor);
+      })
       .catch((caught) => {
         setMessages([]);
         setError(errorMessage(caught));
       });
   }, [business.id, selectedId]);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    let cancelled = false;
+    const refreshMessages = () => {
+      if (document.hidden) return;
+      void api.customerMessages(business.id, selectedId).then((result) => {
+        if (cancelled) return;
+        setMessages((current) => {
+          const merged = new Map((current ?? []).map((item) => [item.id, item]));
+          result.items.forEach((item) => merged.set(item.id, item));
+          return [...merged.values()].sort(
+            (left, right) =>
+              new Date(left.created_at).getTime() -
+              new Date(right.created_at).getTime(),
+          );
+        });
+        setMessageCursor(result.next_cursor);
+      });
+    };
+    const timer = window.setInterval(refreshMessages, 15000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [business.id, selectedId]);
+
+  async function loadOlderConversations() {
+    if (!conversationCursor || loadingOlder) return;
+    setLoadingOlder(true);
+    try {
+      const result = await api.customerConversations(business.id, conversationCursor);
+      setConversations((current) => {
+        const merged = new Map((current ?? []).map((item) => [item.id, item]));
+        result.items.forEach((item) => merged.set(item.id, item));
+        return [...merged.values()];
+      });
+      setConversationCursor(result.next_cursor);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setLoadingOlder(false);
+    }
+  }
+
+  async function loadOlderMessages() {
+    if (!selectedId || !messageCursor || loadingOlder) return;
+    const viewport = scroll.viewportRef.current;
+    const beforeHeight = viewport?.scrollHeight ?? 0;
+    const beforeTop = viewport?.scrollTop ?? 0;
+    setLoadingOlder(true);
+    try {
+      const result = await api.customerMessages(business.id, selectedId, messageCursor);
+      setMessages((current) => {
+        const merged = new Map(result.items.map((item) => [item.id, item]));
+        (current ?? []).forEach((item) => merged.set(item.id, item));
+        return [...merged.values()].sort(
+          (left, right) =>
+            new Date(left.created_at).getTime() - new Date(right.created_at).getTime(),
+        );
+      });
+      setMessageCursor(result.next_cursor);
+      requestAnimationFrame(() => {
+        const nextViewport = scroll.viewportRef.current;
+        if (nextViewport)
+          nextViewport.scrollTop = beforeTop + nextViewport.scrollHeight - beforeHeight;
+      });
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setLoadingOlder(false);
+    }
+  }
 
   async function changeHandoff(handoff: boolean) {
     if (!selected) return;
@@ -1381,6 +1481,16 @@ function WhatsAppConversations({
                 </button>
               ))}
             </div>
+            {conversationCursor && (
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => void loadOlderConversations()}
+                disabled={loadingOlder}
+              >
+                {loadingOlder ? "Loading…" : "Load more conversations"}
+              </button>
+            )}
           </aside>
           <section className="panel conversation-history customer-history">
             {selected && (
@@ -1426,6 +1536,16 @@ function WhatsAppConversations({
                 aria-label="WhatsApp conversation history"
                 onScroll={scroll.onScroll}
               >
+                {messageCursor && (
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => void loadOlderMessages()}
+                    disabled={loadingOlder}
+                  >
+                    {loadingOlder ? "Loading…" : "Load older messages"}
+                  </button>
+                )}
                 {messages.map((message) => (
                   <article
                     key={message.id}
