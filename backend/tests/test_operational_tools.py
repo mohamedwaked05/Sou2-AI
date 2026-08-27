@@ -134,6 +134,16 @@ class StubSource:
                 label="Jbeil Branch",
                 location_type="branch",
             ),
+            LocationCandidate(
+                external_location_id="BR-OTHER",
+                label="Other Branch",
+                location_type="branch",
+            ),
+            LocationCandidate(
+                external_location_id="WH-OTHER",
+                label="Other Warehouse",
+                location_type="warehouse",
+            ),
         )
         self.timeout_seconds = 2
         self.resolution = ProductResolution(
@@ -345,6 +355,12 @@ def test_registry_contains_exactly_four_provider_neutral_tools() -> None:
     assert "postgres" not in serialized
     assert "sql" not in serialized
     assert "password" not in serialized
+    inventory_properties = registry[CURRENT_INVENTORY_TOOL].provider_schema()[
+        "input_schema"
+    ]["properties"]
+    assert "location_reference" in inventory_properties
+    assert "branch_external_id" not in inventory_properties
+    assert "warehouse_external_id" not in inventory_properties
 
 
 @pytest.mark.parametrize(
@@ -726,7 +742,7 @@ def test_explicit_inventory_location_overrides_saved_preference(
                 tool_name=CURRENT_INVENTORY_TOOL,
                 tool_arguments={
                     "product_filter": "generic-item",
-                    "branch_external_id": "BR-OTHER",
+                    "location_reference": "Other Branch",
                     "limit": 5,
                 },
             ),
@@ -749,6 +765,60 @@ def test_explicit_inventory_location_overrides_saved_preference(
         db_session.scalar(select(UserOperationalPreference)).location_external_id
         == "BR-JBEIL"
     )
+
+
+def test_inventory_planning_ignores_history_and_applies_saved_location(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"current-turn-location-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key="default_inventory_location",
+                location_reference="Jbeil Branch",
+            ),
+            usage_result(reply="The default location was saved."),
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"product_filter": "generic-item", "limit": 5},
+            ),
+            usage_result(reply="The validated inventory result is ready."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    preference = submit(
+        api_client,
+        user,
+        business["id"],
+        "Use Jbeil Branch for future inventory questions.",
+        f"history-location-preference-{uuid.uuid4()}",
+    )
+    inventory = submit(
+        api_client,
+        user,
+        business["id"],
+        "How many generic items do we have?",
+        f"history-location-inventory-{uuid.uuid4()}",
+    )
+
+    assert preference.status_code == 200, preference.text
+    assert inventory.status_code == 200, inventory.text
+    planning_request = provider.requests[2]
+    assert planning_request.mode == "operational"
+    assert len(planning_request.messages) == 1
+    assert planning_request.messages[0].content == "How many generic items do we have?"
+    assert source.last_inventory_query.branch_external_id == "BR-JBEIL"
+    saved = db_session.scalar(select(UserOperationalPreference))
+    assert saved is not None
+    assert saved.location_external_id == "BR-JBEIL"
 
 
 def test_location_preference_clear_is_idempotent_and_never_reads_inventory(
@@ -1157,7 +1227,7 @@ def test_owner_loop_executes_live_tool_aggregates_usage_and_replays_without_work
             usage_result(
                 decision="tool",
                 tool_name=CURRENT_INVENTORY_TOOL,
-                tool_arguments={"branch_external_id": "BR-BEY", "limit": 5},
+                tool_arguments={"location_reference": "Jbeil Branch", "limit": 5},
             ),
             usage_result(
                 reply="Beirut has 8 available units as of the source timestamp."
@@ -1334,6 +1404,92 @@ def test_unresolved_product_turn_returns_safe_answer_without_rag_or_guessing(
         assert "couldn't find that product" in content
     assert source.calls == []
     assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
+
+
+def test_product_follow_up_uses_bounded_pending_candidates_without_history(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"pending-product-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    ambiguous = ProductResolution(
+        status="ambiguous",
+        matched_by="partial_name",
+        candidates=(
+            ProductResolutionCandidate(
+                external_product_id="fixture-product-a",
+                sku="fixture-a",
+                name="Fixture Product A",
+            ),
+            ProductResolutionCandidate(
+                external_product_id="fixture-product-b",
+                sku="fixture-b",
+                name="Fixture Product B",
+            ),
+        ),
+        metadata=metadata(rows=2),
+    )
+    resolved = source.resolution
+
+    def resolve_by_reference(query: object) -> ProductResolution:
+        reference = cast(Any, query).reference
+        source.resolution_references.append(reference)
+        return ambiguous if reference == "initial ambiguous request" else resolved
+
+    source.resolve_product = resolve_by_reference  # type: ignore[method-assign]
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={
+                    "product_filter": "initial ambiguous request",
+                    "limit": 5,
+                },
+            ),
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={
+                    "product_filter": "selected fixture variant",
+                    "limit": 5,
+                },
+            ),
+            usage_result(reply="The validated inventory result is ready."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    initial = submit(
+        api_client,
+        user,
+        business["id"],
+        "initial ambiguous request",
+        f"pending-product-initial-{uuid.uuid4()}",
+    )
+    follow_up = submit(
+        api_client,
+        user,
+        business["id"],
+        "selected fixture variant",
+        f"pending-product-follow-up-{uuid.uuid4()}",
+    )
+
+    assert initial.status_code == 200, initial.text
+    assert follow_up.status_code == 200, follow_up.text
+    follow_up_request = provider.requests[1]
+    assert len(follow_up_request.messages) == 1
+    assert follow_up_request.messages[0].content == "selected fixture variant"
+    assert [
+        candidate.label for candidate in follow_up_request.pending_product_candidates
+    ] == [
+        "Fixture Product A",
+        "Fixture Product B",
+    ]
+    assert source.last_inventory_query is not None
 
 
 def test_active_source_without_matching_capability_uses_provider_unavailable(

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -97,6 +97,27 @@ class CurrentInventoryToolInput(InventoryQuery):
     limit: int = Field(default=50, ge=1, le=MAX_TOOL_RESULT_ROWS)
 
 
+class CurrentInventoryPlannerInput(BaseModel):
+    """Untrusted planner input; source identifiers remain a backend concern."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    product_filter: str | None = Field(default=None, min_length=1, max_length=80)
+    category_filter: str | None = Field(default=None, min_length=1, max_length=128)
+    location_reference: str | None = Field(default=None, min_length=1, max_length=255)
+    limit: int = Field(default=50, ge=1, le=MAX_TOOL_RESULT_ROWS)
+
+    @field_validator("product_filter", "category_filter", "location_reference")
+    @classmethod
+    def strip_filter(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Operational filters cannot be blank.")
+        return normalized
+
+
 class BestSellingProductsToolInput(BestSellersQuery):
     limit: int = Field(default=10, ge=1, le=MAX_BEST_SELLER_RESULTS)
 
@@ -130,12 +151,15 @@ class OperationalToolDefinition:
     result_limit: int
     timeout_seconds: int
     executor: ToolExecutor
+    provider_input_schema: type[BaseModel] | None = None
 
     def provider_schema(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "description": self.description,
-            "input_schema": self.input_schema.model_json_schema(),
+            "input_schema": (
+                self.provider_input_schema or self.input_schema
+            ).model_json_schema(),
         }
 
 
@@ -285,6 +309,7 @@ def build_operational_tool_registry(
             result_limit=MAX_TOOL_RESULT_ROWS,
             timeout_seconds=timeout_seconds,
             executor=_inventory,
+            provider_input_schema=CurrentInventoryPlannerInput,
         ),
         OperationalToolDefinition(
             name=SALES_SUMMARY_TOOL,
@@ -533,6 +558,54 @@ class OperationalToolExecutor:
             raise ToolExecutionError("integration_unavailable") from None
         except Exception as exc:
             _logger.warning("resolve_location failed: %s", type(exc).__name__)
+            self._session.rollback()
+            raise ToolExecutionError("adapter_failure") from None
+
+    def resolve_product(
+        self, user: User, business_id: uuid.UUID, reference: str
+    ) -> ProductResolution:
+        """Resolve a bounded source product reference without recording a tool call."""
+
+        secret = self._settings.tool_call_audit_hmac_secret
+        if secret is None or not secret.get_secret_value().strip():
+            raise ToolExecutionError("audit_unavailable")
+        try:
+            business = load_full_access_business(self._session, user, business_id)
+            if business.status is not BusinessStatus.ACTIVE:
+                raise ToolExecutionError("inactive_business")
+            source = self._active_source(business_id)
+            if source is None or "inventory" not in self._source_capabilities(source):
+                raise ToolExecutionError("integration_unavailable")
+            adapter = self._profiles.resolve(source.connection_profile_key)
+            mapping = self._profiles.get_mapping(
+                source.mapping_profile_key, source.mapping_profile_version
+            )
+            if mapping is None or not self._adapter_timeout_is_acceptable(adapter):
+                raise ToolExecutionError("integration_unavailable")
+            self._session.commit()
+            health = adapter.check_health()
+            mapping.validate_health(health)
+            return adapter.resolve_product(ProductResolutionQuery(reference=reference))
+        except ToolExecutionError:
+            self._session.rollback()
+            raise
+        except ApplicationError:
+            self._session.rollback()
+            raise ToolExecutionError("authorization_denied") from None
+        except OperationalQueryTimeout:
+            self._session.rollback()
+            raise ToolExecutionError("timeout") from None
+        except (
+            MappingProfileError,
+            OperationalDataInvalid,
+            OperationalIntegrationError,
+            OperationalSourceUnavailable,
+            ValueError,
+        ):
+            self._session.rollback()
+            raise ToolExecutionError("integration_unavailable") from None
+        except Exception as exc:
+            _logger.warning("resolve_product failed: %s", type(exc).__name__)
             self._session.rollback()
             raise ToolExecutionError("adapter_failure") from None
 

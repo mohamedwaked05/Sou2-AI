@@ -190,6 +190,14 @@ class ProviderLocationCandidate:
 
 
 @dataclass(frozen=True)
+class ProviderProductCandidate:
+    """A source-derived candidate for one immediately pending clarification."""
+
+    label: str
+    sku: str | None = None
+
+
+@dataclass(frozen=True)
 class OwnerChatRequest:
     profile: ProviderBusinessProfile
     knowledge: tuple[ProviderKnowledge, ...]
@@ -217,6 +225,7 @@ class OwnerChatRequest:
     ) = None
     category_candidates: tuple[ProviderCategoryCandidate, ...] = ()
     location_candidates: tuple[ProviderLocationCandidate, ...] = ()
+    pending_product_candidates: tuple[ProviderProductCandidate, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -785,6 +794,10 @@ def _provider_neutral_request_input(request: OwnerChatRequest) -> dict[str, Any]
                 }
                 for candidate in request.location_candidates
             ],
+            pending_product_candidates=[
+                {"label": candidate.label, "sku": candidate.sku}
+                for candidate in request.pending_product_candidates
+            ],
         )
     return payload
 
@@ -890,6 +903,10 @@ def _operational_context(request: OwnerChatRequest) -> dict[str, Any]:
             }
             for candidate in request.location_candidates
         ],
+        "pending_product_candidates": [
+            {"label": candidate.label, "sku": candidate.sku}
+            for candidate in request.pending_product_candidates
+        ],
     }
 
 
@@ -934,6 +951,10 @@ def _operational_instructions(request: OwnerChatRequest) -> str:
         "against the bounded source-defined location_candidates but never invent a "
         "location identifier. Use clear_preference only for that approved key. These "
         "actions do not run inventory queries. "
+        "pending_product_candidates, when supplied, are source-derived options from "
+        "only the immediately preceding unresolved product clarification. Use them "
+        "only to understand a current selection; extract a product_filter from the "
+        "current owner message and never treat older conversation text as a filter. "
         "Never invent missing values, create document citations, expose internal "
         "details, or claim a failed operation succeeded. Return only JSON matching "
         "the supplied schema. Safe context follows:\n"

@@ -32,6 +32,7 @@ from app.agent.owner_chat_provider import (
     ProviderKnowledge,
     ProviderLocationCandidate,
     ProviderMessage,
+    ProviderProductCandidate,
     ProviderSource,
     ProviderToolDefinition,
     ProviderToolResult,
@@ -896,12 +897,18 @@ def _build_operational_request(
     requested_at: datetime | None = None,
     category_candidates: tuple[ProviderCategoryCandidate, ...] = (),
     location_candidates: tuple[ProviderLocationCandidate, ...] = (),
+    pending_product_candidates: tuple[ProviderProductCandidate, ...] = (),
 ) -> _PreparedTurn:
     owner_message = session.get(OwnerChatMessage, owner_message_id)
     business = _load_provider_business(session, business_id)
     if owner_message is None or business is None:
         raise _provider_unavailable()
-    _rolling_summary, messages = _provider_context(session, owner_message)
+    # Operational filters must describe the current turn. Persisted preferences and
+    # pending clarification state are resolved by the backend, not inferred from
+    # unrelated conversation history.
+    messages = (
+        ProviderMessage(role=str(owner_message.role), content=owner_message.content),
+    )
     request = OwnerChatRequest(
         profile=_provider_profile(business),
         knowledge=(),
@@ -915,6 +922,7 @@ def _build_operational_request(
         tool_results=results,
         category_candidates=category_candidates,
         location_candidates=location_candidates,
+        pending_product_candidates=pending_product_candidates,
     )
     session.commit()
     return _PreparedTurn(request=request, business=business, has_usable_evidence=True)
@@ -973,6 +981,8 @@ def _operational_synthesis_status(output: object) -> str:
     status = output.get("status")
     if status == "unsupported":
         return "unsupported"
+    if status in {"ambiguous", "not_found"}:
+        return status
     resolution = output.get("resolution")
     if isinstance(resolution, dict):
         resolution_status = resolution.get("status")
@@ -1620,18 +1630,103 @@ def _operational_synthesis_fallback(
     )
 
 
-def _apply_inventory_location_preference(
+@dataclass(frozen=True)
+class _InventoryLocationPreparation:
+    arguments: dict[str, object]
+    result: ProviderToolResult | None
+    location_source: str
+    location_input_kind: str
+    preference_loaded: bool
+    preference_applied: bool
+    location_resolution: str
+
+
+def _location_resolution_outcome(status: str) -> str:
+    return {
+        "resolved": "one",
+        "ambiguous": "multiple",
+        "not_found": "zero",
+    }.get(status, "zero")
+
+
+def _prepare_inventory_location_arguments(
     session: Session,
     executor: OperationalToolExecutor,
     user: User,
     business_id: uuid.UUID,
     arguments: dict[str, object],
-) -> tuple[dict[str, object], ProviderToolResult | None]:
-    if arguments.get("branch_external_id") or arguments.get("warehouse_external_id"):
-        return arguments, None
+) -> _InventoryLocationPreparation:
+    updated = dict(arguments)
+    location_reference = updated.pop("location_reference", None)
+    branch_reference = updated.pop("branch_external_id", None)
+    warehouse_reference = updated.pop("warehouse_external_id", None)
+    if (
+        sum(
+            bool(reference)
+            for reference in (location_reference, branch_reference, warehouse_reference)
+        )
+        > 1
+    ):
+        raise ToolExecutionError("invalid_arguments")
+    current_turn_reference = (
+        location_reference or branch_reference or warehouse_reference
+    )
+    if current_turn_reference:
+        if not isinstance(current_turn_reference, str):
+            raise ToolExecutionError("invalid_arguments")
+        resolution = executor.resolve_location(
+            user, business_id, current_turn_reference
+        )
+        outcome = _location_resolution_outcome(resolution.status)
+        if resolution.status != "resolved" or resolution.location is None:
+            return _InventoryLocationPreparation(
+                arguments=updated,
+                result=ProviderToolResult(
+                    tool_name="inventory_location",
+                    output={
+                        "capability": "inventory_location",
+                        "status": resolution.status,
+                        "candidates": [
+                            {
+                                "label": candidate.label,
+                                "location_type": candidate.location_type,
+                            }
+                            for candidate in resolution.candidates
+                        ],
+                    },
+                ),
+                location_source="current_turn",
+                location_input_kind="label",
+                preference_loaded=False,
+                preference_applied=False,
+                location_resolution=outcome,
+            )
+        location = resolution.location
+        updated[
+            "branch_external_id"
+            if location.location_type == "branch"
+            else "warehouse_external_id"
+        ] = location.external_location_id
+        return _InventoryLocationPreparation(
+            arguments=updated,
+            result=None,
+            location_source="current_turn",
+            location_input_kind="label",
+            preference_loaded=False,
+            preference_applied=False,
+            location_resolution=outcome,
+        )
     source = executor._active_source(business_id)
     if source is None:
-        return arguments, None
+        return _InventoryLocationPreparation(
+            arguments=updated,
+            result=None,
+            location_source="none",
+            location_input_kind="none",
+            preference_loaded=False,
+            preference_applied=False,
+            location_resolution="zero",
+        )
     preference = session.scalar(
         select(UserOperationalPreference).where(
             UserOperationalPreference.user_id == user.id,
@@ -1641,13 +1736,29 @@ def _apply_inventory_location_preference(
         )
     )
     if preference is None:
-        return arguments, None
+        return _InventoryLocationPreparation(
+            arguments=updated,
+            result=None,
+            location_source="none",
+            location_input_kind="none",
+            preference_loaded=False,
+            preference_applied=False,
+            location_resolution="zero",
+        )
     try:
         resolution = executor.resolve_location(
             user, business_id, preference.location_external_id
         )
     except ToolExecutionError:
-        return arguments, None
+        return _InventoryLocationPreparation(
+            arguments=updated,
+            result=None,
+            location_source="none",
+            location_input_kind="none",
+            preference_loaded=True,
+            preference_applied=False,
+            location_resolution="zero",
+        )
     if (
         resolution.status != "resolved"
         or resolution.location is None
@@ -1656,23 +1767,35 @@ def _apply_inventory_location_preference(
     ):
         session.delete(preference)
         session.commit()
-        return (
-            arguments,
-            ProviderToolResult(
+        return _InventoryLocationPreparation(
+            arguments=updated,
+            result=ProviderToolResult(
                 tool_name="inventory_location_preference",
                 output={
                     "action": "invalidated",
                     "capability": "inventory_location_preference",
                 },
             ),
+            location_source="none",
+            location_input_kind="none",
+            preference_loaded=True,
+            preference_applied=False,
+            location_resolution=_location_resolution_outcome(resolution.status),
         )
-    updated = dict(arguments)
     updated[
         "branch_external_id"
         if preference.location_type == "branch"
         else "warehouse_external_id"
     ] = preference.location_external_id
-    return updated, None
+    return _InventoryLocationPreparation(
+        arguments=updated,
+        result=None,
+        location_source="saved",
+        location_input_kind="validated_reference",
+        preference_loaded=True,
+        preference_applied=True,
+        location_resolution="one",
+    )
 
 
 def _save_inventory_location_preference(
@@ -1844,6 +1967,55 @@ def _category_resolution_reply(
     return replies[language]
 
 
+def _pending_product_candidates(
+    session: Session,
+    executor: OperationalToolExecutor,
+    user: User,
+    business_id: uuid.UUID,
+    owner_message_id: uuid.UUID,
+) -> tuple[ProviderProductCandidate, ...]:
+    """Reconstruct one source-backed product clarification without chat history."""
+
+    owner_message = session.get(OwnerChatMessage, owner_message_id)
+    if owner_message is None or owner_message.sequence_number < 3:
+        return ()
+    previous_owner = session.scalar(
+        select(OwnerChatMessage).where(
+            OwnerChatMessage.conversation_id == owner_message.conversation_id,
+            OwnerChatMessage.sequence_number == owner_message.sequence_number - 2,
+            OwnerChatMessage.role == ChatMessageRole.OWNER,
+            OwnerChatMessage.generation_state == ChatGenerationState.COMPLETED,
+        )
+    )
+    previous_assistant = session.scalar(
+        select(OwnerChatMessage).where(
+            OwnerChatMessage.conversation_id == owner_message.conversation_id,
+            OwnerChatMessage.sequence_number == owner_message.sequence_number - 1,
+            OwnerChatMessage.role == ChatMessageRole.ASSISTANT,
+            OwnerChatMessage.reply_to_message_id == previous_owner.id
+            if previous_owner is not None
+            else False,
+        )
+    )
+    if previous_owner is None or previous_assistant is None:
+        return ()
+    try:
+        resolution = executor.resolve_product(user, business_id, previous_owner.content)
+    except ToolExecutionError:
+        return ()
+    if resolution.status != "ambiguous":
+        return ()
+    candidates = tuple(
+        ProviderProductCandidate(label=candidate.name, sku=candidate.sku)
+        for candidate in resolution.candidates
+    )
+    if not candidates or not all(
+        candidate.label in previous_assistant.content for candidate in candidates
+    ):
+        return ()
+    return candidates
+
+
 def _run_operational_loop(
     session: Session,
     business_id: uuid.UUID,
@@ -1859,6 +2031,9 @@ def _run_operational_loop(
     tool_results: list[ProviderToolResult] = []
     aggregate_usage: TokenUsage | None = None
     requested_at = utc_now()
+    pending_product_candidates = _pending_product_candidates(
+        session, executor, user, business_id, claim.message_id
+    )
 
     for _provider_call in range(1, MAX_OPERATIONAL_PROVIDER_CALLS + 1):
         prepared = _build_operational_request(
@@ -1871,6 +2046,7 @@ def _run_operational_loop(
             requested_at=requested_at,
             category_candidates=category_candidates,
             location_candidates=location_candidates,
+            pending_product_candidates=pending_product_candidates,
         )
         request = prepared.request
         try:
@@ -2031,26 +2207,63 @@ def _run_operational_loop(
 
         arguments = result.tool_arguments or {}
         location_source = "none"
+        location_input_kind = "none"
+        preference_loaded = False
+        preference_applied = False
+        location_resolution = "zero"
         if result.tool_name == "current_inventory":
-            if arguments.get("branch_external_id") or arguments.get(
-                "warehouse_external_id"
-            ):
-                location_source = "explicit"
-            arguments, invalidated_preference = _apply_inventory_location_preference(
-                session, executor, user, business_id, arguments
+            product_filter = arguments.get("product_filter")
+            product_input_kind = (
+                "query"
+                if isinstance(product_filter, str) and product_filter
+                else "none"
             )
-            if location_source == "none" and (
-                arguments.get("branch_external_id")
-                or arguments.get("warehouse_external_id")
-            ):
-                location_source = "saved"
-            if invalidated_preference is not None:
+            product_query_token_count = (
+                len(re.findall(r"[^\W_]+", product_filter, flags=re.UNICODE))
+                if product_input_kind == "query"
+                else 0
+            )
+            _logger.info(
+                "owner_chat_inventory_plan product_input_kind=%s "
+                "product_query_token_count=%s",
+                product_input_kind,
+                product_query_token_count,
+            )
+            try:
+                location_preparation = _prepare_inventory_location_arguments(
+                    session, executor, user, business_id, arguments
+                )
+            except ToolExecutionError:
+                _logger.info(
+                    "owner_chat_inventory_location outcome=error "
+                    "location_source=current_turn location_input_kind=label"
+                )
+                return (
+                    OwnerChatResult(
+                        reply=_live_operational_reply(
+                            request.messages[-1].content,
+                            prepared.business.default_language,
+                        ),
+                        usage=aggregate_usage,
+                        provider_identifier=result.provider_identifier,
+                        model_identifier=result.model_identifier,
+                        decision="unavailable",
+                    ),
+                    aggregate_usage,
+                )
+            arguments = location_preparation.arguments
+            location_source = location_preparation.location_source
+            location_input_kind = location_preparation.location_input_kind
+            preference_loaded = location_preparation.preference_loaded
+            preference_applied = location_preparation.preference_applied
+            location_resolution = location_preparation.location_resolution
+            if location_preparation.result is not None:
                 synthesis_prepared = _build_operational_synthesis_request(
                     session,
                     business_id,
                     claim.message_id,
                     settings,
-                    invalidated_preference,
+                    location_preparation.result,
                     requested_at=requested_at,
                 )
                 synthesis_request = synthesis_prepared.request
@@ -2064,7 +2277,7 @@ def _run_operational_loop(
                     aggregate_usage = _add_usage(aggregate_usage, synthesis_usage)
                     _logger.info(
                         "owner_chat_operational_synthesis "
-                        "outcome=preference_invalidated schema=response_only"
+                        "outcome=location_resolution schema=response_only"
                     )
                     return (
                         _operational_result_with_usage(synthesis, aggregate_usage),
@@ -2073,7 +2286,7 @@ def _run_operational_loop(
                 except OwnerChatProviderError:
                     return (
                         _operational_synthesis_fallback(
-                            invalidated_preference.output,
+                            location_preparation.result.output,
                             aggregate_usage,
                             result.provider_identifier,
                             result.model_identifier,
@@ -2121,9 +2334,17 @@ def _run_operational_loop(
             inventory_status = _operational_synthesis_status(executed.output)
             _logger.info(
                 "owner_chat_inventory_result location_source=%s "
+                "location_input_kind=%s preference_loaded=%s "
+                "preference_applied=%s location_resolution=%s "
                 "product_resolution=%s normalized_rows=%s tool_result=%s",
                 location_source,
-                resolution_status,
+                location_input_kind,
+                preference_loaded,
+                preference_applied,
+                location_resolution,
+                _location_resolution_outcome(resolution_status)
+                if resolution_status != "none"
+                else "zero",
                 executed.output.metadata.row_count,
                 inventory_status,
             )
