@@ -540,7 +540,7 @@ def test_profit_metric_returns_missing_capability_and_revenue_alternative(
 
 
 def test_owner_receives_unsupported_profit_facts_and_preserves_franco_style(
-    api_client: TestClient, db_session: Session
+    api_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     user, business = active_business(
         api_client, db_session, email=f"profit-capability-{uuid.uuid4()}@example.com"
@@ -566,6 +566,12 @@ def test_owner_receives_unsupported_profit_facts_and_preserves_franco_style(
         ]
     )
     configure_operational_chat(db_session, business["id"], source, provider)
+    diagnostic_messages: list[str] = []
+    monkeypatch.setattr(
+        owner_chat._logger,
+        "info",
+        lambda message, *args: diagnostic_messages.append(message % args),
+    )
 
     response = submit(
         api_client,
@@ -578,10 +584,17 @@ def test_owner_receives_unsupported_profit_facts_and_preserves_franco_style(
     assert response.status_code == 200, response.text
     assert "COGS" in response.json()["assistant_message"]["content"]
     assert "unavailable" not in response.json()["assistant_message"]["content"]
+    assert SALES_SUMMARY_TOOL in {tool.name for tool in provider.requests[0].tools}
     supplied = provider.requests[1].tool_results[0].output
     assert supplied["requested_metric"] == "gross_profit"
     assert supplied["supported_metrics"] == ["revenue", "sales_count"]
     assert "minimarket" not in str(supplied)
+    assert any("metric=gross_profit" in message for message in diagnostic_messages)
+    assert any(
+        "capability_outcome=unsupported" in message for message in diagnostic_messages
+    )
+    assert all("rebe7" not in message for message in diagnostic_messages)
+    assert all("Ma fina" not in message for message in diagnostic_messages)
 
 
 @pytest.mark.parametrize(
@@ -956,7 +969,7 @@ def test_unresolved_product_turn_returns_safe_answer_without_rag_or_guessing(
     assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
 
 
-def test_active_source_without_matching_capability_keeps_safe_unavailable_bypass(
+def test_active_source_without_matching_capability_uses_provider_unavailable(
     api_client: TestClient, db_session: Session, migration_engine: Engine
 ) -> None:
     user, business = active_business(
@@ -966,7 +979,9 @@ def test_active_source_without_matching_capability_keeps_safe_unavailable_bypass
         name="Unsupported Live Store",
     )
     source = StubSource()
-    provider = SequenceProvider([])
+    provider = SequenceProvider(
+        [usage_result(decision="unavailable", reply="No supported tool is available.")]
+    )
     configure_operational_chat(db_session, business["id"], source, provider)
 
     response = submit(
@@ -978,13 +993,13 @@ def test_active_source_without_matching_capability_keeps_safe_unavailable_bypass
     )
 
     assert response.status_code == 200, response.text
-    assert "live operational" in response.json()["assistant_message"]["content"].lower()
-    assert provider.requests == []
+    assert "supported tool" in response.json()["assistant_message"]["content"].lower()
+    assert len(provider.requests) == 1
     assert source.calls == []
     assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 0
     with migration_engine.connect() as connection:
         assert (
-            connection.scalar(text("SELECT count(*) FROM ai_usage_reservations")) == 0
+            connection.scalar(text("SELECT count(*) FROM ai_usage_reservations")) == 1
         )
 
 

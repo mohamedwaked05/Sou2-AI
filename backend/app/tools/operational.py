@@ -288,8 +288,9 @@ def build_operational_tool_registry(
             description=(
                 "Summarize completed sales and finalized returns/refunds for a "
                 "bounded source-local date range and optional branch. Revenue and "
-                "sales count are supported only when selected by the typed metric; "
-                "profit requires a separate mapped cost/expense capability."
+                "sales count are typed metrics. Use this approved action for every "
+                "financial metric request; the backend validates source support and "
+                "returns a typed capability result when required inputs are missing."
             ),
             input_schema=SalesQuery,
             output_schema=(SalesSummary, MetricCapabilityResult),

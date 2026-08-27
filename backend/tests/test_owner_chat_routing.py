@@ -98,13 +98,10 @@ def test_ordinary_casual_phrases_do_not_require_business_evidence(
         "adde ba2e men WATER-1500?",
     ],
 )
-def test_multilingual_product_quantity_phrasing_routes_only_to_inventory(
+def test_multilingual_product_quantity_phrasing_remains_operational(
     message: str,
 ) -> None:
     assert owner_chat._is_live_operational_request(message) is True
-    assert owner_chat._matching_operational_tools(message) == frozenset(
-        {"current_inventory"}
-    )
 
 
 @pytest.mark.parametrize(

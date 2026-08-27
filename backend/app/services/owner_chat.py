@@ -78,10 +78,6 @@ from app.services.business_profiles import is_business_profile_complete
 from app.services.businesses import load_full_access_business
 from app.services.conversations import get_default_conversation, load_conversation
 from app.tools.operational import (
-    BEST_SELLING_PRODUCTS_TOOL,
-    CURRENT_INVENTORY_TOOL,
-    RESTOCKING_RECOMMENDATIONS_TOOL,
-    SALES_SUMMARY_TOOL,
     OperationalToolExecutor,
     ToolExecutionError,
 )
@@ -102,6 +98,10 @@ PROVIDER_WEEKDAYS = (
     "friday",
     "saturday",
     "sunday",
+)
+
+_SAFE_FINANCIAL_METRICS = frozenset(
+    {"revenue", "gross_profit", "net_profit", "sales_count", "inventory_value"}
 )
 
 
@@ -700,22 +700,6 @@ def _is_live_operational_request(value: str) -> bool:
     ):
         return False
     return True
-
-
-def _matching_operational_tools(value: str) -> frozenset[str]:
-    """Map deterministic message concepts to the smallest approved tool set."""
-
-    concepts = _query_concepts(value)
-    names: set[str] = set()
-    if "inventory" in concepts:
-        names.add(CURRENT_INVENTORY_TOOL)
-    if concepts & {"sales", "revenue"}:
-        names.add(SALES_SUMMARY_TOOL)
-    if "sales" in concepts:
-        names.add(BEST_SELLING_PRODUCTS_TOOL)
-    if "restocking" in concepts:
-        names.add(RESTOCKING_RECOMMENDATIONS_TOOL)
-    return frozenset(names)
 
 
 def _profile_evidence_texts(profile: ProviderBusinessProfile) -> tuple[str, ...]:
@@ -1477,6 +1461,17 @@ def _usage_for_result(
     )
 
 
+def _planned_metric(arguments: object) -> str | None:
+    if not isinstance(arguments, dict):
+        return None
+    metric = arguments.get("metric")
+    return (
+        metric
+        if isinstance(metric, str) and metric in _SAFE_FINANCIAL_METRICS
+        else None
+    )
+
+
 def _operational_result_with_usage(
     result: OwnerChatResult, usage: TokenUsage
 ) -> OwnerChatResult:
@@ -1620,6 +1615,13 @@ def _run_operational_loop(
                     else aggregate_usage
                 )
             raise
+        _logger.info(
+            "owner_chat_operational_plan action=%s tool=%s metric=%s "
+            "validation=accepted",
+            result.decision,
+            result.tool_name if result.decision == "tool" else None,
+            _planned_metric(result.tool_arguments),
+        )
         call_usage = _usage_for_result(provider, request, result)
         if call_usage.output_tokens > request.max_output_tokens:
             raise OwnerChatProviderInvalidResponse(
@@ -1659,11 +1661,20 @@ def _run_operational_loop(
             return resolved_result, aggregate_usage
 
         if result.decision == "unavailable":
+            _logger.info(
+                "owner_chat_operational_dispatch outcome=provider_unavailable "
+                "fallback_reason=provider_unavailable final_synthesis_path=provider"
+            )
             return _operational_result_with_usage(
                 result, aggregate_usage
             ), aggregate_usage
         if result.decision == "final":
             if not tool_results:
+                _logger.info(
+                    "owner_chat_operational_dispatch outcome=final_without_tool "
+                    "fallback_reason=provider_final_without_tool "
+                    "final_synthesis_path=deterministic"
+                )
                 unavailable = OwnerChatResult(
                     reply=_live_operational_reply(
                         request.messages[-1].content,
@@ -1719,6 +1730,11 @@ def _run_operational_loop(
                 arguments=arguments,
             )
         except ToolExecutionError:
+            _logger.info(
+                "owner_chat_operational_dispatch outcome=tool_error "
+                "fallback_reason=tool_execution_error "
+                "final_synthesis_path=deterministic"
+            )
             fallback = OwnerChatResult(
                 reply=_live_operational_reply(
                     request.messages[-1].content,
@@ -1730,6 +1746,14 @@ def _run_operational_loop(
                 decision="unavailable",
             )
             return fallback, aggregate_usage
+        capability = getattr(executed.output, "capability", None)
+        capability_status = getattr(executed.output, "status", None)
+        _logger.info(
+            "owner_chat_operational_dispatch outcome=executed capability=%s "
+            "capability_outcome=%s final_synthesis_path=provider",
+            capability,
+            capability_status,
+        )
         tool_results.append(
             ProviderToolResult(
                 tool_name=executed.tool_name,
@@ -1929,13 +1953,6 @@ def _generate_claimed_turn(
                 if executor is not None
                 else ()
             )
-            if is_live_operational:
-                matching_names = _matching_operational_tools(owner_message.content)
-                available = tuple(
-                    definition
-                    for definition in available
-                    if definition.name in matching_names
-                )
             if not available:
                 live_result = OwnerChatResult(
                     reply=_live_operational_reply(
