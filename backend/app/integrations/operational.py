@@ -10,6 +10,9 @@ from app.schemas.operational import (
     IntegrationHealth,
     InventoryReadQuery,
     InventoryResult,
+    LocationCandidate,
+    LocationResolution,
+    LocationResolutionQuery,
     ProductResolution,
     ProductResolutionQuery,
     RestockingReadQuery,
@@ -51,6 +54,12 @@ class OperationalDataSource(Protocol):
     def resolve_category(self, query: ProductResolutionQuery) -> CategoryResolution: ...
 
     def list_categories(self, *, limit: int) -> tuple[CategoryCandidate, ...]: ...
+
+    def resolve_location(
+        self, query: LocationResolutionQuery
+    ) -> LocationResolution: ...
+
+    def list_locations(self, *, limit: int) -> tuple[LocationCandidate, ...]: ...
 
     def get_current_inventory(self, query: InventoryReadQuery) -> InventoryResult: ...
 

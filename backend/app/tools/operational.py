@@ -41,6 +41,9 @@ from app.schemas.operational import (
     InventoryQuery,
     InventoryReadQuery,
     InventoryResult,
+    LocationCandidate,
+    LocationResolution,
+    LocationResolutionQuery,
     MetricCapabilityResult,
     ProductResolution,
     ProductResolutionQuery,
@@ -449,6 +452,89 @@ class OperationalToolExecutor:
             )
             self._session.rollback()
             return ()
+
+    def location_candidates(
+        self, user: User, business_id: uuid.UUID
+    ) -> tuple[LocationCandidate, ...]:
+        """Expose only bounded, healthy inventory locations to the planner."""
+
+        secret = self._settings.tool_call_audit_hmac_secret
+        if secret is None or not secret.get_secret_value().strip():
+            return ()
+        try:
+            business = load_full_access_business(self._session, user, business_id)
+            if business.status is not BusinessStatus.ACTIVE:
+                self._session.rollback()
+                return ()
+            source = self._active_source(business_id)
+            if source is None or "inventory" not in self._source_capabilities(source):
+                self._session.rollback()
+                return ()
+            adapter = self._profiles.resolve(source.connection_profile_key)
+            mapping = self._profiles.get_mapping(
+                source.mapping_profile_key, source.mapping_profile_version
+            )
+            if mapping is None or not self._adapter_timeout_is_acceptable(adapter):
+                self._session.rollback()
+                return ()
+            self._session.commit()
+            health = adapter.check_health()
+            mapping.validate_health(health)
+            return adapter.list_locations(limit=20)
+        except Exception as exc:
+            _logger.warning(
+                "location_candidates returning empty: %s", type(exc).__name__
+            )
+            self._session.rollback()
+            return ()
+
+    def resolve_location(
+        self, user: User, business_id: uuid.UUID, reference: str
+    ) -> LocationResolution:
+        secret = self._settings.tool_call_audit_hmac_secret
+        if secret is None or not secret.get_secret_value().strip():
+            raise ToolExecutionError("audit_unavailable")
+        try:
+            business = load_full_access_business(self._session, user, business_id)
+            if business.status is not BusinessStatus.ACTIVE:
+                raise ToolExecutionError("inactive_business")
+            source = self._active_source(business_id)
+            if source is None or "inventory" not in self._source_capabilities(source):
+                raise ToolExecutionError("integration_unavailable")
+            adapter = self._profiles.resolve(source.connection_profile_key)
+            mapping = self._profiles.get_mapping(
+                source.mapping_profile_key, source.mapping_profile_version
+            )
+            if mapping is None or not self._adapter_timeout_is_acceptable(adapter):
+                raise ToolExecutionError("integration_unavailable")
+            self._session.commit()
+            health = adapter.check_health()
+            mapping.validate_health(health)
+            return adapter.resolve_location(
+                LocationResolutionQuery(reference=reference)
+            )
+        except ToolExecutionError:
+            self._session.rollback()
+            raise
+        except ApplicationError:
+            self._session.rollback()
+            raise ToolExecutionError("authorization_denied") from None
+        except OperationalQueryTimeout:
+            self._session.rollback()
+            raise ToolExecutionError("timeout") from None
+        except (
+            MappingProfileError,
+            OperationalDataInvalid,
+            OperationalIntegrationError,
+            OperationalSourceUnavailable,
+            ValueError,
+        ):
+            self._session.rollback()
+            raise ToolExecutionError("integration_unavailable") from None
+        except Exception as exc:
+            _logger.warning("resolve_location failed: %s", type(exc).__name__)
+            self._session.rollback()
+            raise ToolExecutionError("adapter_failure") from None
 
     def execute(
         self,

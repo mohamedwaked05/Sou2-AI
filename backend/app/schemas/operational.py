@@ -63,6 +63,7 @@ class Product(OperationalContract):
 
 
 ProductResolutionStatus = Literal["resolved", "ambiguous", "not_found"]
+LocationType = Literal["branch", "warehouse"]
 ProductMatchType = Literal[
     "internal_id",
     "external_id",
@@ -92,6 +93,31 @@ class ProductResolutionCandidate(OperationalContract):
         if not normalized:
             raise ValueError("Product candidate fields cannot be blank.")
         return normalized
+
+
+class LocationCandidate(OperationalContract):
+    external_location_id: str = Field(min_length=1, max_length=128)
+    label: str = Field(min_length=1, max_length=255)
+    location_type: LocationType
+
+
+class LocationResolution(OperationalContract):
+    status: ProductResolutionStatus
+    location: LocationCandidate | None = None
+    candidates: tuple[LocationCandidate, ...] = ()
+    metadata: OperationalResultMetadata
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> LocationResolution:
+        if self.status == "resolved":
+            if self.location is None or self.candidates:
+                raise ValueError("Resolved locations require exactly one location.")
+        elif self.status == "ambiguous":
+            if self.location is not None or not self.candidates:
+                raise ValueError("Ambiguous locations require candidates.")
+        elif self.location is not None or self.candidates:
+            raise ValueError("Not-found locations cannot include candidates.")
+        return self
 
 
 class InventoryItem(OperationalContract):
@@ -128,6 +154,19 @@ class InventoryItem(OperationalContract):
         if self.target_stock < self.reorder_point:
             raise ValueError("Target stock cannot be below the reorder point.")
         return self
+
+
+class LocationResolutionQuery(OperationalContract):
+    reference: str = Field(min_length=1, max_length=255)
+    candidate_limit: int = Field(default=5, ge=1, le=5)
+
+    @field_validator("reference")
+    @classmethod
+    def normalize_reference(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("Location reference cannot be blank.")
+        return normalized
 
 
 class ReportingPeriod(OperationalContract):

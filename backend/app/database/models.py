@@ -1646,6 +1646,64 @@ class OperationalDataSourceConfig(Base):
         return " ".join(value.split())
 
 
+class UserOperationalPreference(Base):
+    """One validated user default for a capability on a connected source."""
+
+    __tablename__ = "user_operational_preferences"
+    __table_args__ = (
+        CheckConstraint(
+            "preference_key = 'default_inventory_location'",
+            name="ck_user_operational_preference_key",
+        ),
+        CheckConstraint(
+            "location_type IN ('branch', 'warehouse')",
+            name="ck_user_operational_preference_location_type",
+        ),
+        UniqueConstraint(
+            "user_id",
+            "business_id",
+            "source_id",
+            "preference_key",
+            name="uq_user_operational_preference_scope",
+        ),
+        ForeignKeyConstraint(
+            ["source_id", "business_id"],
+            ["operational_data_sources.id", "operational_data_sources.business_id"],
+            ondelete="CASCADE",
+            name="fk_user_operational_preference_source_scope",
+        ),
+        Index(
+            "ix_user_operational_preferences_lookup",
+            "user_id",
+            "business_id",
+            "preference_key",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    preference_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    location_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    location_external_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class MessagingChannelConnection(Base):
     """Tenant-owned, non-secret configuration for an external channel."""
 

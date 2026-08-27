@@ -29,6 +29,9 @@ from app.schemas.operational import (
     InventoryItem,
     InventoryReadQuery,
     InventoryResult,
+    LocationCandidate,
+    LocationResolution,
+    LocationResolutionQuery,
     OperationalResultMetadata,
     Product,
     ProductResolution,
@@ -285,6 +288,30 @@ _CATEGORY_CANDIDATES_SQL = text(
     FROM minimarket.categories
     WHERE btrim(label) <> ''
     ORDER BY lower(label), category_id
+    LIMIT :row_limit
+    """
+)
+
+_LOCATION_RESOLUTION_SQL = text(
+    """
+    SELECT location_code AS external_location_id, location_label AS label,
+           lower(location_type) AS location_type
+    FROM minimarket.stock_locations
+    WHERE lower(regexp_replace(btrim(location_label), '\\s+', ' ', 'g'))
+            LIKE :reference ESCAPE '\\'
+       OR lower(location_code) = :normalized_reference
+    ORDER BY lower(location_label), location_code
+    LIMIT :row_limit
+    """
+)
+
+_LOCATION_CANDIDATES_SQL = text(
+    """
+    SELECT location_code AS external_location_id, location_label AS label,
+           lower(location_type) AS location_type
+    FROM minimarket.stock_locations
+    WHERE btrim(location_label) <> ''
+    ORDER BY lower(location_label), location_code
     LIMIT :row_limit
     """
 )
@@ -620,6 +647,76 @@ class PostgreSQLOperationalAdapter:
                     CategoryCandidate(
                         external_category_id=row["external_category_id"],
                         label=row["label"],
+                    )
+                    for row in rows
+                )
+        except (SQLAlchemyError, RuntimeError) as exc:
+            self._raise_safe_database_error(exc)
+        except ValidationError, KeyError, TypeError, ArithmeticError:
+            raise OperationalDataInvalid(
+                "Operational source data is invalid."
+            ) from None
+
+    def resolve_location(self, query: LocationResolutionQuery) -> LocationResolution:
+        try:
+            with self._engine.connect() as connection:
+                self._prepare_read(connection)
+                source = self._source_configuration(connection)
+                normalized = self._normalized_reference(query.reference)
+                rows = list(
+                    connection.execute(
+                        _LOCATION_RESOLUTION_SQL,
+                        {
+                            "reference": self._escaped_search(normalized),
+                            "normalized_reference": normalized,
+                            "row_limit": query.candidate_limit + 1,
+                        },
+                    ).mappings()
+                )
+            candidates = tuple(
+                LocationCandidate(
+                    external_location_id=row["external_location_id"],
+                    label=row["label"],
+                    location_type=row["location_type"],
+                )
+                for row in rows[: query.candidate_limit]
+            )
+            metadata = self._metadata(
+                source,
+                row_count=len(candidates),
+                requested_limit=query.candidate_limit,
+                is_truncated=len(rows) > query.candidate_limit,
+            )
+            if not candidates:
+                return LocationResolution(status="not_found", metadata=metadata)
+            if len(rows) == 1:
+                return LocationResolution(
+                    status="resolved", location=candidates[0], metadata=metadata
+                )
+            return LocationResolution(
+                status="ambiguous", candidates=candidates, metadata=metadata
+            )
+        except (SQLAlchemyError, RuntimeError) as exc:
+            self._raise_safe_database_error(exc)
+        except ValidationError, KeyError, TypeError, ArithmeticError:
+            raise OperationalDataInvalid(
+                "Operational source data is invalid."
+            ) from None
+
+    def list_locations(self, *, limit: int) -> tuple[LocationCandidate, ...]:
+        if not 1 <= limit <= 100:
+            raise ValueError("Location candidate limit is outside the safe bound.")
+        try:
+            with self._engine.connect() as connection:
+                self._prepare_read(connection)
+                rows = connection.execute(
+                    _LOCATION_CANDIDATES_SQL, {"row_limit": limit}
+                ).mappings()
+                return tuple(
+                    LocationCandidate(
+                        external_location_id=row["external_location_id"],
+                        label=row["label"],
+                        location_type=row["location_type"],
                     )
                     for row in rows
                 )

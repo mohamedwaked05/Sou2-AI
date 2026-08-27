@@ -27,6 +27,7 @@ from app.database.models import (
     ToolCallLog,
     ToolCallStatus,
     User,
+    UserOperationalPreference,
 )
 from app.integrations.operational import OperationalQueryTimeout
 from app.integrations.profiles import (
@@ -44,6 +45,8 @@ from app.schemas.operational import (
     IntegrationHealth,
     InventoryItem,
     InventoryResult,
+    LocationCandidate,
+    LocationResolution,
     MetricCapabilityResult,
     OperationalResultMetadata,
     Product,
@@ -124,6 +127,13 @@ class StubSource:
         self.categories = (
             CategoryCandidate(external_category_id="category-1", label="Pantry"),
         )
+        self.locations = (
+            LocationCandidate(
+                external_location_id="BR-JBEIL",
+                label="Jbeil Branch",
+                location_type="branch",
+            ),
+        )
         self.timeout_seconds = 2
         self.resolution = ProductResolution(
             status="resolved",
@@ -151,6 +161,29 @@ class StubSource:
 
     def list_categories(self, *, limit: int) -> tuple[CategoryCandidate, ...]:
         return self.categories[:limit]
+
+    def resolve_location(self, query: object) -> LocationResolution:
+        reference = cast(Any, query).reference.casefold()
+        matches = tuple(
+            candidate
+            for candidate in self.locations
+            if reference in candidate.label.casefold()
+            or reference == candidate.external_location_id.casefold()
+        )
+        if not matches:
+            return LocationResolution(status="not_found", metadata=metadata(rows=0))
+        if len(matches) > 1:
+            return LocationResolution(
+                status="ambiguous",
+                candidates=matches,
+                metadata=metadata(rows=len(matches)),
+            )
+        return LocationResolution(
+            status="resolved", location=matches[0], metadata=metadata()
+        )
+
+    def list_locations(self, *, limit: int) -> tuple[LocationCandidate, ...]:
+        return self.locations[:limit]
 
     def check_health(self) -> IntegrationHealth:
         if self.health_error is not None:
@@ -601,6 +634,279 @@ def test_owner_receives_unsupported_profit_facts_and_preserves_franco_style(
     )
     assert all("rebe7" not in message for message in diagnostic_messages)
     assert all("Ma fina" not in message for message in diagnostic_messages)
+
+
+def test_location_preference_is_saved_without_an_inventory_read_and_applied_later(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"location-preference-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    preference_provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key="default_inventory_location",
+                location_reference="Jbeil",
+            ),
+            usage_result(
+                reply="I will use that location for future inventory questions."
+            ),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, preference_provider)
+
+    preference = submit(
+        api_client,
+        user,
+        business["id"],
+        "Please use this branch for my later inventory questions.",
+        f"location-preference-{uuid.uuid4()}",
+    )
+
+    assert preference.status_code == 200, preference.text
+    assert "BR-JBEIL" not in str(preference_provider.requests[0])
+    assert preference_provider.requests[1].mode == "operational_synthesis"
+    assert preference_provider.requests[1].tools == ()
+    assert source.calls == []
+    saved = db_session.scalar(select(UserOperationalPreference))
+    assert saved is not None
+    assert saved.location_external_id == "BR-JBEIL"
+
+    inventory_provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"product_filter": "generic-item", "limit": 5},
+            ),
+            usage_result(reply="The validated inventory result is ready."),
+        ]
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: inventory_provider
+    inventory = submit(
+        api_client,
+        user,
+        business["id"],
+        "How many generic items do we have?",
+        f"location-preference-inventory-{uuid.uuid4()}",
+    )
+
+    assert inventory.status_code == 200, inventory.text
+    assert source.last_inventory_query.branch_external_id == "BR-JBEIL"
+
+
+def test_explicit_inventory_location_overrides_saved_preference(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"location-override-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    configure_operational_chat(db_session, business["id"], source, SequenceProvider([]))
+    active = db_session.scalar(select(OperationalDataSourceConfig))
+    assert active is not None
+    db_session.add(
+        UserOperationalPreference(
+            user_id=user.id,
+            business_id=uuid.UUID(str(business["id"])),
+            source_id=active.id,
+            preference_key="default_inventory_location",
+            location_type="branch",
+            location_external_id="BR-JBEIL",
+        )
+    )
+    db_session.commit()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={
+                    "product_filter": "generic-item",
+                    "branch_external_id": "BR-OTHER",
+                    "limit": 5,
+                },
+            ),
+            usage_result(reply="The validated inventory result is ready."),
+        ]
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "How many generic items are at the other location?",
+        f"location-override-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.last_inventory_query.branch_external_id == "BR-OTHER"
+    assert (
+        db_session.scalar(select(UserOperationalPreference)).location_external_id
+        == "BR-JBEIL"
+    )
+
+
+def test_location_preference_clear_is_idempotent_and_never_reads_inventory(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"location-clear-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    configure_operational_chat(db_session, business["id"], source, SequenceProvider([]))
+    active = db_session.scalar(
+        select(OperationalDataSourceConfig).where(
+            OperationalDataSourceConfig.business_id == uuid.UUID(str(business["id"]))
+        )
+    )
+    assert active is not None
+    db_session.add(
+        UserOperationalPreference(
+            user_id=user.id,
+            business_id=uuid.UUID(str(business["id"])),
+            source_id=active.id,
+            preference_key="default_inventory_location",
+            location_type="branch",
+            location_external_id="BR-JBEIL",
+        )
+    )
+    db_session.commit()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="clear_preference",
+                preference_key="default_inventory_location",
+            ),
+            usage_result(reply="The default inventory location is cleared."),
+        ]
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Do not use my inventory location default anymore.",
+        f"location-clear-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert provider.requests[1].mode == "operational_synthesis"
+    assert source.calls == []
+    assert (
+        db_session.scalar(
+            select(UserOperationalPreference).where(
+                UserOperationalPreference.user_id == user.id,
+                UserOperationalPreference.business_id == uuid.UUID(str(business["id"])),
+            )
+        )
+        is None
+    )
+
+
+def test_ambiguous_location_preference_is_not_saved_or_exposes_source_ids(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"location-ambiguous-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.locations = (
+        LocationCandidate(
+            external_location_id="BR-ONE", label="North Branch", location_type="branch"
+        ),
+        LocationCandidate(
+            external_location_id="BR-TWO", label="South Branch", location_type="branch"
+        ),
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key="default_inventory_location",
+                location_reference="Branch",
+            ),
+            usage_result(reply="Which location do you mean?"),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Use this location for future inventory questions.",
+        f"location-ambiguous-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    supplied = provider.requests[1].tool_results[0].output
+    assert supplied["action"] == "not_saved"
+    assert [
+        candidate["label"] for candidate in supplied["resolution"]["candidates"]
+    ] == [
+        "North Branch",
+        "South Branch",
+    ]
+    assert "external_location_id" not in str(supplied)
+    assert db_session.scalar(select(UserOperationalPreference)) is None
+    assert source.calls == []
+
+
+def test_stale_location_preference_is_removed_without_an_inventory_query(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"location-stale-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    configure_operational_chat(db_session, business["id"], source, SequenceProvider([]))
+    active = db_session.scalar(
+        select(OperationalDataSourceConfig).where(
+            OperationalDataSourceConfig.business_id == uuid.UUID(str(business["id"]))
+        )
+    )
+    assert active is not None
+    db_session.add(
+        UserOperationalPreference(
+            user_id=user.id,
+            business_id=uuid.UUID(str(business["id"])),
+            source_id=active.id,
+            preference_key="default_inventory_location",
+            location_type="branch",
+            location_external_id="BR-REMOVED",
+        )
+    )
+    db_session.commit()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"product_filter": "generic-item", "limit": 5},
+            ),
+            usage_result(reply="Your saved inventory location is no longer available."),
+        ]
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "How many generic items do we have?",
+        f"location-stale-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.calls == []
+    assert provider.requests[1].mode == "operational_synthesis"
+    assert provider.requests[1].tool_results[0].output["action"] == "invalidated"
+    assert db_session.scalar(select(UserOperationalPreference)) is None
 
 
 def test_unsupported_profit_uses_capability_fallback_when_synthesis_is_invalid(

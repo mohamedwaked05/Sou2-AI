@@ -12,6 +12,7 @@ from app.integrations.postgresql import PostgreSQLOperationalAdapter
 from app.schemas.operational import (
     BestSellersQuery,
     InventoryReadQuery,
+    LocationResolutionQuery,
     ProductResolutionQuery,
     RestockingReadQuery,
     SalesQuery,
@@ -281,6 +282,37 @@ def test_category_resolution_reports_ambiguous_source_matches(
 
     assert resolution.status == "ambiguous"
     assert len(resolution.candidates) >= 2
+
+
+def test_location_resolution_uses_bounded_source_labels_and_codes(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    by_label = operational_adapter.resolve_location(
+        LocationResolutionQuery(reference="jbeil")
+    )
+    by_code = operational_adapter.resolve_location(
+        LocationResolutionQuery(reference="BR-JBEIL")
+    )
+
+    assert by_label.status == by_code.status == "resolved"
+    assert by_label.location is not None
+    assert by_code.location is not None
+    assert (
+        by_label.location.external_location_id == by_code.location.external_location_id
+    )
+    assert by_label.location.label == by_code.location.label
+    assert by_label.location.location_type == "branch"
+
+
+def test_location_resolution_is_case_insensitive_and_literal(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    resolution = operational_adapter.resolve_location(
+        LocationResolutionQuery(reference="JB%_EIL")
+    )
+
+    assert resolution.status == "not_found"
+    assert resolution.candidates == ()
 
 
 def test_sales_totals_statuses_returns_currency_and_timezone(

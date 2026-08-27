@@ -30,6 +30,7 @@ from app.agent.owner_chat_provider import (
     ProviderBusinessProfile,
     ProviderCategoryCandidate,
     ProviderKnowledge,
+    ProviderLocationCandidate,
     ProviderMessage,
     ProviderSource,
     ProviderToolDefinition,
@@ -54,6 +55,7 @@ from app.database.models import (
     OwnerConversation,
     OwnerConversationSummary,
     User,
+    UserOperationalPreference,
 )
 from app.integrations.profiles import ConnectionProfileRegistry
 from app.rag.embeddings import create_embedding_provider
@@ -893,6 +895,7 @@ def _build_operational_request(
     *,
     requested_at: datetime | None = None,
     category_candidates: tuple[ProviderCategoryCandidate, ...] = (),
+    location_candidates: tuple[ProviderLocationCandidate, ...] = (),
 ) -> _PreparedTurn:
     owner_message = session.get(OwnerChatMessage, owner_message_id)
     business = _load_provider_business(session, business_id)
@@ -911,6 +914,7 @@ def _build_operational_request(
         tools=definitions,
         tool_results=results,
         category_candidates=category_candidates,
+        location_candidates=location_candidates,
     )
     session.commit()
     return _PreparedTurn(request=request, business=business, has_usable_evidence=True)
@@ -1534,6 +1538,24 @@ def _operational_synthesis_fallback(
             f"calculated because {missing} is not connected. "
             f"Available alternatives: {alternatives}."
         )
+    elif isinstance(output, dict) and output.get("capability") == (
+        "inventory_location_preference"
+    ):
+        action = output.get("action")
+        location = output.get("location")
+        if (
+            action == "saved"
+            and isinstance(location, dict)
+            and isinstance(location.get("label"), str)
+        ):
+            reply = (
+                f"I will use {location['label']} by default for inventory questions "
+                "unless you specify another location."
+            )
+        elif action == "cleared":
+            reply = "I will no longer use a default location for inventory questions."
+        else:
+            reply = "I could not save that inventory location preference."
     else:
         reply = (
             "The requested operational lookup completed, but I could not safely "
@@ -1545,6 +1567,137 @@ def _operational_synthesis_fallback(
         provider_identifier=provider_identifier,
         model_identifier=model_identifier,
         decision="final",
+    )
+
+
+def _apply_inventory_location_preference(
+    session: Session,
+    executor: OperationalToolExecutor,
+    user: User,
+    business_id: uuid.UUID,
+    arguments: dict[str, object],
+) -> tuple[dict[str, object], ProviderToolResult | None]:
+    if arguments.get("branch_external_id") or arguments.get("warehouse_external_id"):
+        return arguments, None
+    source = executor._active_source(business_id)
+    if source is None:
+        return arguments, None
+    preference = session.scalar(
+        select(UserOperationalPreference).where(
+            UserOperationalPreference.user_id == user.id,
+            UserOperationalPreference.business_id == business_id,
+            UserOperationalPreference.source_id == source.id,
+            UserOperationalPreference.preference_key == "default_inventory_location",
+        )
+    )
+    if preference is None:
+        return arguments, None
+    try:
+        resolution = executor.resolve_location(
+            user, business_id, preference.location_external_id
+        )
+    except ToolExecutionError:
+        return arguments, None
+    if (
+        resolution.status != "resolved"
+        or resolution.location is None
+        or resolution.location.external_location_id != preference.location_external_id
+        or resolution.location.location_type != preference.location_type
+    ):
+        session.delete(preference)
+        session.commit()
+        return (
+            arguments,
+            ProviderToolResult(
+                tool_name="inventory_location_preference",
+                output={
+                    "action": "invalidated",
+                    "capability": "inventory_location_preference",
+                },
+            ),
+        )
+    updated = dict(arguments)
+    updated[
+        "branch_external_id"
+        if preference.location_type == "branch"
+        else "warehouse_external_id"
+    ] = preference.location_external_id
+    return updated, None
+
+
+def _save_inventory_location_preference(
+    session: Session,
+    executor: OperationalToolExecutor,
+    user: User,
+    business_id: uuid.UUID,
+    action: str,
+    location_reference: str | None,
+) -> ProviderToolResult:
+    source = executor._active_source(business_id)
+    if source is None:
+        raise ToolExecutionError("integration_unavailable")
+    statement = select(UserOperationalPreference).where(
+        UserOperationalPreference.user_id == user.id,
+        UserOperationalPreference.business_id == business_id,
+        UserOperationalPreference.source_id == source.id,
+        UserOperationalPreference.preference_key == "default_inventory_location",
+    )
+    existing = session.scalar(statement)
+    if action == "clear_preference":
+        if existing is not None:
+            session.delete(existing)
+            session.commit()
+        return ProviderToolResult(
+            tool_name="inventory_location_preference",
+            output={"action": "cleared", "capability": "inventory_location_preference"},
+        )
+    if location_reference is None:
+        raise ToolExecutionError("invalid_arguments")
+    resolution = executor.resolve_location(user, business_id, location_reference)
+    if resolution.status != "resolved" or resolution.location is None:
+        return ProviderToolResult(
+            tool_name="inventory_location_preference",
+            output={
+                "action": "not_saved",
+                "capability": "inventory_location_preference",
+                "resolution": {
+                    "status": resolution.status,
+                    "candidates": [
+                        {
+                            "label": candidate.label,
+                            "location_type": candidate.location_type,
+                        }
+                        for candidate in resolution.candidates
+                    ],
+                },
+            },
+        )
+    location = resolution.location
+    if existing is None:
+        session.add(
+            UserOperationalPreference(
+                user_id=user.id,
+                business_id=business_id,
+                source_id=source.id,
+                preference_key="default_inventory_location",
+                location_type=location.location_type,
+                location_external_id=location.external_location_id,
+            )
+        )
+    else:
+        existing.location_type = location.location_type
+        existing.location_external_id = location.external_location_id
+    session.commit()
+    return ProviderToolResult(
+        tool_name="inventory_location_preference",
+        output={
+            "action": "saved",
+            "capability": "inventory_location_preference",
+            "location": {
+                "label": location.label,
+                "location_type": location.location_type,
+            },
+        },
     )
 
 
@@ -1651,6 +1804,7 @@ def _run_operational_loop(
     executor: OperationalToolExecutor,
     definitions: tuple[ProviderToolDefinition, ...],
     category_candidates: tuple[ProviderCategoryCandidate, ...] = (),
+    location_candidates: tuple[ProviderLocationCandidate, ...] = (),
 ) -> tuple[OwnerChatResult, TokenUsage]:
     tool_results: list[ProviderToolResult] = []
     aggregate_usage: TokenUsage | None = None
@@ -1666,11 +1820,16 @@ def _run_operational_loop(
             tuple(tool_results),
             requested_at=requested_at,
             category_candidates=category_candidates,
+            location_candidates=location_candidates,
         )
         request = prepared.request
         try:
             result = _validate_result(provider.generate(request), request)
         except OwnerChatProviderError as exc:
+            _logger.info(
+                "owner_chat_operational_plan validation=rejected reason=%s",
+                exc.reason,
+            )
             if aggregate_usage is not None and not exc.usage_uncertain:
                 exc.usage = (
                     _add_usage(aggregate_usage, exc.usage)
@@ -1753,7 +1912,114 @@ def _run_operational_loop(
                 result, aggregate_usage
             ), aggregate_usage
 
+        if result.decision in {"set_preference", "clear_preference"}:
+            try:
+                preference_result = _save_inventory_location_preference(
+                    session,
+                    executor,
+                    user,
+                    business_id,
+                    result.decision,
+                    result.location_reference,
+                )
+            except ToolExecutionError:
+                _logger.info(
+                    "owner_chat_operational_dispatch outcome=preference_error "
+                    "final_synthesis_path=deterministic"
+                )
+                return (
+                    _operational_synthesis_fallback(
+                        {
+                            "action": "not_saved",
+                            "capability": "inventory_location_preference",
+                        },
+                        aggregate_usage,
+                        result.provider_identifier,
+                        result.model_identifier,
+                    ),
+                    aggregate_usage,
+                )
+            synthesis_prepared = _build_operational_synthesis_request(
+                session,
+                business_id,
+                claim.message_id,
+                settings,
+                preference_result,
+                requested_at=requested_at,
+            )
+            synthesis_request = synthesis_prepared.request
+            try:
+                synthesis = _validate_result(
+                    provider.generate(synthesis_request), synthesis_request
+                )
+                synthesis_usage = _usage_for_result(
+                    provider, synthesis_request, synthesis
+                )
+                aggregate_usage = _add_usage(aggregate_usage, synthesis_usage)
+                _logger.info(
+                    "owner_chat_operational_synthesis outcome=preference "
+                    "schema=response_only"
+                )
+                return (
+                    _operational_result_with_usage(synthesis, aggregate_usage),
+                    aggregate_usage,
+                )
+            except OwnerChatProviderError:
+                _logger.info(
+                    "owner_chat_operational_synthesis outcome=preference_failure "
+                    "schema=response_only"
+                )
+                return (
+                    _operational_synthesis_fallback(
+                        preference_result.output,
+                        aggregate_usage,
+                        result.provider_identifier,
+                        result.model_identifier,
+                    ),
+                    aggregate_usage,
+                )
+
         arguments = result.tool_arguments or {}
+        if result.tool_name == "current_inventory":
+            arguments, invalidated_preference = _apply_inventory_location_preference(
+                session, executor, user, business_id, arguments
+            )
+            if invalidated_preference is not None:
+                synthesis_prepared = _build_operational_synthesis_request(
+                    session,
+                    business_id,
+                    claim.message_id,
+                    settings,
+                    invalidated_preference,
+                    requested_at=requested_at,
+                )
+                synthesis_request = synthesis_prepared.request
+                try:
+                    synthesis = _validate_result(
+                        provider.generate(synthesis_request), synthesis_request
+                    )
+                    synthesis_usage = _usage_for_result(
+                        provider, synthesis_request, synthesis
+                    )
+                    aggregate_usage = _add_usage(aggregate_usage, synthesis_usage)
+                    _logger.info(
+                        "owner_chat_operational_synthesis "
+                        "outcome=preference_invalidated schema=response_only"
+                    )
+                    return (
+                        _operational_result_with_usage(synthesis, aggregate_usage),
+                        aggregate_usage,
+                    )
+                except OwnerChatProviderError:
+                    return (
+                        _operational_synthesis_fallback(
+                            invalidated_preference.output,
+                            aggregate_usage,
+                            result.provider_identifier,
+                            result.model_identifier,
+                        ),
+                        aggregate_usage,
+                    )
         try:
             executed = executor.execute(
                 user=user,
@@ -1893,6 +2159,29 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
                 result.reply
                 or not isinstance(result.tool_name, str)
                 or not isinstance(result.tool_arguments, dict)
+            ):
+                raise OwnerChatProviderInvalidResponse(
+                    reason="invalid_operational_response"
+                )
+        elif result.decision == "set_preference":
+            if (
+                result.reply
+                or result.tool_name is not None
+                or result.tool_arguments is not None
+                or result.preference_key != "default_inventory_location"
+                or not isinstance(result.location_reference, str)
+                or not result.location_reference.strip()
+            ):
+                raise OwnerChatProviderInvalidResponse(
+                    reason="invalid_operational_response"
+                )
+        elif result.decision == "clear_preference":
+            if (
+                result.reply
+                or result.tool_name is not None
+                or result.tool_arguments is not None
+                or result.preference_key != "default_inventory_location"
+                or result.location_reference is not None
             ):
                 raise OwnerChatProviderInvalidResponse(
                     reason="invalid_operational_response"
@@ -2106,6 +2395,13 @@ def _generate_claimed_turn(
                 )
                 for candidate in executor.category_candidates(user, business_id)
             )
+            location_candidates = tuple(
+                ProviderLocationCandidate(
+                    label=candidate.label,
+                    location_type=candidate.location_type,
+                )
+                for candidate in executor.location_candidates(user, business_id)
+            )
             initial = _build_operational_request(
                 session,
                 business_id,
@@ -2113,6 +2409,7 @@ def _generate_claimed_turn(
                 settings,
                 provider_definitions,
                 category_candidates=category_candidates,
+                location_candidates=location_candidates,
             )
             generation_attempt = _admit_provider_generation(session, business_id, claim)
             try:
@@ -2150,6 +2447,7 @@ def _generate_claimed_turn(
                 executor,
                 provider_definitions,
                 category_candidates,
+                location_candidates,
             )
             _persist_result(
                 session,
@@ -2200,6 +2498,15 @@ def _generate_claimed_turn(
                         user, business_id
                     )
                 )
+                location_candidates = tuple(
+                    ProviderLocationCandidate(
+                        label=candidate.label,
+                        location_type=candidate.location_type,
+                    )
+                    for candidate in operational_executor.location_candidates(
+                        user, business_id
+                    )
+                )
                 initial = _build_operational_request(
                     session,
                     business_id,
@@ -2207,6 +2514,7 @@ def _generate_claimed_turn(
                     settings,
                     provider_definitions,
                     category_candidates=category_candidates,
+                    location_candidates=location_candidates,
                 )
                 generation_attempt = _admit_provider_generation(
                     session, business_id, claim
@@ -2244,6 +2552,7 @@ def _generate_claimed_turn(
                     operational_executor,
                     provider_definitions,
                     category_candidates,
+                    location_candidates,
                 )
                 _persist_result(
                     session,
@@ -2383,7 +2692,11 @@ def _generate_claimed_turn(
             ),
         )
         raise _provider_unavailable() from None
-    except Exception:
+    except Exception as exc:
+        _logger.info(
+            "owner_chat_operational_dispatch outcome=unexpected_error type=%s",
+            type(exc).__name__,
+        )
         _logger.error(
             "unexpected exception in _generate_claimed_turn:\n%s",
             traceback.format_exc(),

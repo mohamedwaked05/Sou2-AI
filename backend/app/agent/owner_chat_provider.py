@@ -182,6 +182,14 @@ class ProviderCategoryCandidate:
 
 
 @dataclass(frozen=True)
+class ProviderLocationCandidate:
+    """A source-derived location that the planner may reference only by label."""
+
+    label: str
+    location_type: Literal["branch", "warehouse"]
+
+
+@dataclass(frozen=True)
 class OwnerChatRequest:
     profile: ProviderBusinessProfile
     knowledge: tuple[ProviderKnowledge, ...]
@@ -196,6 +204,7 @@ class OwnerChatRequest:
     tools: tuple[ProviderToolDefinition, ...] = ()
     tool_results: tuple[ProviderToolResult, ...] = ()
     category_candidates: tuple[ProviderCategoryCandidate, ...] = ()
+    location_candidates: tuple[ProviderLocationCandidate, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -235,9 +244,13 @@ class OwnerChatResult:
     usage: TokenUsage | None = None
     provider_identifier: str | None = None
     model_identifier: str | None = None
-    decision: Literal["final", "tool", "unavailable"] = "final"
+    decision: Literal[
+        "final", "tool", "unavailable", "set_preference", "clear_preference"
+    ] = "final"
     tool_name: str | None = None
     tool_arguments: dict[str, Any] | None = None
+    preference_key: str | None = None
+    location_reference: str | None = None
 
 
 @runtime_checkable
@@ -575,21 +588,53 @@ class _SummaryStructuredResult(BaseModel):
 class _OperationalStructuredResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    decision: Literal["final", "tool", "unavailable"]
+    decision: Literal[
+        "final", "tool", "unavailable", "set_preference", "clear_preference"
+    ]
     reply: str | None = None
     tool_name: str | None = None
     arguments: dict[str, Any] | None = None
+    preference_key: Literal["default_inventory_location"] | None = None
+    location_reference: str | None = None
 
     @model_validator(mode="after")
     def validate_decision(self) -> _OperationalStructuredResult:
         if self.decision == "tool":
-            if not self.tool_name or self.arguments is None or self.reply is not None:
+            if (
+                not self.tool_name
+                or self.arguments is None
+                or self.reply is not None
+                or self.preference_key is not None
+                or self.location_reference is not None
+            ):
                 raise ValueError("Tool decisions require only a tool and arguments.")
+        elif self.decision == "set_preference":
+            if (
+                self.reply is not None
+                or self.tool_name is not None
+                or self.arguments is not None
+                or self.preference_key != "default_inventory_location"
+                or not self.location_reference
+            ):
+                raise ValueError(
+                    "Preference updates require a key and location reference."
+                )
+        elif self.decision == "clear_preference":
+            if (
+                self.reply is not None
+                or self.tool_name is not None
+                or self.arguments is not None
+                or self.preference_key != "default_inventory_location"
+                or self.location_reference is not None
+            ):
+                raise ValueError("Preference clearing requires only an approved key.")
         elif (
             self.reply is None
             or not self.reply.strip()
             or self.tool_name is not None
             or self.arguments is not None
+            or self.preference_key is not None
+            or self.location_reference is not None
         ):
             raise ValueError("Final decisions require only a nonblank reply.")
         return self
@@ -705,6 +750,13 @@ def _provider_neutral_request_input(request: OwnerChatRequest) -> dict[str, Any]
                 }
                 for candidate in request.category_candidates
             ],
+            location_candidates=[
+                {
+                    "label": candidate.label,
+                    "location_type": candidate.location_type,
+                }
+                for candidate in request.location_candidates
+            ],
         )
     return payload
 
@@ -803,6 +855,13 @@ def _operational_context(request: OwnerChatRequest) -> dict[str, Any]:
             }
             for candidate in request.category_candidates
         ],
+        "location_candidates": [
+            {
+                "label": candidate.label,
+                "location_type": candidate.location_type,
+            }
+            for candidate in request.location_candidates
+        ],
     }
 
 
@@ -811,7 +870,8 @@ def _operational_instructions(request: OwnerChatRequest) -> str:
     return (
         "You answer an authenticated business owner's live operational question. "
         "Choose exactly one decision: request one approved tool, give a final answer, "
-        "or state that the capability is unavailable. Tool names and schemas are "
+        "set or clear an approved preference, or state that the capability is "
+        "unavailable. Tool names and schemas are "
         "fixed by approved_tools. Never invent, rename, define, or call another tool. "
         "Never add a business identifier, SQL, URL, code, credential, host, schema, "
         "or connection setting to arguments. If operational_results is empty and an "
@@ -841,6 +901,11 @@ def _operational_instructions(request: OwnerChatRequest) -> str:
         "cannot be calculated, name only its safe missing input concepts, and offer "
         "the listed supported metrics without relabeling or silently substituting "
         "one as another. Preserve the owner's language and style. "
+        "For a future inventory-location instruction, use set_preference with only "
+        "default_inventory_location and the unresolved location_reference. Interpret "
+        "against the bounded source-defined location_candidates but never invent a "
+        "location identifier. Use clear_preference only for that approved key. These "
+        "actions do not run inventory queries. "
         "Never invent missing values, create document citations, expose internal "
         "details, or claim a failed operation succeeded. Return only JSON matching "
         "the supplied schema. Safe context follows:\n"
@@ -911,6 +976,8 @@ def _owner_chat_result_from_operational(
     str,
     str | None,
     dict[str, Any] | None,
+    str | None,
+    str | None,
 ]:
     return (
         structured.reply or "",
@@ -920,6 +987,8 @@ def _owner_chat_result_from_operational(
         structured.decision,
         structured.tool_name,
         structured.arguments,
+        structured.preference_key,
+        structured.location_reference,
     )
 
 
@@ -1106,9 +1175,17 @@ class OllamaOwnerChatProvider:
                     )
                     cited_source_ids: tuple[str, ...] = ()
                     proposed_knowledge: tuple[ProposedKnowledge, ...] = ()
-                    decision: Literal["final", "tool", "unavailable"] = "final"
+                    decision: Literal[
+                        "final",
+                        "tool",
+                        "unavailable",
+                        "set_preference",
+                        "clear_preference",
+                    ] = "final"
                     tool_name: str | None = None
                     tool_arguments: dict[str, Any] | None = None
+                    preference_key: str | None = None
+                    location_reference: str | None = None
                 elif request.mode == "operational":
                     operational_result = (
                         _OperationalStructuredResult.model_validate_json(
@@ -1123,6 +1200,8 @@ class OllamaOwnerChatProvider:
                         decision,
                         tool_name,
                         tool_arguments,
+                        preference_key,
+                        location_reference,
                     ) = _owner_chat_result_from_operational(operational_result)
                 elif request.mode == "operational_synthesis":
                     synthesis_result = (
@@ -1137,6 +1216,8 @@ class OllamaOwnerChatProvider:
                     decision = "final"
                     tool_name = None
                     tool_arguments = None
+                    preference_key = None
+                    location_reference = None
                 else:
                     grounded_result = _OllamaStructuredResult.model_validate_json(
                         envelope.message.content
@@ -1174,6 +1255,8 @@ class OllamaOwnerChatProvider:
                     decision = "final"
                     tool_name = None
                     tool_arguments = None
+                    preference_key = None
+                    location_reference = None
             except ValueError:
                 raise OwnerChatProviderInvalidResponse(
                     reason="invalid_structured_response",
@@ -1237,6 +1320,8 @@ class OllamaOwnerChatProvider:
             decision=decision,
             tool_name=tool_name,
             tool_arguments=tool_arguments,
+            preference_key=preference_key,
+            location_reference=location_reference,
         )
 
     def _request_payload(self, request: OwnerChatRequest) -> dict[str, Any]:
@@ -1574,9 +1659,13 @@ class GeminiOwnerChatProvider:
                 requires_business_knowledge = structured.requires_business_knowledge
                 cited_source_ids: tuple[str, ...] = ()
                 proposed_knowledge: tuple[ProposedKnowledge, ...] = ()
-                decision: Literal["final", "tool", "unavailable"] = "final"
+                decision: Literal[
+                    "final", "tool", "unavailable", "set_preference", "clear_preference"
+                ] = "final"
                 tool_name: str | None = None
                 tool_arguments: dict[str, Any] | None = None
+                preference_key: str | None = None
+                location_reference: str | None = None
             elif isinstance(structured, _OperationalStructuredResult):
                 (
                     reply,
@@ -1586,6 +1675,8 @@ class GeminiOwnerChatProvider:
                     decision,
                     tool_name,
                     tool_arguments,
+                    preference_key,
+                    location_reference,
                 ) = _owner_chat_result_from_operational(structured)
             elif isinstance(structured, _OperationalSynthesisStructuredResult):
                 reply = structured.reply
@@ -1595,6 +1686,8 @@ class GeminiOwnerChatProvider:
                 decision = "final"
                 tool_name = None
                 tool_arguments = None
+                preference_key = None
+                location_reference = None
             else:
                 if any(
                     fact.expires_at is not None
@@ -1633,6 +1726,8 @@ class GeminiOwnerChatProvider:
                 decision = "final"
                 tool_name = None
                 tool_arguments = None
+                preference_key = None
+                location_reference = None
         except OwnerChatProviderError:
             raise
         except httpx.TimeoutException:
@@ -1693,6 +1788,8 @@ class GeminiOwnerChatProvider:
             decision=decision,
             tool_name=tool_name,
             tool_arguments=tool_arguments,
+            preference_key=preference_key,
+            location_reference=location_reference,
         )
 
     def _request_payload(self, request: OwnerChatRequest) -> dict[str, Any]:
