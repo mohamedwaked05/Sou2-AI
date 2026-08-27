@@ -133,6 +133,14 @@ def operational_request(*, with_result: bool = False) -> OwnerChatRequest:
     )
 
 
+def operational_synthesis_request() -> OwnerChatRequest:
+    return replace(
+        operational_request(with_result=True),
+        mode="operational_synthesis",
+        tools=(),
+    )
+
+
 def request_with_source() -> OwnerChatRequest:
     return replace(
         provider_request(),
@@ -262,6 +270,72 @@ def test_gemini_operational_final_uses_only_normalized_tool_context() -> None:
     assert "available_quantity" in serialized
     assert "retrievedSources" not in serialized
     assert "connection_profile" not in serialized
+
+
+@pytest.mark.parametrize("adapter", ["ollama", "gemini"])
+def test_operational_synthesis_is_response_only_and_requires_connected_source(
+    adapter: str,
+) -> None:
+    captured: dict[str, object] = {}
+    structured = {
+        "reply": "The validated result is ready.",
+        "source_connected": True,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        if adapter == "ollama":
+            return httpx.Response(
+                200,
+                json={
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(structured),
+                    }
+                },
+            )
+        return gemini_successful_transport(structured).handle_request(request)
+
+    provider: OwnerChatProvider = (
+        ollama_provider(httpx.MockTransport(handler))
+        if adapter == "ollama"
+        else gemini_provider(httpx.MockTransport(handler))
+    )
+    result = provider.generate(operational_synthesis_request())
+
+    assert result.decision == "final"
+    assert result.tool_name is None
+    assert result.tool_arguments is None
+    schema = (
+        captured["format"]
+        if adapter == "ollama"
+        else captured["generationConfig"]["responseJsonSchema"]
+    )
+    assert (
+        schema
+        == owner_chat_provider._OperationalSynthesisStructuredResult.model_json_schema()
+    )
+    system = (
+        captured["messages"][0]["content"]
+        if adapter == "ollama"
+        else captured["systemInstruction"]["parts"][0]["text"]
+    )
+    assert "approved_tools" not in system
+    assert "Do not plan" in system
+
+
+def test_operational_synthesis_rejects_a_disconnected_source_claim() -> None:
+    provider = ollama_provider(
+        successful_transport(
+            {
+                "reply": "The source is disconnected.",
+                "source_connected": False,
+            }
+        )
+    )
+
+    with pytest.raises(OwnerChatProviderInvalidResponse):
+        provider.generate(operational_synthesis_request())
 
 
 def test_operational_provider_response_rejects_unknown_fields() -> None:

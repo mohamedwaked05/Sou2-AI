@@ -58,6 +58,7 @@ from app.database.models import (
 from app.integrations.profiles import ConnectionProfileRegistry
 from app.rag.embeddings import create_embedding_provider
 from app.rag.retrieval import retrieve
+from app.schemas.operational import MetricCapabilityResult
 from app.schemas.owner_chat import (
     ChatMessageResponse,
     ConversationHistoryResponse,
@@ -85,8 +86,7 @@ from app.tools.operational import (
 _logger = logging.getLogger(__name__)
 
 CHAT_CONTEXT_MESSAGE_LIMIT = 12
-MAX_OPERATIONAL_TOOL_EXECUTIONS = 2
-MAX_OPERATIONAL_PROVIDER_CALLS = 3
+MAX_OPERATIONAL_PROVIDER_CALLS = 2
 HISTORY_PAGE_SIZE = 50
 ABANDONED_TURN_RECOVERY_BATCH_SIZE = 100
 HIGH_CONFIDENCE_EVIDENCE_SIMILARITY = 0.65
@@ -916,6 +916,37 @@ def _build_operational_request(
     return _PreparedTurn(request=request, business=business, has_usable_evidence=True)
 
 
+def _build_operational_synthesis_request(
+    session: Session,
+    business_id: uuid.UUID,
+    owner_message_id: uuid.UUID,
+    settings: Settings,
+    result: ProviderToolResult,
+    *,
+    requested_at: datetime,
+) -> _PreparedTurn:
+    owner_message = session.get(OwnerChatMessage, owner_message_id)
+    business = _load_provider_business(session, business_id)
+    if owner_message is None or business is None:
+        raise _provider_unavailable()
+    _rolling_summary, messages = _provider_context(session, owner_message)
+    request = OwnerChatRequest(
+        profile=_provider_profile(business),
+        knowledge=(),
+        sources=(),
+        messages=messages,
+        rolling_summary=None,
+        requested_at=requested_at,
+        max_output_tokens=settings.owner_chat_max_output_tokens,
+        mode="operational_synthesis",
+        tools=(),
+        tool_results=(result,),
+        category_candidates=(),
+    )
+    session.commit()
+    return _PreparedTurn(request=request, business=business, has_usable_evidence=True)
+
+
 def _build_provider_request(
     session: Session,
     user: User,
@@ -1484,6 +1515,39 @@ def _operational_result_with_usage(
     )
 
 
+def _operational_synthesis_fallback(
+    output: object,
+    usage: TokenUsage,
+    provider_identifier: str | None,
+    model_identifier: str | None,
+) -> OwnerChatResult:
+    if isinstance(output, MetricCapabilityResult) and output.status == "unsupported":
+        missing = ", ".join(
+            "cost/COGS" if item == "cost_cogs" else item.replace("_", " ")
+            for item in output.missing_inputs
+        )
+        alternatives = ", ".join(
+            item.replace("_", " ") for item in output.supported_metrics
+        )
+        reply = (
+            f"Accurate {output.requested_metric.replace('_', ' ')} cannot be "
+            f"calculated because {missing} is not connected. "
+            f"Available alternatives: {alternatives}."
+        )
+    else:
+        reply = (
+            "The requested operational lookup completed, but I could not safely "
+            "format its validated result."
+        )
+    return OwnerChatResult(
+        reply=reply,
+        usage=usage,
+        provider_identifier=provider_identifier,
+        model_identifier=model_identifier,
+        decision="final",
+    )
+
+
 def _product_resolution_reply(
     tool_results: list[ProviderToolResult],
     message: str,
@@ -1589,7 +1653,6 @@ def _run_operational_loop(
     category_candidates: tuple[ProviderCategoryCandidate, ...] = (),
 ) -> tuple[OwnerChatResult, TokenUsage]:
     tool_results: list[ProviderToolResult] = []
-    call_fingerprints: set[str] = set()
     aggregate_usage: TokenUsage | None = None
     requested_at = utc_now()
 
@@ -1691,37 +1754,6 @@ def _run_operational_loop(
             ), aggregate_usage
 
         arguments = result.tool_arguments or {}
-        fingerprint = json.dumps(
-            {"name": result.tool_name, "arguments": arguments},
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        if (
-            fingerprint in call_fingerprints
-            or len(tool_results) >= MAX_OPERATIONAL_TOOL_EXECUTIONS
-        ):
-            try:
-                executor.reject(
-                    user=user,
-                    business_id=business_id,
-                    tool_name=result.tool_name,
-                    arguments=arguments,
-                    code="loop_limit",
-                )
-            except ToolExecutionError:
-                fallback = OwnerChatResult(
-                    reply=_live_operational_reply(
-                        request.messages[-1].content,
-                        prepared.business.default_language,
-                    ),
-                    usage=aggregate_usage,
-                    provider_identifier=result.provider_identifier,
-                    model_identifier=result.model_identifier,
-                    decision="unavailable",
-                )
-                return fallback, aggregate_usage
-        call_fingerprints.add(fingerprint)
         try:
             executed = executor.execute(
                 user=user,
@@ -1754,14 +1786,98 @@ def _run_operational_loop(
             capability,
             capability_status,
         )
-        tool_results.append(
-            ProviderToolResult(
-                tool_name=executed.tool_name,
-                output=executed.output.model_dump(mode="json"),
+        tool_result = ProviderToolResult(
+            tool_name=executed.tool_name,
+            output=executed.output.model_dump(mode="json"),
+        )
+        resolution_reply = _product_resolution_reply(
+            [tool_result],
+            request.messages[-1].content,
+            prepared.business.default_language,
+        )
+        if resolution_reply is None:
+            resolution_reply = _category_resolution_reply(
+                [tool_result],
+                request.messages[-1].content,
+                prepared.business.default_language,
             )
+        if resolution_reply is not None:
+            return (
+                OwnerChatResult(
+                    reply=resolution_reply,
+                    usage=aggregate_usage,
+                    provider_identifier=result.provider_identifier,
+                    model_identifier=result.model_identifier,
+                    decision="final",
+                ),
+                aggregate_usage,
+            )
+
+        synthesis_prepared = _build_operational_synthesis_request(
+            session,
+            business_id,
+            claim.message_id,
+            settings,
+            tool_result,
+            requested_at=requested_at,
+        )
+        synthesis_request = synthesis_prepared.request
+        try:
+            synthesis = _validate_result(
+                provider.generate(synthesis_request), synthesis_request
+            )
+        except OwnerChatProviderError as exc:
+            failure_usage = exc.usage
+            if failure_usage is None and exc.usage_uncertain:
+                estimated_input = provider.estimate_input_tokens(synthesis_request)
+                failure_usage = TokenUsage(
+                    input_tokens=estimated_input,
+                    output_tokens=synthesis_request.max_output_tokens,
+                    total_tokens=estimated_input + synthesis_request.max_output_tokens,
+                    authoritative=False,
+                )
+            if failure_usage is not None:
+                aggregate_usage = _add_usage(aggregate_usage, failure_usage)
+            assert aggregate_usage is not None
+            _logger.info(
+                "owner_chat_operational_synthesis outcome=provider_failure "
+                "schema=response_only fallback_reason=provider_failure"
+            )
+            return (
+                _operational_synthesis_fallback(
+                    executed.output,
+                    aggregate_usage,
+                    result.provider_identifier,
+                    result.model_identifier,
+                ),
+                aggregate_usage,
+            )
+        synthesis_usage = _usage_for_result(provider, synthesis_request, synthesis)
+        assert aggregate_usage is not None
+        if synthesis_usage.output_tokens > synthesis_request.max_output_tokens:
+            _logger.info(
+                "owner_chat_operational_synthesis outcome=invalid "
+                "schema=response_only fallback_reason=output_token_limit"
+            )
+            return (
+                _operational_synthesis_fallback(
+                    executed.output,
+                    aggregate_usage,
+                    result.provider_identifier,
+                    result.model_identifier,
+                ),
+                aggregate_usage,
+            )
+        aggregate_usage = _add_usage(aggregate_usage, synthesis_usage)
+        _logger.info(
+            "owner_chat_operational_synthesis outcome=final schema=response_only"
+        )
+        return (
+            _operational_result_with_usage(synthesis, aggregate_usage),
+            aggregate_usage,
         )
 
-    raise RuntimeError("Operational provider loop exited unexpectedly.")
+    raise RuntimeError("Operational provider planner exited unexpectedly.")
 
 
 def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResult:
@@ -1797,6 +1913,22 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
             raise OwnerChatProviderInvalidResponse(
                 reason="invalid_operational_response"
             )
+    elif request.mode == "operational_synthesis":
+        if (
+            result.proposed_knowledge
+            or result.cited_source_ids
+            or result.requires_business_knowledge
+            or result.decision != "final"
+            or result.tool_name is not None
+            or result.tool_arguments is not None
+            or not isinstance(result.reply, str)
+            or not 1 <= len(result.reply.strip()) <= 14_000
+        ):
+            raise OwnerChatProviderInvalidResponse(
+                reason="invalid_operational_synthesis_response"
+            )
+        if _is_unsafe_reply(result.reply):
+            raise OwnerChatProviderInvalidResponse(reason="unsafe_output")
     else:
         if (
             not isinstance(result.reply, str)

@@ -585,6 +585,8 @@ def test_owner_receives_unsupported_profit_facts_and_preserves_franco_style(
     assert "COGS" in response.json()["assistant_message"]["content"]
     assert "unavailable" not in response.json()["assistant_message"]["content"]
     assert SALES_SUMMARY_TOOL in {tool.name for tool in provider.requests[0].tools}
+    assert provider.requests[1].mode == "operational_synthesis"
+    assert provider.requests[1].tools == ()
     supplied = provider.requests[1].tool_results[0].output
     assert supplied["requested_metric"] == "gross_profit"
     assert supplied["supported_metrics"] == ["revenue", "sales_count"]
@@ -593,8 +595,58 @@ def test_owner_receives_unsupported_profit_facts_and_preserves_franco_style(
     assert any(
         "capability_outcome=unsupported" in message for message in diagnostic_messages
     )
+    assert any(
+        "owner_chat_operational_synthesis outcome=final schema=response_only" in message
+        for message in diagnostic_messages
+    )
     assert all("rebe7" not in message for message in diagnostic_messages)
     assert all("Ma fina" not in message for message in diagnostic_messages)
+
+
+def test_unsupported_profit_uses_capability_fallback_when_synthesis_is_invalid(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"profit-fallback-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=SALES_SUMMARY_TOOL,
+                tool_arguments={
+                    "start_date": "2026-08-20",
+                    "end_date": "2026-08-23",
+                    "metric": "gross_profit",
+                },
+            ),
+            usage_result(
+                decision="tool",
+                tool_name=SALES_SUMMARY_TOOL,
+                tool_arguments={"metric": "gross_profit"},
+            ),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "badi a3ref adde 3melna rebe7 e5er fatra",
+        f"profit-fallback-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    content = response.json()["assistant_message"]["content"]
+    assert "cost/COGS" in content
+    assert "revenue" in content
+    assert "sales count" in content
+    assert "live operational data" not in content.lower()
+    assert len(provider.requests) == 2
+    assert provider.requests[1].mode == "operational_synthesis"
+    assert source.calls == []
 
 
 @pytest.mark.parametrize(
@@ -1037,7 +1089,7 @@ def test_unhealthy_source_keeps_safe_unavailable_bypass(
         )
 
 
-def test_repeated_tool_request_is_rejected_without_second_execution(
+def test_response_only_synthesis_rejects_a_tool_request_without_replanning(
     api_client: TestClient, db_session: Session
 ) -> None:
     user, business = active_business(
@@ -1066,20 +1118,21 @@ def test_repeated_tool_request_is_rejected_without_second_execution(
     )
 
     assert response.status_code == 200, response.text
-    assert "live operational" in response.json()["assistant_message"]["content"].lower()
+    assert (
+        "could not safely format"
+        in response.json()["assistant_message"]["content"].lower()
+    )
     assert len(provider.requests) == 2
+    assert provider.requests[1].mode == "operational_synthesis"
+    assert provider.requests[1].tools == ()
     assert source.calls == [CURRENT_INVENTORY_TOOL]
     audits = db_session.scalars(
         select(ToolCallLog).order_by(ToolCallLog.created_at, ToolCallLog.id)
     ).all()
-    assert [audit.status for audit in audits] == [
-        ToolCallStatus.SUCCESS,
-        ToolCallStatus.DENIED,
-    ]
-    assert audits[1].error_code == "loop_limit"
+    assert [audit.status for audit in audits] == [ToolCallStatus.SUCCESS]
 
 
-def test_loop_allows_two_tools_and_requires_final_by_third_provider_call(
+def test_tool_result_uses_response_only_synthesis_without_a_second_plan(
     api_client: TestClient, db_session: Session
 ) -> None:
     user, business = active_business(
@@ -1095,14 +1148,6 @@ def test_loop_allows_two_tools_and_requires_final_by_third_provider_call(
                 decision="tool",
                 tool_name=CURRENT_INVENTORY_TOOL,
                 tool_arguments={"limit": 5},
-            ),
-            usage_result(
-                decision="tool",
-                tool_name=SALES_SUMMARY_TOOL,
-                tool_arguments={
-                    "start_date": "2026-08-20",
-                    "end_date": "2026-08-23",
-                },
             ),
             usage_result(
                 reply=(
@@ -1124,17 +1169,17 @@ def test_loop_allows_two_tools_and_requires_final_by_third_provider_call(
     )
 
     assert response.status_code == 200, response.text
-    assert len(provider.requests) == 3
-    assert source.calls == [CURRENT_INVENTORY_TOOL, SALES_SUMMARY_TOOL]
-    assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 2
-    final_context = provider.requests[2].tool_results
-    assert [item.tool_name for item in final_context] == [
-        CURRENT_INVENTORY_TOOL,
-        SALES_SUMMARY_TOOL,
+    assert len(provider.requests) == 2
+    assert source.calls == [CURRENT_INVENTORY_TOOL]
+    assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
+    assert provider.requests[1].mode == "operational_synthesis"
+    assert provider.requests[1].tools == ()
+    assert [item.tool_name for item in provider.requests[1].tool_results] == [
+        CURRENT_INVENTORY_TOOL
     ]
 
 
-def test_failed_loop_finalizes_reservation_and_terminal_replay_does_no_work(
+def test_synthesis_failure_uses_safe_fallback_and_replay_does_no_work(
     api_client: TestClient, db_session: Session, migration_engine: Engine
 ) -> None:
     user, business = active_business(
@@ -1170,10 +1215,13 @@ def test_failed_loop_finalizes_reservation_and_terminal_replay_does_no_work(
         "failed-live-loop",
     )
 
-    assert first.status_code == 503
-    assert first.json()["error"]["code"] == "assistant_timeout"
-    assert replay.status_code == 409
-    assert replay.json()["error"]["code"] == "owner_turn_failed"
+    assert first.status_code == 200
+    assert (
+        "could not safely format"
+        in first.json()["assistant_message"]["content"].lower()
+    )
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
     assert len(provider.requests) == 2
     assert source.calls == [CURRENT_INVENTORY_TOOL]
     assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
@@ -1184,8 +1232,8 @@ def test_failed_loop_finalizes_reservation_and_terminal_replay_does_no_work(
                 "FROM ai_usage_reservations"
             )
         ).one()
-    assert reservation.status == "charged"
-    assert reservation.total_tokens == reservation.reserved_tokens
+    assert reservation.status == "completed"
+    assert reservation.total_tokens < reservation.reserved_tokens
 
 
 def test_concurrent_idempotent_operational_submissions_execute_once(
