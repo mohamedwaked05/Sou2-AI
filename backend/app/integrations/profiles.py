@@ -81,6 +81,11 @@ class OperationalMappingProfile:
             "inventory_value",
         }:
             raise MappingProfileError("Operational metric semantics are incomplete.")
+        supported = set(self.supported_metrics)
+        if "gross_profit" in supported and "revenue" not in supported:
+            raise MappingProfileError("Gross profit requires revenue support.")
+        if "net_profit" in supported and "gross_profit" not in supported:
+            raise MappingProfileError("Net profit requires gross profit support.")
         if set(self.required_capabilities) != set(OPERATIONAL_CAPABILITIES):
             raise MappingProfileError("Operational capability mapping is incomplete.")
 

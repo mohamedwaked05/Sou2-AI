@@ -236,6 +236,8 @@ class SalesSummary(OperationalContract):
     net_revenue: Decimal
     currency: str = Field(pattern=r"^[A-Z]{3}$")
     metric: OperationalMetric = "revenue"
+    gross_profit: Decimal | None = None
+    net_profit: Decimal | None = None
     metadata: OperationalResultMetadata
 
     @model_validator(mode="after")
@@ -244,7 +246,26 @@ class SalesSummary(OperationalContract):
             raise ValueError("Net quantity must equal sold quantity minus returns.")
         if self.net_revenue != self.gross_revenue - self.refund_amount:
             raise ValueError("Net revenue must equal gross revenue minus refunds.")
+        if self.metric == "gross_profit" and self.gross_profit is None:
+            raise ValueError("Gross-profit results require mapped cost data.")
+        if self.metric == "net_profit" and self.net_profit is None:
+            raise ValueError("Net-profit results require mapped expense data.")
         return self
+
+
+MetricCapabilityStatus = Literal["supported", "unsupported"]
+
+
+class MetricCapabilityResult(OperationalContract):
+    """Safe capability facts returned when a requested metric cannot run."""
+
+    capability: Literal["financial_metric"] = "financial_metric"
+    requested_metric: OperationalMetric
+    status: MetricCapabilityStatus
+    missing_inputs: tuple[Literal["cost_cogs", "expenses", "valuation_basis"], ...] = ()
+    supported_metrics: tuple[OperationalMetric, ...] = ()
+    period: ReportingPeriod
+    branch_external_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class BestSellingProduct(OperationalContract):

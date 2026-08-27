@@ -44,6 +44,7 @@ from app.schemas.operational import (
     IntegrationHealth,
     InventoryItem,
     InventoryResult,
+    MetricCapabilityResult,
     OperationalResultMetadata,
     Product,
     ProductResolution,
@@ -514,24 +515,73 @@ def test_operational_planner_receives_bounded_source_categories(
     assert provider.requests[0].rolling_summary is None
 
 
-def test_profit_metric_is_rejected_when_mapping_has_no_cost_capability(
+def test_profit_metric_returns_missing_capability_and_revenue_alternative(
     api_client: TestClient, db_session: Session
 ) -> None:
     user, business, _registry, executor = executor_setup(api_client, db_session)
 
-    with pytest.raises(ToolExecutionError) as caught:
-        executor.execute(
-            user=user,
-            business_id=business.id,
-            tool_name=SALES_SUMMARY_TOOL,
-            arguments={
-                "start_date": "2026-08-20",
-                "end_date": "2026-08-23",
-                "metric": "gross_profit",
-            },
-        )
+    result = executor.execute(
+        user=user,
+        business_id=business.id,
+        tool_name=SALES_SUMMARY_TOOL,
+        arguments={
+            "start_date": "2026-08-20",
+            "end_date": "2026-08-23",
+            "metric": "gross_profit",
+        },
+    )
 
-    assert caught.value.code == "capability_unavailable"
+    assert isinstance(result.output, MetricCapabilityResult)
+    assert result.output.status == "unsupported"
+    assert result.output.requested_metric == "gross_profit"
+    assert result.output.missing_inputs == ("cost_cogs",)
+    assert result.output.supported_metrics == ("revenue", "sales_count")
+    assert result.output.period.start_date.isoformat() == "2026-08-20"
+
+
+def test_owner_receives_unsupported_profit_facts_and_preserves_franco_style(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"profit-capability-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=SALES_SUMMARY_TOOL,
+                tool_arguments={
+                    "start_date": "2026-08-20",
+                    "end_date": "2026-08-23",
+                    "metric": "gross_profit",
+                },
+            ),
+            usage_result(
+                reply=(
+                    "Ma fina n7seb l profit accurately la2an cost/COGS mish "
+                    "connected. Fina n3tik revenue iza بدك."
+                )
+            ),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "badi a3ref adde 3melna rebe7 e5er fatra",
+        f"profit-capability-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert "COGS" in response.json()["assistant_message"]["content"]
+    assert "unavailable" not in response.json()["assistant_message"]["content"]
+    supplied = provider.requests[1].tool_results[0].output
+    assert supplied["requested_metric"] == "gross_profit"
+    assert supplied["supported_metrics"] == ["revenue", "sales_count"]
+    assert "minimarket" not in str(supplied)
 
 
 @pytest.mark.parametrize(

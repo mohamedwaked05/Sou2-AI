@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
@@ -41,6 +41,7 @@ from app.schemas.operational import (
     InventoryQuery,
     InventoryReadQuery,
     InventoryResult,
+    MetricCapabilityResult,
     ProductResolution,
     ProductResolutionQuery,
     RestockingQuery,
@@ -121,7 +122,7 @@ class OperationalToolDefinition:
     name: str
     description: str
     input_schema: type[BaseModel]
-    output_schema: type[BaseModel]
+    output_schema: type[BaseModel] | tuple[type[BaseModel], ...]
     capability: str
     result_limit: int
     timeout_seconds: int
@@ -177,6 +178,38 @@ def _inventory(source: OperationalDataSource, query: BaseModel) -> BaseModel:
 def _sales_summary(source: OperationalDataSource, query: BaseModel) -> BaseModel:
     assert isinstance(query, SalesQuery)
     return source.get_sales_summary(query)
+
+
+def _unsupported_metric_result(
+    query: SalesQuery, supported_metrics: tuple[str, ...], source_timezone: str
+) -> MetricCapabilityResult:
+    if query.metric == "gross_profit":
+        missing: tuple[Literal["cost_cogs", "expenses", "valuation_basis"], ...] = (
+            "cost_cogs",
+        )
+    elif query.metric == "net_profit":
+        missing = ("cost_cogs", "expenses")
+    else:
+        missing = ("valuation_basis",)
+    return MetricCapabilityResult(
+        requested_metric=query.metric,
+        status="unsupported",
+        missing_inputs=missing,
+        supported_metrics=tuple(
+            metric
+            for metric in supported_metrics
+            if metric
+            in {
+                "revenue",
+                "gross_profit",
+                "net_profit",
+                "sales_count",
+                "inventory_value",
+            }
+        ),
+        period=query.period(source_timezone),
+        branch_external_id=query.branch_external_id,
+    )
 
 
 def _best_sellers(source: OperationalDataSource, query: BaseModel) -> BaseModel:
@@ -259,7 +292,7 @@ def build_operational_tool_registry(
                 "profit requires a separate mapped cost/expense capability."
             ),
             input_schema=SalesQuery,
-            output_schema=SalesSummary,
+            output_schema=(SalesSummary, MetricCapabilityResult),
             capability="sales_summaries",
             result_limit=1,
             timeout_seconds=timeout_seconds,
@@ -494,15 +527,18 @@ class OperationalToolExecutor:
             )
             if mapping is None:
                 raise ToolExecutionError("integration_unavailable")
+            self._session.commit()
+            health = adapter.check_health()
+            mapping.validate_health(health)
             if (
                 definition.name == SALES_SUMMARY_TOOL
                 and getattr(query, "metric", "revenue") not in mapping.supported_metrics
             ):
-                raise ToolExecutionError("capability_unavailable")
-            self._session.commit()
-            health = adapter.check_health()
-            mapping.validate_health(health)
-            result = definition.executor(adapter, query)
+                result = _unsupported_metric_result(
+                    query, mapping.supported_metrics, health.source_timezone or "UTC"
+                )
+            else:
+                result = definition.executor(adapter, query)
             elapsed = time.monotonic() - started
             if elapsed > definition.timeout_seconds:
                 raise ToolExecutionError("timeout")
