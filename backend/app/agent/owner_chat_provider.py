@@ -203,6 +203,18 @@ class OwnerChatRequest:
     ] = "grounded"
     tools: tuple[ProviderToolDefinition, ...] = ()
     tool_results: tuple[ProviderToolResult, ...] = ()
+    validated_result_status: (
+        Literal[
+            "data",
+            "empty",
+            "ambiguous",
+            "not_found",
+            "unsupported",
+            "preference",
+            "other",
+        ]
+        | None
+    ) = None
     category_candidates: tuple[ProviderCategoryCandidate, ...] = ()
     location_candidates: tuple[ProviderLocationCandidate, ...] = ()
 
@@ -251,6 +263,18 @@ class OwnerChatResult:
     tool_arguments: dict[str, Any] | None = None
     preference_key: str | None = None
     location_reference: str | None = None
+    validated_result_status: (
+        Literal[
+            "data",
+            "empty",
+            "ambiguous",
+            "not_found",
+            "unsupported",
+            "preference",
+            "other",
+        ]
+        | None
+    ) = None
 
 
 @runtime_checkable
@@ -313,6 +337,7 @@ class DeterministicMockOwnerChatProvider:
                 ),
                 provider_identifier="mock",
                 model_identifier="deterministic",
+                validated_result_status=request.validated_result_status,
             )
 
         if request.mode == "operational":
@@ -647,6 +672,9 @@ class _OperationalSynthesisStructuredResult(BaseModel):
 
     reply: str
     source_connected: Literal[True]
+    validated_result_status: Literal[
+        "data", "empty", "ambiguous", "not_found", "unsupported", "preference", "other"
+    ]
 
     @field_validator("reply")
     @classmethod
@@ -916,6 +944,7 @@ def _operational_instructions(request: OwnerChatRequest) -> str:
 def _operational_synthesis_instructions(request: OwnerChatRequest) -> str:
     context = {
         "request_time_utc": request.requested_at.isoformat(),
+        "validated_result_status": request.validated_result_status,
         "validated_operational_results": [
             {"tool_name": result.tool_name, "output": result.output}
             for result in request.tool_results
@@ -1322,6 +1351,11 @@ class OllamaOwnerChatProvider:
             tool_arguments=tool_arguments,
             preference_key=preference_key,
             location_reference=location_reference,
+            validated_result_status=(
+                synthesis_result.validated_result_status
+                if request.mode == "operational_synthesis"
+                else None
+            ),
         )
 
     def _request_payload(self, request: OwnerChatRequest) -> dict[str, Any]:
@@ -1790,6 +1824,11 @@ class GeminiOwnerChatProvider:
             tool_arguments=tool_arguments,
             preference_key=preference_key,
             location_reference=location_reference,
+            validated_result_status=(
+                structured.validated_result_status
+                if isinstance(structured, _OperationalSynthesisStructuredResult)
+                else None
+            ),
         )
 
     def _request_payload(self, request: OwnerChatRequest) -> dict[str, Any]:

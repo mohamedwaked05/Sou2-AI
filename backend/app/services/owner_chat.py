@@ -60,7 +60,7 @@ from app.database.models import (
 from app.integrations.profiles import ConnectionProfileRegistry
 from app.rag.embeddings import create_embedding_provider
 from app.rag.retrieval import retrieve
-from app.schemas.operational import MetricCapabilityResult
+from app.schemas.operational import InventoryResult, MetricCapabilityResult
 from app.schemas.owner_chat import (
     ChatMessageResponse,
     ConversationHistoryResponse,
@@ -945,10 +945,48 @@ def _build_operational_synthesis_request(
         mode="operational_synthesis",
         tools=(),
         tool_results=(result,),
+        validated_result_status=_operational_synthesis_status(result.output),
         category_candidates=(),
     )
     session.commit()
     return _PreparedTurn(request=request, business=business, has_usable_evidence=True)
+
+
+def _operational_synthesis_status(output: object) -> str:
+    """Classify backend-validated tool output for response-only verification."""
+
+    if isinstance(output, MetricCapabilityResult):
+        return "unsupported" if output.status == "unsupported" else "data"
+    if isinstance(output, InventoryResult):
+        if output.resolution is not None and output.resolution.status != "resolved":
+            return output.resolution.status
+        if (
+            output.category_resolution is not None
+            and output.category_resolution.status != "resolved"
+        ):
+            return output.category_resolution.status
+        return "data" if output.items else "empty"
+    if not isinstance(output, dict):
+        return "other"
+    if output.get("capability") == "inventory_location_preference":
+        return "preference"
+    status = output.get("status")
+    if status == "unsupported":
+        return "unsupported"
+    resolution = output.get("resolution")
+    if isinstance(resolution, dict):
+        resolution_status = resolution.get("status")
+        if resolution_status in {"ambiguous", "not_found"}:
+            return resolution_status
+    category_resolution = output.get("category_resolution")
+    if isinstance(category_resolution, dict):
+        category_status = category_resolution.get("status")
+        if category_status in {"ambiguous", "not_found"}:
+            return category_status
+    items = output.get("items")
+    if isinstance(items, list):
+        return "data" if items else "empty"
+    return "other"
 
 
 def _build_provider_request(
@@ -1525,7 +1563,19 @@ def _operational_synthesis_fallback(
     provider_identifier: str | None,
     model_identifier: str | None,
 ) -> OwnerChatResult:
-    if isinstance(output, MetricCapabilityResult) and output.status == "unsupported":
+    if isinstance(output, InventoryResult):
+        if output.items:
+            entries = []
+            for item in output.items[:10]:
+                location = item.branch_name or item.warehouse_name
+                entries.append(
+                    f"{item.product.name}: {item.available_quantity} available "
+                    f"at {location}"
+                )
+            reply = "Validated inventory: " + "; ".join(entries) + "."
+        else:
+            reply = "The validated inventory query returned no matching stock rows."
+    elif isinstance(output, MetricCapabilityResult) and output.status == "unsupported":
         missing = ", ".join(
             "cost/COGS" if item == "cost_cogs" else item.replace("_", " ")
             for item in output.missing_inputs
@@ -1980,10 +2030,20 @@ def _run_operational_loop(
                 )
 
         arguments = result.tool_arguments or {}
+        location_source = "none"
         if result.tool_name == "current_inventory":
+            if arguments.get("branch_external_id") or arguments.get(
+                "warehouse_external_id"
+            ):
+                location_source = "explicit"
             arguments, invalidated_preference = _apply_inventory_location_preference(
                 session, executor, user, business_id, arguments
             )
+            if location_source == "none" and (
+                arguments.get("branch_external_id")
+                or arguments.get("warehouse_external_id")
+            ):
+                location_source = "saved"
             if invalidated_preference is not None:
                 synthesis_prepared = _build_operational_synthesis_request(
                     session,
@@ -2052,6 +2112,21 @@ def _run_operational_loop(
             capability,
             capability_status,
         )
+        if isinstance(executed.output, InventoryResult):
+            resolution_status = (
+                executed.output.resolution.status
+                if executed.output.resolution is not None
+                else "none"
+            )
+            inventory_status = _operational_synthesis_status(executed.output)
+            _logger.info(
+                "owner_chat_inventory_result location_source=%s "
+                "product_resolution=%s normalized_rows=%s tool_result=%s",
+                location_source,
+                resolution_status,
+                executed.output.metadata.row_count,
+                inventory_status,
+            )
         tool_result = ProviderToolResult(
             tool_name=executed.tool_name,
             output=executed.output.model_dump(mode="json"),
@@ -2210,6 +2285,7 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
             or result.decision != "final"
             or result.tool_name is not None
             or result.tool_arguments is not None
+            or result.validated_result_status != request.validated_result_status
             or not isinstance(result.reply, str)
             or not 1 <= len(result.reply.strip()) <= 14_000
         ):

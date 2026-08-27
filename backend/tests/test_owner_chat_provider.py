@@ -138,6 +138,7 @@ def operational_synthesis_request() -> OwnerChatRequest:
         operational_request(with_result=True),
         mode="operational_synthesis",
         tools=(),
+        validated_result_status="data",
     )
 
 
@@ -280,6 +281,7 @@ def test_operational_synthesis_is_response_only_and_requires_connected_source(
     structured = {
         "reply": "The validated result is ready.",
         "source_connected": True,
+        "validated_result_status": "data",
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -330,6 +332,7 @@ def test_operational_synthesis_rejects_a_disconnected_source_claim() -> None:
             {
                 "reply": "The source is disconnected.",
                 "source_connected": False,
+                "validated_result_status": "data",
             }
         )
     )

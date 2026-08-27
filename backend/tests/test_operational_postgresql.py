@@ -246,6 +246,28 @@ def test_inventory_stable_branch_id_matches_uppercase_source_type(
     assert result.items[0].available_quantity == Decimal("50")
 
 
+def test_saved_and_explicit_branch_references_return_identical_inventory(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    """A persisted canonical preference compiles like an explicit location filter."""
+
+    saved_preference_filter = InventoryReadQuery(
+        external_product_id="P1004", branch_external_id="BR-JBEIL", limit=5
+    )
+    explicit_filter = InventoryReadQuery(
+        external_product_id="P1004", branch_external_id="BR-JBEIL", limit=5
+    )
+
+    saved = operational_adapter.get_current_inventory(saved_preference_filter)
+    explicit = operational_adapter.get_current_inventory(explicit_filter)
+
+    assert saved.metadata.row_count == explicit.metadata.row_count == 1
+    assert [item.model_dump() for item in saved.items] == [
+        item.model_dump() for item in explicit.items
+    ]
+    assert saved.items[0].available_quantity == Decimal("50")
+
+
 def test_inventory_limit_is_enforced_and_reports_truncation(
     operational_adapter: PostgreSQLOperationalAdapter,
 ) -> None:

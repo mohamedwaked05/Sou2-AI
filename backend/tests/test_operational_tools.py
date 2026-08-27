@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from threading import Event
@@ -1081,7 +1082,15 @@ class SequenceProvider:
 
     def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
         self.requests.append(request)
-        return self.results[len(self.requests) - 1]
+        result = self.results[len(self.requests) - 1]
+        if (
+            request.mode == "operational_synthesis"
+            and result.validated_result_status is None
+        ):
+            return replace(
+                result, validated_result_status=request.validated_result_status
+            )
+        return result
 
 
 class FailingSecondProvider(SequenceProvider):
@@ -1425,8 +1434,7 @@ def test_response_only_synthesis_rejects_a_tool_request_without_replanning(
 
     assert response.status_code == 200, response.text
     assert (
-        "could not safely format"
-        in response.json()["assistant_message"]["content"].lower()
+        "validated inventory" in response.json()["assistant_message"]["content"].lower()
     )
     assert len(provider.requests) == 2
     assert provider.requests[1].mode == "operational_synthesis"
@@ -1485,6 +1493,48 @@ def test_tool_result_uses_response_only_synthesis_without_a_second_plan(
     ]
 
 
+def test_inventory_synthesis_cannot_label_positive_validated_stock_as_empty(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email="synthesis-inventory-state@example.com",
+        name="Synthesis Inventory State Store",
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"limit": 5},
+            ),
+            usage_result(
+                reply="No matching stock is available.",
+                validated_result_status="empty",
+            ),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Inventory quantity request.",
+        "synthesis-inventory-state",
+    )
+
+    assert response.status_code == 200, response.text
+    assert provider.requests[1].mode == "operational_synthesis"
+    assert provider.requests[1].validated_result_status == "data"
+    assert (
+        "validated inventory" in response.json()["assistant_message"]["content"].lower()
+    )
+    assert source.calls == [CURRENT_INVENTORY_TOOL]
+
+
 def test_synthesis_failure_uses_safe_fallback_and_replay_does_no_work(
     api_client: TestClient, db_session: Session, migration_engine: Engine
 ) -> None:
@@ -1522,10 +1572,7 @@ def test_synthesis_failure_uses_safe_fallback_and_replay_does_no_work(
     )
 
     assert first.status_code == 200
-    assert (
-        "could not safely format"
-        in first.json()["assistant_message"]["content"].lower()
-    )
+    assert "validated inventory" in first.json()["assistant_message"]["content"].lower()
     assert replay.status_code == 200
     assert replay.json()["replayed"] is True
     assert len(provider.requests) == 2
