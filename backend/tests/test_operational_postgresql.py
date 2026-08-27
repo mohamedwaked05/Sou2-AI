@@ -231,6 +231,21 @@ def test_inventory_branch_warehouse_isolation_and_literal_filtering(
     assert {item.warehouse_external_id for item in warehouse.items} == {"WH-BEY"}
 
 
+def test_inventory_stable_branch_id_matches_uppercase_source_type(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    result = operational_adapter.get_current_inventory(
+        InventoryReadQuery(
+            external_product_id="P1004", branch_external_id="BR-JBEIL", limit=5
+        )
+    )
+
+    assert len(result.items) == 1
+    assert result.items[0].branch_external_id == "BR-JBEIL"
+    assert result.items[0].warehouse_external_id is None
+    assert result.items[0].available_quantity == Decimal("50")
+
+
 def test_inventory_limit_is_enforced_and_reports_truncation(
     operational_adapter: PostgreSQLOperationalAdapter,
 ) -> None:

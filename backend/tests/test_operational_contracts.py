@@ -9,6 +9,7 @@ from typing import Any, cast
 import pytest
 from app.core.config import Settings
 from app.integrations.operational import (
+    OperationalDataInvalid,
     OperationalDataSource,
     OperationalQueryTimeout,
     OperationalSourceUnavailable,
@@ -69,6 +70,24 @@ def inventory() -> InventoryItem:
     )
 
 
+def _inventory_row(*, location_type: str) -> dict[str, object]:
+    return {
+        "external_product_id": "P-1",
+        "sku": "SKU-1",
+        "barcode": "0001",
+        "product_name": "Fixture product",
+        "category": "Fixture category",
+        "location_code": "LOC-1",
+        "location_label": "Fixture location",
+        "location_type": location_type,
+        "on_hand_quantity": Decimal("7"),
+        "reserved_quantity": Decimal("2"),
+        "available_quantity": Decimal("5"),
+        "reorder_point": Decimal("3"),
+        "target_stock": Decimal("9"),
+    }
+
+
 def test_product_normalizes_external_identifiers_without_source_column_names() -> None:
     normalized = product()
 
@@ -76,6 +95,42 @@ def test_product_normalizes_external_identifiers_without_source_column_names() -
     assert normalized.sku == "RICE-5KG"
     assert normalized.name == "Cedars Long Grain Rice 5 kg"
     assert "item_code" not in Product.model_fields
+
+
+@pytest.mark.parametrize(
+    ("location_type_mapping", "source_location_type", "branch_expected"),
+    [
+        ({"branch": ("BRANCH",), "warehouse": ("WAREHOUSE",)}, "BRANCH", True),
+        ({"branch": ("branch",), "warehouse": ("warehouse",)}, "branch", True),
+        ({"branch": ("BRANCH",), "warehouse": ("WAREHOUSE",)}, "WAREHOUSE", False),
+    ],
+)
+def test_postgresql_adapter_normalizes_connector_location_types(
+    location_type_mapping: dict[str, tuple[str, ...]],
+    source_location_type: str,
+    branch_expected: bool,
+) -> None:
+    adapter = PostgreSQLOperationalAdapter(
+        engine=cast(Engine, object()), location_type_mapping=location_type_mapping
+    )
+    item = adapter._normalize_inventory(
+        _inventory_row(location_type=source_location_type)
+    )
+
+    assert (item.branch_external_id is not None) is branch_expected
+    assert (item.warehouse_external_id is not None) is not branch_expected
+
+
+def test_postgresql_adapter_rejects_unknown_connector_location_types() -> None:
+    adapter = PostgreSQLOperationalAdapter(
+        engine=cast(Engine, object()),
+        location_type_mapping={
+            "branch": ("BRANCH",),
+            "warehouse": ("WAREHOUSE",),
+        },
+    )
+    with pytest.raises(OperationalDataInvalid):
+        adapter._normalize_inventory(_inventory_row(location_type="UNKNOWN"))
 
 
 def test_contracts_reject_blank_product_text_and_unknown_fields() -> None:

@@ -101,14 +101,16 @@ _INVENTORY_SQL = text(
           AND (
               CAST(:branch_code AS text) IS NULL
               OR (
-                  location.location_type = 'BRANCH'
+                  location.location_type = ANY(CAST(:branch_location_types AS text[]))
                   AND location.location_code = :branch_code
               )
           )
           AND (
               CAST(:warehouse_code AS text) IS NULL
               OR (
-                  location.location_type = 'WAREHOUSE'
+                  location.location_type = ANY(
+                      CAST(:warehouse_location_types AS text[])
+                  )
                   AND location.location_code = :warehouse_code
               )
           )
@@ -121,7 +123,10 @@ _INVENTORY_SQL = text(
            AND target_stock > available_quantity
        )
     ORDER BY
-        CASE location_type WHEN 'BRANCH' THEN 0 ELSE 1 END,
+        CASE
+            WHEN location_type = ANY(CAST(:branch_location_types AS text[])) THEN 0
+            ELSE 1
+        END,
         location_code,
         product_name,
         external_product_id
@@ -295,7 +300,7 @@ _CATEGORY_CANDIDATES_SQL = text(
 _LOCATION_RESOLUTION_SQL = text(
     """
     SELECT location_code AS external_location_id, location_label AS label,
-           lower(location_type) AS location_type
+           location_type AS source_location_type
     FROM minimarket.stock_locations
     WHERE lower(regexp_replace(btrim(location_label), '\\s+', ' ', 'g'))
             LIKE :reference ESCAPE '\\'
@@ -308,7 +313,7 @@ _LOCATION_RESOLUTION_SQL = text(
 _LOCATION_CANDIDATES_SQL = text(
     """
     SELECT location_code AS external_location_id, location_label AS label,
-           lower(location_type) AS location_type
+           location_type AS source_location_type
     FROM minimarket.stock_locations
     WHERE btrim(location_label) <> ''
     ORDER BY lower(location_label), location_code
@@ -503,6 +508,7 @@ class PostgreSQLOperationalAdapter:
         query_timeout_seconds: int = 2,
         max_reporting_days: int = 366,
         engine: Engine | None = None,
+        location_type_mapping: Mapping[str, tuple[str, ...]] | None = None,
     ) -> None:
         if query_timeout_seconds < 1 or query_timeout_seconds > 30:
             raise ValueError(
@@ -514,6 +520,19 @@ class PostgreSQLOperationalAdapter:
             )
         self.query_timeout_milliseconds = query_timeout_seconds * 1000
         self.max_reporting_days = max_reporting_days
+        self._source_location_types = self._validated_location_type_mapping(
+            location_type_mapping
+        )
+        self._branch_source_location_types = tuple(
+            source_type
+            for source_type, canonical_type in self._source_location_types.items()
+            if canonical_type == "branch"
+        )
+        self._warehouse_source_location_types = tuple(
+            source_type
+            for source_type, canonical_type in self._source_location_types.items()
+            if canonical_type == "warehouse"
+        )
         if engine is not None:
             self._engine = engine
             return
@@ -677,7 +696,9 @@ class PostgreSQLOperationalAdapter:
                 LocationCandidate(
                     external_location_id=row["external_location_id"],
                     label=row["label"],
-                    location_type=row["location_type"],
+                    location_type=self._canonical_location_type(
+                        row["source_location_type"]
+                    ),
                 )
                 for row in rows[: query.candidate_limit]
             )
@@ -716,7 +737,9 @@ class PostgreSQLOperationalAdapter:
                     LocationCandidate(
                         external_location_id=row["external_location_id"],
                         label=row["label"],
-                        location_type=row["location_type"],
+                        location_type=self._canonical_location_type(
+                            row["source_location_type"]
+                        ),
                     )
                     for row in rows
                 )
@@ -929,6 +952,10 @@ class PostgreSQLOperationalAdapter:
                     "category_filter": query.category_filter,
                     "branch_code": query.branch_external_id,
                     "warehouse_code": query.warehouse_external_id,
+                    "branch_location_types": list(self._branch_source_location_types),
+                    "warehouse_location_types": list(
+                        self._warehouse_source_location_types
+                    ),
                     "restock_only": restock_only,
                     "row_limit": query.limit + 1,
                 },
@@ -1000,11 +1027,10 @@ class PostgreSQLOperationalAdapter:
             metadata=metadata,
         )
 
-    @classmethod
-    def _normalize_inventory(cls, row: Mapping[str, Any]) -> InventoryItem:
-        is_branch = row["location_type"] == "BRANCH"
+    def _normalize_inventory(self, row: Mapping[str, Any]) -> InventoryItem:
+        is_branch = self._canonical_location_type(row["location_type"]) == "branch"
         return InventoryItem(
-            product=cls._normalize_product(row),
+            product=self._normalize_product(row),
             branch_external_id=row["location_code"] if is_branch else None,
             branch_name=row["location_label"] if is_branch else None,
             warehouse_external_id=row["location_code"] if not is_branch else None,
@@ -1015,6 +1041,36 @@ class PostgreSQLOperationalAdapter:
             reorder_point=row["reorder_point"],
             target_stock=row["target_stock"],
         )
+
+    @staticmethod
+    def _validated_location_type_mapping(
+        mapping: Mapping[str, tuple[str, ...]] | None,
+    ) -> dict[str, str]:
+        if mapping is None:
+            from app.integrations.profiles import FAKE_STORE_MAPPING
+
+            mapping = FAKE_STORE_MAPPING.source_location_types
+        if set(mapping) != {"branch", "warehouse"}:
+            raise ValueError("Location type mapping is incomplete.")
+        normalized: dict[str, str] = {}
+        for canonical_type, source_types in mapping.items():
+            if not source_types:
+                raise ValueError("Location type mapping is incomplete.")
+            for source_type in source_types:
+                if not isinstance(source_type, str) or not source_type.strip():
+                    raise ValueError("Location type mapping is invalid.")
+                if source_type in normalized:
+                    raise ValueError("Location type mapping conflicts.")
+                normalized[source_type] = canonical_type
+        return normalized
+
+    def _canonical_location_type(self, source_type: object) -> str:
+        if not isinstance(source_type, str):
+            raise OperationalDataInvalid("Operational source data is invalid.")
+        canonical_type = self._source_location_types.get(source_type)
+        if canonical_type is None:
+            raise OperationalDataInvalid("Operational source data is invalid.")
+        return canonical_type
 
     @staticmethod
     def _escaped_search(value: str | None) -> str | None:
@@ -1072,13 +1128,18 @@ class PostgreSQLOperationalAdapter:
         )
 
 
-def create_fake_store_adapter(settings: Settings) -> PostgreSQLOperationalAdapter:
+def create_fake_store_adapter(
+    settings: Settings,
+    *,
+    location_type_mapping: Mapping[str, tuple[str, ...]] | None = None,
+) -> PostgreSQLOperationalAdapter:
     """Build the configured adapter without exposing its secret connection URL."""
     return PostgreSQLOperationalAdapter(
         settings.fake_store_database_url,
         connect_timeout_seconds=settings.postgresql_connect_timeout_seconds,
         query_timeout_seconds=settings.operational_query_timeout_seconds,
         max_reporting_days=settings.operational_max_reporting_days,
+        location_type_mapping=location_type_mapping,
     )
 
 
