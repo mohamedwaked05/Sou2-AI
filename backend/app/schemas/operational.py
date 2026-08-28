@@ -341,6 +341,7 @@ class RestockingRecommendationsResult(OperationalContract):
     items: tuple[RestockingRecommendation, ...]
     metadata: OperationalResultMetadata
     resolution: ProductResolution | None = None
+    category_resolution: CategoryResolution | None = None
 
 
 class IntegrationHealth(OperationalContract):

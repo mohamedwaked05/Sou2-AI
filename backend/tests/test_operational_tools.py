@@ -121,6 +121,7 @@ class StubSource:
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.resolution_references: list[str] = []
+        self.category_references: list[str] = []
         self.last_inventory_query: Any | None = None
         self.last_restocking_query: Any | None = None
         self.error: Exception | None = None
@@ -152,6 +153,13 @@ class StubSource:
             product=inventory_item().product,
             metadata=metadata(),
         )
+        self.category_resolution = CategoryResolution(
+            status="resolved",
+            category=CategoryCandidate(
+                external_category_id="category-1", label="Pantry"
+            ),
+            metadata=metadata(),
+        )
 
     @property
     def enforced_query_timeout_seconds(self) -> int:
@@ -162,13 +170,8 @@ class StubSource:
         return self.resolution
 
     def resolve_category(self, query: object) -> CategoryResolution:
-        return CategoryResolution(
-            status="resolved",
-            category=CategoryCandidate(
-                external_category_id="category-1", label="Pantry"
-            ),
-            metadata=metadata(),
-        )
+        self.category_references.append(cast(Any, query).reference)
+        return self.category_resolution
 
     def list_categories(self, *, limit: int) -> tuple[CategoryCandidate, ...]:
         return self.categories[:limit]
@@ -507,21 +510,262 @@ def test_product_scoped_tools_resolve_then_query_the_stable_external_id(
     assert not hasattr(read_query, "product_filter")
 
 
-def test_category_scoped_inventory_resolves_before_read_query(
-    api_client: TestClient, db_session: Session
+@pytest.mark.parametrize(
+    "tool_name", [CURRENT_INVENTORY_TOOL, RESTOCKING_RECOMMENDATIONS_TOOL]
+)
+def test_category_scoped_tools_resolve_before_read_query(
+    api_client: TestClient, db_session: Session, tool_name: str
 ) -> None:
     user, business, registry, executor = executor_setup(api_client, db_session)
 
     result = executor.execute(
         user=user,
         business_id=business.id,
+        tool_name=tool_name,
+        arguments={"category_filter": "pan", "limit": 5},
+    )
+
+    assert cast(Any, result.output).category_resolution.status == "resolved"
+    read_query = (
+        registry.source.last_inventory_query
+        if tool_name == CURRENT_INVENTORY_TOOL
+        else registry.source.last_restocking_query
+    )
+    assert read_query.category_filter == "Pantry"
+    assert registry.source.category_references == ["pan"]
+    assert registry.source.resolution_references == []
+
+
+@pytest.mark.parametrize(
+    "tool_name", [CURRENT_INVENTORY_TOOL, RESTOCKING_RECOMMENDATIONS_TOOL]
+)
+def test_unknown_category_short_circuits_category_scoped_tools(
+    api_client: TestClient, db_session: Session, tool_name: str
+) -> None:
+    user, business, registry, executor = executor_setup(api_client, db_session)
+    registry.source.category_resolution = CategoryResolution(
+        status="not_found", metadata=metadata(rows=0)
+    )
+
+    result = executor.execute(
+        user=user,
+        business_id=business.id,
+        tool_name=tool_name,
+        arguments={"category_filter": "unmatched category", "limit": 5},
+    )
+
+    assert cast(Any, result.output).category_resolution.status == "not_found"
+    assert registry.source.category_references == ["unmatched category"]
+    assert registry.source.calls == []
+
+
+def test_unknown_category_reaches_inventory_resolution_without_source_fallback(
+    api_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"unknown-category-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.category_resolution = CategoryResolution(
+        status="not_found", metadata=metadata(rows=0)
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"category_filter": "Electronics", "limit": 5},
+            ),
+            usage_result(reply="I could not find a matching live catalogue category."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+    diagnostic_messages: list[str] = []
+    monkeypatch.setattr(
+        owner_chat._logger,
+        "info",
+        lambda message, *args: diagnostic_messages.append(message % args),
+    )
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "what electronics do we have?",
+        f"unknown-category-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert (
+        "matching live catalogue category"
+        in response.json()["assistant_message"]["content"]
+    )
+    assert (
+        "can't access live operational data"
+        not in response.json()["assistant_message"]["content"]
+    )
+    assert source.category_references == ["Electronics"]
+    assert source.calls == []
+    assert len(provider.requests) == 2
+    assert provider.requests[1].mode == "operational_synthesis"
+    supplied = provider.requests[1].tool_results[0].output
+    assert supplied["category_resolution"]["status"] == "not_found"
+    assert provider.requests[1].validated_result_status == "not_found"
+    assert any(
+        "category_input_kind=query" in message for message in diagnostic_messages
+    )
+    assert any(
+        "category_resolution=zero" in message and "tool_result=not_found" in message
+        for message in diagnostic_messages
+    )
+    assert all(
+        "electronics" not in message.casefold() for message in diagnostic_messages
+    )
+
+
+def test_category_reference_is_resolved_and_never_trusted_as_a_source_identifier(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business, registry, executor = executor_setup(api_client, db_session)
+    registry.source.category_resolution = CategoryResolution(
+        status="not_found", metadata=metadata(rows=0)
+    )
+
+    result = executor.execute(
+        user=user,
+        business_id=business.id,
         tool_name=CURRENT_INVENTORY_TOOL,
-        arguments={"category_filter": "Pantry", "limit": 5},
+        arguments={"category_filter": "category-1", "limit": 5},
     )
 
     assert isinstance(result.output, InventoryResult)
-    assert registry.source.last_inventory_query.category_filter == "Pantry"
-    assert registry.source.resolution_references == []
+    assert result.output.category_resolution is not None
+    assert result.output.category_resolution.status == "not_found"
+    assert registry.source.category_references == ["category-1"]
+    assert registry.source.last_inventory_query is None
+    assert registry.source.calls == []
+
+
+def test_multiple_categories_return_source_derived_clarification(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"ambiguous-category-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.category_resolution = CategoryResolution(
+        status="ambiguous",
+        candidates=(
+            CategoryCandidate(external_category_id="category-2", label="Group One"),
+            CategoryCandidate(external_category_id="category-3", label="Group Two"),
+        ),
+        metadata=metadata(rows=2),
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"category_filter": "group", "limit": 5},
+            )
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "show me this group",
+        f"ambiguous-category-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    content = response.json()["assistant_message"]["content"]
+    assert "Group One" in content
+    assert "Group Two" in content
+    assert source.calls == []
+    assert len(provider.requests) == 1
+
+
+def test_bounded_category_candidates_do_not_block_unresolved_source_lookup(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"bounded-category-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.categories = tuple(
+        CategoryCandidate(
+            external_category_id=f"category-{index}", label=f"Group {index}"
+        )
+        for index in range(60)
+    )
+    source.category_resolution = CategoryResolution(
+        status="not_found", metadata=metadata(rows=0)
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={
+                    "category_filter": "outside candidate page",
+                    "limit": 5,
+                },
+            ),
+            usage_result(reply="No matching category was found."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "show an unavailable category",
+        f"bounded-category-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(provider.requests[0].category_candidates) == 50
+    assert source.category_references == ["outside candidate page"]
+    assert provider.requests[1].validated_result_status == "not_found"
+
+
+def test_final_without_tool_keeps_active_source_fallback_truthful(
+    api_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"planner-final-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    provider = SequenceProvider([usage_result(reply="No tool is needed.")])
+    configure_operational_chat(db_session, business["id"], source, provider)
+    diagnostic_messages: list[str] = []
+    monkeypatch.setattr(
+        owner_chat._logger,
+        "info",
+        lambda message, *args: diagnostic_messages.append(message % args),
+    )
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Please provide a live operational answer.",
+        f"planner-final-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    content = response.json()["assistant_message"]["content"]
+    assert "live operational source is available" in content
+    assert "can't access live operational data" not in content
+    assert source.calls == []
+    assert any(
+        "fallback_reason=provider_final_without_tool_active_source" in message
+        for message in diagnostic_messages
+    )
 
 
 def test_operational_planner_receives_bounded_source_categories(

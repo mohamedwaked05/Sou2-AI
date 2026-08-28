@@ -61,7 +61,11 @@ from app.database.models import (
 from app.integrations.profiles import ConnectionProfileRegistry
 from app.rag.embeddings import create_embedding_provider
 from app.rag.retrieval import retrieve
-from app.schemas.operational import InventoryResult, MetricCapabilityResult
+from app.schemas.operational import (
+    InventoryResult,
+    MetricCapabilityResult,
+    RestockingRecommendationsResult,
+)
 from app.schemas.owner_chat import (
     ChatMessageResponse,
     ConversationHistoryResponse,
@@ -974,6 +978,15 @@ def _operational_synthesis_status(output: object) -> str:
         ):
             return output.category_resolution.status
         return "data" if output.items else "empty"
+    if isinstance(output, RestockingRecommendationsResult):
+        if output.resolution is not None and output.resolution.status != "resolved":
+            return output.resolution.status
+        if (
+            output.category_resolution is not None
+            and output.category_resolution.status != "resolved"
+        ):
+            return output.category_resolution.status
+        return "data" if output.items else "empty"
     if not isinstance(output, dict):
         return "other"
     if output.get("capability") == "inventory_location_preference":
@@ -1616,6 +1629,15 @@ def _operational_synthesis_fallback(
             reply = "I will no longer use a default location for inventory questions."
         else:
             reply = "I could not save that inventory location preference."
+    elif (
+        isinstance(output, dict)
+        and output.get("capability") == "operational_planning"
+        and output.get("source_connected") is True
+    ):
+        reply = (
+            "The live operational source is available, but I could not determine "
+            "a safe lookup to run. Please clarify your request."
+        )
     else:
         reply = (
             "The requested operational lookup completed, but I could not safely "
@@ -2120,20 +2142,22 @@ def _run_operational_loop(
             if not tool_results:
                 _logger.info(
                     "owner_chat_operational_dispatch outcome=final_without_tool "
-                    "fallback_reason=provider_final_without_tool "
+                    "fallback_reason=provider_final_without_tool_active_source "
                     "final_synthesis_path=deterministic"
                 )
-                unavailable = OwnerChatResult(
-                    reply=_live_operational_reply(
-                        request.messages[-1].content,
-                        prepared.business.default_language,
+                return (
+                    _operational_synthesis_fallback(
+                        {
+                            "capability": "operational_planning",
+                            "source_connected": True,
+                            "status": "invalid_final_without_tool",
+                        },
+                        aggregate_usage,
+                        result.provider_identifier,
+                        result.model_identifier,
                     ),
-                    usage=aggregate_usage,
-                    provider_identifier=result.provider_identifier,
-                    model_identifier=result.model_identifier,
-                    decision="unavailable",
+                    aggregate_usage,
                 )
-                return unavailable, aggregate_usage
             return _operational_result_with_usage(
                 result, aggregate_usage
             ), aggregate_usage
@@ -2213,9 +2237,15 @@ def _run_operational_loop(
         location_resolution = "zero"
         if result.tool_name == "current_inventory":
             product_filter = arguments.get("product_filter")
+            category_filter = arguments.get("category_filter")
             product_input_kind = (
                 "query"
                 if isinstance(product_filter, str) and product_filter
+                else "none"
+            )
+            category_input_kind = (
+                "query"
+                if isinstance(category_filter, str) and category_filter
                 else "none"
             )
             product_query_token_count = (
@@ -2223,11 +2253,19 @@ def _run_operational_loop(
                 if product_input_kind == "query"
                 else 0
             )
+            category_query_token_count = (
+                len(re.findall(r"[^\W_]+", category_filter, flags=re.UNICODE))
+                if category_input_kind == "query"
+                else 0
+            )
             _logger.info(
                 "owner_chat_inventory_plan product_input_kind=%s "
-                "product_query_token_count=%s",
+                "product_query_token_count=%s category_input_kind=%s "
+                "category_query_token_count=%s",
                 product_input_kind,
                 product_query_token_count,
+                category_input_kind,
+                category_query_token_count,
             )
             try:
                 location_preparation = _prepare_inventory_location_arguments(
@@ -2332,11 +2370,17 @@ def _run_operational_loop(
                 else "none"
             )
             inventory_status = _operational_synthesis_status(executed.output)
+            category_resolution_status = (
+                executed.output.category_resolution.status
+                if executed.output.category_resolution is not None
+                else "none"
+            )
             _logger.info(
                 "owner_chat_inventory_result location_source=%s "
                 "location_input_kind=%s preference_loaded=%s "
                 "preference_applied=%s location_resolution=%s "
-                "product_resolution=%s normalized_rows=%s tool_result=%s",
+                "product_resolution=%s category_resolution=%s "
+                "normalized_rows=%s tool_result=%s",
                 location_source,
                 location_input_kind,
                 preference_loaded,
@@ -2345,6 +2389,9 @@ def _run_operational_loop(
                 _location_resolution_outcome(resolution_status)
                 if resolution_status != "none"
                 else "zero",
+                _location_resolution_outcome(category_resolution_status)
+                if category_resolution_status != "none"
+                else "none",
                 executed.output.metadata.row_count,
                 inventory_status,
             )

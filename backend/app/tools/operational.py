@@ -191,7 +191,12 @@ def _inventory(source: OperationalDataSource, query: BaseModel) -> BaseModel:
             if resolution is not None and resolution.product is not None
             else None
         ),
-        category_filter=query.category_filter,
+        category_filter=(
+            category_resolution.category.label
+            if category_resolution is not None
+            and category_resolution.category is not None
+            else None
+        ),
         branch_external_id=query.branch_external_id,
         warehouse_external_id=query.warehouse_external_id,
         limit=query.limit,
@@ -254,7 +259,10 @@ def _restocking(source: OperationalDataSource, query: BaseModel) -> BaseModel:
     category_resolution = _resolve_category_filter(source, query.category_filter)
     if category_resolution is not None and category_resolution.status != "resolved":
         return RestockingRecommendationsResult(
-            items=(), metadata=category_resolution.metadata, resolution=resolution
+            items=(),
+            metadata=category_resolution.metadata,
+            resolution=resolution,
+            category_resolution=category_resolution,
         )
     read_query = RestockingReadQuery(
         external_product_id=(
@@ -262,13 +270,23 @@ def _restocking(source: OperationalDataSource, query: BaseModel) -> BaseModel:
             if resolution is not None and resolution.product is not None
             else None
         ),
-        category_filter=query.category_filter,
+        category_filter=(
+            category_resolution.category.label
+            if category_resolution is not None
+            and category_resolution.category is not None
+            else None
+        ),
         branch_external_id=query.branch_external_id,
         warehouse_external_id=query.warehouse_external_id,
         limit=query.limit,
     )
     result = source.get_restocking_recommendations(read_query)
-    return result.model_copy(update={"resolution": resolution})
+    return result.model_copy(
+        update={
+            "resolution": resolution,
+            "category_resolution": category_resolution,
+        }
+    )
 
 
 def _resolve_product_filter(

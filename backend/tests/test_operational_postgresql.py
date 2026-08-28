@@ -321,6 +321,19 @@ def test_category_resolution_reports_ambiguous_source_matches(
     assert len(resolution.candidates) >= 2
 
 
+def test_category_resolution_reports_not_found_for_an_unknown_source_concept(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    resolution = operational_adapter.resolve_category(
+        ProductResolutionQuery(reference="No matching catalogue category")
+    )
+
+    assert resolution.status == "not_found"
+    assert resolution.category is None
+    assert resolution.candidates == ()
+    assert resolution.metadata.row_count == 0
+
+
 def test_location_resolution_uses_bounded_source_labels_and_codes(
     operational_adapter: PostgreSQLOperationalAdapter,
 ) -> None:
