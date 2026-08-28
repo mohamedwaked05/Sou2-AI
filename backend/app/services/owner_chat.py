@@ -94,7 +94,10 @@ from app.tools.operational import (
 _logger = logging.getLogger(__name__)
 
 CHAT_CONTEXT_MESSAGE_LIMIT = 12
-MAX_OPERATIONAL_PROVIDER_CALLS = 2
+# A category inventory turn may need a planner, bounded semantic resolver, and
+# response-only synthesis. Reserve for the complete bounded path up front.
+MAX_OPERATIONAL_PROVIDER_CALLS = 3
+CATEGORY_RESOLUTION_MAX_OUTPUT_TOKENS = 64
 HISTORY_PAGE_SIZE = 50
 ABANDONED_TURN_RECOVERY_BATCH_SIZE = 100
 HIGH_CONFIDENCE_EVIDENCE_SIMILARITY = 0.65
@@ -965,6 +968,26 @@ def _build_operational_synthesis_request(
     return _PreparedTurn(request=request, business=business, has_usable_evidence=True)
 
 
+def _build_category_resolution_request(
+    request: OwnerChatRequest, category_query: str
+) -> OwnerChatRequest:
+    """Create an isolated, compact request for bounded category matching."""
+
+    return replace(
+        request,
+        messages=(ProviderMessage(role="owner", content=category_query),),
+        rolling_summary=None,
+        max_output_tokens=min(
+            request.max_output_tokens, CATEGORY_RESOLUTION_MAX_OUTPUT_TOKENS
+        ),
+        mode="category_resolution",
+        tools=(),
+        tool_results=(),
+        location_candidates=(),
+        pending_product_candidates=(),
+    )
+
+
 def _operational_synthesis_status(output: object) -> str:
     """Classify backend-validated tool output for response-only verification."""
 
@@ -1538,16 +1561,27 @@ def _usage_for_result(
 ) -> TokenUsage:
     if result.usage is not None:
         return result.usage
-    output = (
-        result.reply
-        if result.decision != "tool"
-        else json.dumps(
-            {"tool_name": result.tool_name, "arguments": result.tool_arguments},
+    if request.mode == "category_resolution":
+        output = json.dumps(
+            {
+                "status": result.category_resolution_status,
+                "candidate_references": result.category_candidate_references,
+            },
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         )
-    )
+    else:
+        output = (
+            result.reply
+            if result.decision != "tool"
+            else json.dumps(
+                {"tool_name": result.tool_name, "arguments": result.tool_arguments},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
     input_tokens = provider.estimate_input_tokens(request)
     output_tokens = estimate_utf8_tokens(output)
     return TokenUsage(
@@ -1571,6 +1605,7 @@ def _planned_metric(arguments: object) -> str | None:
 
 def _consistent_operational_plan(
     result: OwnerChatResult,
+    category_candidates: tuple[ProviderCategoryCandidate, ...],
 ) -> tuple[OwnerChatResult, str]:
     """Derive inventory execution from validated semantic intent, not tool choice."""
 
@@ -1585,7 +1620,21 @@ def _consistent_operational_plan(
     if result.semantic_operation == "inventory_product":
         arguments["product_filter"] = result.entity_query
     elif result.semantic_operation == "inventory_category":
-        arguments["category_filter"] = result.entity_query
+        candidate = next(
+            (
+                item
+                for item in category_candidates
+                if item.external_category_id == result.category_candidate_reference
+            ),
+            None,
+        )
+        if result.category_candidate_reference is not None and candidate is None:
+            raise OwnerChatProviderInvalidResponse(
+                reason="invalid_category_candidate_reference"
+            )
+        arguments["category_filter"] = (
+            candidate.label if candidate is not None else result.entity_query
+        )
     if (
         result.tool_name == CURRENT_INVENTORY_TOOL
         and isinstance(result.tool_arguments, dict)
@@ -1633,7 +1682,12 @@ def _operational_synthesis_fallback(
     model_identifier: str | None,
 ) -> OwnerChatResult:
     if isinstance(output, InventoryResult):
-        if output.items:
+        if (
+            output.category_resolution is not None
+            and output.category_resolution.status == "not_found"
+        ):
+            reply = "The requested category was not found in the current catalogue."
+        elif output.items:
             entries = []
             for item in output.items[:10]:
                 location = item.branch_name or item.warehouse_name
@@ -1641,9 +1695,9 @@ def _operational_synthesis_fallback(
                     f"{item.product.name}: {item.available_quantity} available "
                     f"at {location}"
                 )
-            reply = "Validated inventory: " + "; ".join(entries) + "."
+            reply = "Current inventory: " + "; ".join(entries) + "."
         else:
-            reply = "The validated inventory query returned no matching stock rows."
+            reply = "No matching stock is currently available."
     elif isinstance(output, MetricCapabilityResult) and output.status == "unsupported":
         missing = ", ".join(
             "cost/COGS" if item == "cost_cogs" else item.replace("_", " ")
@@ -1786,6 +1840,9 @@ def _prepare_inventory_location_arguments(
         )
     source = executor._active_source(business_id)
     if source is None:
+        _logger.info(
+            "owner_chat_inventory_preference preference_lookup=source_mismatch"
+        )
         return _InventoryLocationPreparation(
             arguments=updated,
             result=None,
@@ -1804,6 +1861,7 @@ def _prepare_inventory_location_arguments(
         )
     )
     if preference is None:
+        _logger.info("owner_chat_inventory_preference preference_lookup=not_found")
         return _InventoryLocationPreparation(
             arguments=updated,
             result=None,
@@ -1818,6 +1876,9 @@ def _prepare_inventory_location_arguments(
             user, business_id, preference.location_external_id
         )
     except ToolExecutionError:
+        _logger.info(
+            "owner_chat_inventory_preference preference_lookup=invalid_reference"
+        )
         return _InventoryLocationPreparation(
             arguments=updated,
             result=None,
@@ -1833,6 +1894,9 @@ def _prepare_inventory_location_arguments(
         or resolution.location.external_location_id != preference.location_external_id
         or resolution.location.location_type != preference.location_type
     ):
+        _logger.info(
+            "owner_chat_inventory_preference preference_lookup=invalid_reference"
+        )
         session.delete(preference)
         session.commit()
         return _InventoryLocationPreparation(
@@ -1855,6 +1919,7 @@ def _prepare_inventory_location_arguments(
         if preference.location_type == "branch"
         else "warehouse_external_id"
     ] = preference.location_external_id
+    _logger.info("owner_chat_inventory_preference preference_lookup=found")
     return _InventoryLocationPreparation(
         arguments=updated,
         result=None,
@@ -2035,6 +2100,49 @@ def _category_resolution_reply(
     return replies[language]
 
 
+def _bounded_category_resolution_reply(
+    candidate_references: tuple[str, ...],
+    category_candidates: tuple[ProviderCategoryCandidate, ...],
+    message: str,
+    default_language: str,
+) -> str | None:
+    labels = tuple(
+        candidate.label
+        for candidate in category_candidates
+        if candidate.external_category_id in candidate_references
+    )
+    if len(labels) < 2:
+        return None
+    candidate_text = "; ".join(labels[:5])
+    language = _fallback_language(message, default_language)
+    replies = {
+        "english": (
+            f"I found several matching categories: {candidate_text}. "
+            "Which one do you mean?"
+        ),
+        "arabic": f"وجدت عدة فئات مطابقة: {candidate_text}. أي فئة تقصد؟",
+        "lebanese_arabic": f"لقيت أكتر من فئة مطابقة: {candidate_text}. أي فئة قصدك؟",
+        "franco_arabic": (
+            f"La2et aktar men category: {candidate_text}. Ayya wa7de 2asdak?"
+        ),
+        "mixed": f"I found أكتر من category: {candidate_text}. Which one do you mean?",
+    }
+    return replies[language]
+
+
+def _exact_category_candidate_reference(
+    category_query: str,
+    category_candidates: tuple[ProviderCategoryCandidate, ...],
+) -> str | None:
+    normalized_query = category_query.strip().casefold()
+    matches = tuple(
+        candidate.external_category_id
+        for candidate in category_candidates
+        if candidate.label.strip().casefold() == normalized_query
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
 def _pending_product_candidates(
     session: Session,
     executor: OperationalToolExecutor,
@@ -2132,7 +2240,13 @@ def _run_operational_loop(
                 )
             raise
         original_action = result.decision
-        result, consistency_outcome = _consistent_operational_plan(result)
+        # Only the dedicated resolver may supply an executable category reference.
+        # A planner-provided reference is untrusted until it is revalidated against
+        # the exact bounded candidates in a separate compact request.
+        result = replace(result, category_candidate_reference=None)
+        result, consistency_outcome = _consistent_operational_plan(
+            result, request.category_candidates
+        )
         _logger.info(
             "owner_chat_operational_plan semantic_operation=%s entity_kind=%s "
             "original_action=%s effective_action=%s consistency_outcome=%s "
@@ -2153,6 +2267,111 @@ def _run_operational_loop(
                 model_identifier=result.model_identifier,
             )
         aggregate_usage = _add_usage(aggregate_usage, call_usage)
+
+        if (
+            result.semantic_operation == "inventory_category"
+            and result.entity_query is not None
+            and request.category_candidates
+        ):
+            exact_reference = _exact_category_candidate_reference(
+                result.entity_query, request.category_candidates
+            )
+            if exact_reference is not None:
+                result = replace(result, category_candidate_reference=exact_reference)
+                result, redispatch_outcome = _consistent_operational_plan(
+                    result, request.category_candidates
+                )
+                _logger.info(
+                    "owner_chat_category_resolution outcome=exact redispatch=%s",
+                    redispatch_outcome,
+                )
+            else:
+                category_request = _build_category_resolution_request(
+                    request, result.entity_query
+                )
+                try:
+                    category_result = _validate_result(
+                        provider.generate(category_request), category_request
+                    )
+                except OwnerChatProviderError as exc:
+                    failure_usage = exc.usage
+                    if failure_usage is None and exc.usage_uncertain:
+                        estimated_input = provider.estimate_input_tokens(
+                            category_request
+                        )
+                        failure_usage = TokenUsage(
+                            input_tokens=estimated_input,
+                            output_tokens=category_request.max_output_tokens,
+                            total_tokens=(
+                                estimated_input + category_request.max_output_tokens
+                            ),
+                            authoritative=False,
+                        )
+                    if failure_usage is not None:
+                        aggregate_usage = _add_usage(aggregate_usage, failure_usage)
+                    _logger.info(
+                        "owner_chat_category_resolution outcome=provider_failure "
+                        "failure_reason=%s fallback=source_lookup",
+                        exc.reason or "unknown",
+                    )
+                else:
+                    category_usage = _usage_for_result(
+                        provider, category_request, category_result
+                    )
+                    if (
+                        category_usage.output_tokens
+                        > category_request.max_output_tokens
+                    ):
+                        aggregate_usage = _add_usage(aggregate_usage, category_usage)
+                        _logger.info(
+                            "owner_chat_category_resolution outcome=invalid "
+                            "failure_reason=output_token_limit fallback=source_lookup"
+                        )
+                    else:
+                        aggregate_usage = _add_usage(aggregate_usage, category_usage)
+                        _logger.info(
+                            "owner_chat_category_resolution outcome=%s "
+                            "candidate_count=%s",
+                            category_result.category_resolution_status,
+                            len(category_result.category_candidate_references),
+                        )
+                        if category_result.category_resolution_status == "matched":
+                            result = replace(
+                                result,
+                                category_candidate_reference=(
+                                    category_result.category_candidate_references[0]
+                                ),
+                            )
+                            result, redispatch_outcome = _consistent_operational_plan(
+                                result, request.category_candidates
+                            )
+                            _logger.info(
+                                "owner_chat_category_resolution outcome=matched "
+                                "redispatch=%s",
+                                redispatch_outcome,
+                            )
+                        elif category_result.category_resolution_status == "ambiguous":
+                            reply = _bounded_category_resolution_reply(
+                                category_result.category_candidate_references,
+                                request.category_candidates,
+                                request.messages[-1].content,
+                                prepared.business.default_language,
+                            )
+                            if reply is None:
+                                raise OwnerChatProviderInvalidResponse(
+                                    reason="invalid_category_resolution_references"
+                                )
+                            return (
+                                OwnerChatResult(
+                                    reply=reply,
+                                    usage=aggregate_usage,
+                                    provider_identifier=(
+                                        category_result.provider_identifier
+                                    ),
+                                    model_identifier=category_result.model_identifier,
+                                ),
+                                aggregate_usage,
+                            )
 
         resolution_reply = _product_resolution_reply(
             tool_results,
@@ -2503,7 +2722,9 @@ def _run_operational_loop(
             assert aggregate_usage is not None
             _logger.info(
                 "owner_chat_operational_synthesis outcome=provider_failure "
-                "schema=response_only fallback_reason=provider_failure"
+                "failure_reason=%s schema=response_only "
+                "fallback_reason=provider_failure",
+                exc.reason or "unknown",
             )
             return (
                 _operational_synthesis_fallback(
@@ -2630,6 +2851,41 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
             )
         if _is_unsafe_reply(result.reply):
             raise OwnerChatProviderInvalidResponse(reason="unsafe_output")
+    elif request.mode == "category_resolution":
+        candidate_references = {
+            candidate.external_category_id for candidate in request.category_candidates
+        }
+        result_references = result.category_candidate_references
+        status = result.category_resolution_status
+        if (
+            result.reply
+            or result.proposed_knowledge
+            or result.cited_source_ids
+            or result.requires_business_knowledge
+            or result.decision != "final"
+            or result.tool_name is not None
+            or result.tool_arguments is not None
+            or result.preference_key is not None
+            or result.location_reference is not None
+            or result.semantic_operation is not None
+            or result.entity_kind is not None
+            or result.entity_query is not None
+            or result.category_candidate_reference is not None
+            or result.validated_result_status is not None
+            or status not in {"matched", "ambiguous", "no_match"}
+            or not isinstance(result_references, tuple)
+            or any(
+                not isinstance(reference, str) or reference not in candidate_references
+                for reference in result_references
+            )
+            or len(set(result_references)) != len(result_references)
+            or (status == "matched" and len(result_references) != 1)
+            or (status == "ambiguous" and len(result_references) < 2)
+            or (status == "no_match" and result_references)
+        ):
+            raise OwnerChatProviderInvalidResponse(
+                reason="invalid_category_resolution_response"
+            )
     else:
         if (
             not isinstance(result.reply, str)

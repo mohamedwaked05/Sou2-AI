@@ -641,6 +641,7 @@ def test_inventory_category_semantics_normalize_a_provider_final_to_inventory(
                 entity_kind="category",
                 entity_query="unresolved future category",
             ),
+            usage_result(category_resolution_status="no_match"),
             usage_result(reply="No matching category was found."),
         ]
     )
@@ -663,9 +664,10 @@ def test_inventory_category_semantics_normalize_a_provider_final_to_inventory(
     assert response.status_code == 200, response.text
     assert source.category_references == ["unresolved future category"]
     assert source.calls == []
-    assert len(provider.requests) == 2
+    assert len(provider.requests) == 3
     assert provider.requests[0].mode == "operational"
-    assert provider.requests[1].mode == "operational_synthesis"
+    assert provider.requests[1].mode == "category_resolution"
+    assert provider.requests[2].mode == "operational_synthesis"
     assert any(
         "semantic_operation=inventory_category" in message
         and "entity_kind=category" in message
@@ -864,6 +866,277 @@ def test_operational_planner_receives_bounded_source_categories(
         "Pantry",
     ]
     assert provider.requests[0].rolling_summary is None
+
+
+def test_category_semantic_match_redispatches_inventory_with_source_label(
+    api_client: TestClient, db_session: Session, migration_engine: Engine
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"semantic-drinks-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.categories = (
+        CategoryCandidate(external_category_id="category-7", label="Beverages"),
+        CategoryCandidate(external_category_id="category-8", label="Pantry"),
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                reply="Planning category inventory.",
+                semantic_operation="inventory_category",
+                entity_kind="category",
+                entity_query="drinks",
+            ),
+            usage_result(
+                category_resolution_status="matched",
+                category_candidate_references=("category-7",),
+            ),
+            usage_result(reply="The current beverages inventory is available."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "what drinks do we have?",
+        f"semantic-drinks-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.category_references == ["Beverages"]
+    assert source.calls == [CURRENT_INVENTORY_TOOL]
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "category_resolution",
+        "operational_synthesis",
+    ]
+    assert provider.requests[1].messages[-1].content == "drinks"
+    assert provider.requests[1].max_output_tokens == 64
+    assert provider.requests[1].tools == ()
+    with migration_engine.connect() as connection:
+        reservation = connection.execute(
+            text(
+                "SELECT input_tokens, output_tokens, total_tokens "
+                "FROM ai_usage_reservations"
+            )
+        ).one()
+    assert tuple(reservation) == (30, 6, 36)
+    with migration_engine.connect() as connection:
+        daily_usage = connection.execute(
+            text(
+                "SELECT input_tokens_used, output_tokens_used, total_tokens_used "
+                "FROM business_ai_usage_daily"
+            )
+        ).one()
+    assert tuple(daily_usage) == (30, 6, 36)
+
+
+def test_exact_category_label_bypasses_semantic_resolver_and_releases_reserve(
+    api_client: TestClient, db_session: Session, migration_engine: Engine
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"exact-category-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.categories = (
+        CategoryCandidate(external_category_id="category-7", label="Beverages"),
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                reply="Planning category inventory.",
+                semantic_operation="inventory_category",
+                entity_kind="category",
+                entity_query="beverages",
+            ),
+            usage_result(reply="The current beverages inventory is available."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "show beverages",
+        f"exact-category-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.category_references == ["Beverages"]
+    assert source.calls == [CURRENT_INVENTORY_TOOL]
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "operational_synthesis",
+    ]
+    with migration_engine.connect() as connection:
+        reservation = connection.execute(
+            text(
+                "SELECT reserved_tokens, input_tokens, output_tokens, total_tokens "
+                "FROM ai_usage_reservations"
+            )
+        ).one()
+        daily_usage = connection.execute(
+            text("SELECT total_tokens_used FROM business_ai_usage_daily")
+        ).one()
+    assert tuple(reservation) == (1566, 20, 4, 24)
+    assert reservation.total_tokens < reservation.reserved_tokens
+    assert tuple(daily_usage) == (24,)
+
+
+def test_category_resolver_timeout_charges_uncertain_usage_once_and_falls_back(
+    api_client: TestClient, db_session: Session, migration_engine: Engine
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"category-resolver-timeout-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    source.category_resolution = CategoryResolution(
+        status="not_found", metadata=metadata(rows=0)
+    )
+    provider = FailingCategoryResolverProvider(
+        [
+            usage_result(
+                reply="Planning category inventory.",
+                semantic_operation="inventory_category",
+                entity_kind="category",
+                entity_query="drinks",
+            ),
+            usage_result(),
+            usage_result(reply="No matching category was found."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "show drinks",
+        f"category-resolver-timeout-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.category_references == ["drinks"]
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "category_resolution",
+        "operational_synthesis",
+    ]
+    with migration_engine.connect() as connection:
+        reservation = connection.execute(
+            text(
+                "SELECT input_tokens, output_tokens, total_tokens "
+                "FROM ai_usage_reservations"
+            )
+        ).one()
+        daily_usage = connection.execute(
+            text(
+                "SELECT input_tokens_used, output_tokens_used, total_tokens_used "
+                "FROM business_ai_usage_daily"
+            )
+        ).one()
+    assert tuple(reservation) == (30, 68, 98)
+    assert tuple(daily_usage) == (30, 68, 98)
+
+
+def test_ambiguous_bounded_category_returns_clarification_without_source_lookup(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"ambiguous-semantic-category-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    source.categories = (
+        CategoryCandidate(external_category_id="category-2", label="Cold Drinks"),
+        CategoryCandidate(external_category_id="category-3", label="Hot Drinks"),
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                reply="Planning category inventory.",
+                semantic_operation="inventory_category",
+                entity_kind="category",
+                entity_query="drinks",
+            ),
+            usage_result(
+                category_resolution_status="ambiguous",
+                category_candidate_references=("category-2", "category-3"),
+            ),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "show drinks",
+        f"ambiguous-semantic-category-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert "Cold Drinks" in response.json()["assistant_message"]["content"]
+    assert "Hot Drinks" in response.json()["assistant_message"]["content"]
+    assert source.category_references == []
+    assert source.calls == []
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "category_resolution",
+    ]
+
+
+def test_unrecognized_category_resolution_reference_falls_back_to_source_lookup(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"invalid-semantic-category-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    source.category_resolution = CategoryResolution(
+        status="not_found", metadata=metadata(rows=0)
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                reply="Planning category inventory.",
+                semantic_operation="inventory_category",
+                entity_kind="category",
+                entity_query="drinks",
+            ),
+            usage_result(
+                category_resolution_status="matched",
+                category_candidate_references=("not-a-source-category",),
+            ),
+            usage_result(reply="No matching category was found."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "show drinks",
+        f"invalid-semantic-category-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.category_references == ["drinks"]
+    assert source.calls == []
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "category_resolution",
+        "operational_synthesis",
+    ]
 
 
 def test_profit_metric_returns_missing_capability_and_revenue_alternative(
@@ -1454,6 +1727,20 @@ class SequenceProvider:
     def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
         self.requests.append(request)
         result = self.results[len(self.requests) - 1]
+        if request.mode == "category_resolution":
+            return replace(
+                result,
+                reply="",
+                decision="final",
+                tool_name=None,
+                tool_arguments=None,
+                preference_key=None,
+                location_reference=None,
+                semantic_operation=None,
+                entity_kind=None,
+                entity_query=None,
+                category_candidate_reference=None,
+            )
         if (
             request.mode == "operational_synthesis"
             and result.validated_result_status is None
@@ -1467,6 +1754,14 @@ class SequenceProvider:
 class FailingSecondProvider(SequenceProvider):
     def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
         if self.requests:
+            self.requests.append(request)
+            raise OwnerChatProviderTimeout(usage_uncertain=True)
+        return super().generate(request)
+
+
+class FailingCategoryResolverProvider(SequenceProvider):
+    def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
+        if request.mode == "category_resolution":
             self.requests.append(request)
             raise OwnerChatProviderTimeout(usage_uncertain=True)
         return super().generate(request)
@@ -1892,7 +2187,7 @@ def test_response_only_synthesis_rejects_a_tool_request_without_replanning(
 
     assert response.status_code == 200, response.text
     assert (
-        "validated inventory" in response.json()["assistant_message"]["content"].lower()
+        "current inventory" in response.json()["assistant_message"]["content"].lower()
     )
     assert len(provider.requests) == 2
     assert provider.requests[1].mode == "operational_synthesis"
@@ -1988,7 +2283,7 @@ def test_inventory_synthesis_cannot_label_positive_validated_stock_as_empty(
     assert provider.requests[1].mode == "operational_synthesis"
     assert provider.requests[1].validated_result_status == "data"
     assert (
-        "validated inventory" in response.json()["assistant_message"]["content"].lower()
+        "current inventory" in response.json()["assistant_message"]["content"].lower()
     )
     assert source.calls == [CURRENT_INVENTORY_TOOL]
 
@@ -2030,7 +2325,7 @@ def test_synthesis_failure_uses_safe_fallback_and_replay_does_no_work(
     )
 
     assert first.status_code == 200
-    assert "validated inventory" in first.json()["assistant_message"]["content"].lower()
+    assert "current inventory" in first.json()["assistant_message"]["content"].lower()
     assert replay.status_code == 200
     assert replay.json()["replayed"] is True
     assert len(provider.requests) == 2

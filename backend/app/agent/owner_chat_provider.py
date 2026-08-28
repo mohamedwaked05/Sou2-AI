@@ -207,7 +207,12 @@ class OwnerChatRequest:
     max_output_tokens: int = 512
     sources: tuple[ProviderSource, ...] = ()
     mode: Literal[
-        "grounded", "conversation", "operational", "operational_synthesis", "customer"
+        "grounded",
+        "conversation",
+        "operational",
+        "operational_synthesis",
+        "category_resolution",
+        "customer",
     ] = "grounded"
     tools: tuple[ProviderToolDefinition, ...] = ()
     tool_results: tuple[ProviderToolResult, ...] = ()
@@ -287,6 +292,11 @@ class OwnerChatResult:
     ) = None
     entity_kind: Literal["product", "category"] | None = None
     entity_query: str | None = None
+    category_candidate_reference: str | None = None
+    category_resolution_status: Literal["matched", "ambiguous", "no_match"] | None = (
+        None
+    )
+    category_candidate_references: tuple[str, ...] = ()
     validated_result_status: (
         Literal[
             "data",
@@ -362,6 +372,20 @@ class DeterministicMockOwnerChatProvider:
                 provider_identifier="mock",
                 model_identifier="deterministic",
                 validated_result_status=request.validated_result_status,
+            )
+
+        if request.mode == "category_resolution":
+            input_tokens = self.estimate_input_tokens(request)
+            return OwnerChatResult(
+                usage=TokenUsage(
+                    input_tokens=input_tokens,
+                    output_tokens=0,
+                    total_tokens=input_tokens,
+                    authoritative=False,
+                ),
+                provider_identifier="mock",
+                model_identifier="deterministic",
+                category_resolution_status="no_match",
             )
 
         if request.mode == "operational":
@@ -747,6 +771,26 @@ class _OperationalSynthesisStructuredResult(BaseModel):
         return value
 
 
+class _CategoryResolutionStructuredResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["matched", "ambiguous", "no_match"]
+    candidate_references: list[str] = []
+
+    @model_validator(mode="after")
+    def validate_references(self) -> _CategoryResolutionStructuredResult:
+        count = len(self.candidate_references)
+        if len(set(self.candidate_references)) != count:
+            raise ValueError("Category references must be unique.")
+        if (
+            (self.status == "matched" and count != 1)
+            or (self.status == "ambiguous" and count < 2)
+            or (self.status == "no_match" and count != 0)
+        ):
+            raise ValueError("Category resolution status does not match references.")
+        return self
+
+
 class _OllamaMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -1054,6 +1098,20 @@ def _operational_synthesis_instructions(request: OwnerChatRequest) -> str:
     )
 
 
+def _category_resolution_instructions(request: OwnerChatRequest) -> str:
+    candidates = [
+        {"external_category_id": item.external_category_id, "label": item.label}
+        for item in request.category_candidates
+    ]
+    return (
+        "Resolve one category phrase against only the supplied bounded candidates. "
+        "Return matched only for one confident candidate reference, ambiguous for "
+        "multiple candidates, and no_match otherwise. Never invent references. "
+        "Return JSON only. Candidates follow:\n"
+        f"{json.dumps(candidates, ensure_ascii=False, separators=(',', ':'))}"
+    )
+
+
 def _customer_instructions(request: OwnerChatRequest) -> str:
     context = {
         "public_business_profile": _profile_context(request.profile),
@@ -1286,6 +1344,9 @@ class OllamaOwnerChatProvider:
                 semantic_operation = None
                 entity_kind = None
                 entity_query = None
+                category_candidate_reference = None
+                category_resolution_status = None
+                category_candidate_references: tuple[str, ...] = ()
                 if request.mode == "conversation":
                     conversation_result = (
                         _ConversationStructuredResult.model_validate_json(
@@ -1347,6 +1408,30 @@ class OllamaOwnerChatProvider:
                     semantic_operation = None
                     entity_kind = None
                     entity_query = None
+                    category_candidate_reference = None
+                elif request.mode == "category_resolution":
+                    category_result = (
+                        _CategoryResolutionStructuredResult.model_validate_json(
+                            envelope.message.content
+                        )
+                    )
+                    reply = ""
+                    requires_business_knowledge = False
+                    cited_source_ids = ()
+                    proposed_knowledge = ()
+                    decision = "final"
+                    tool_name = None
+                    tool_arguments = None
+                    preference_key = None
+                    location_reference = None
+                    semantic_operation = None
+                    entity_kind = None
+                    entity_query = None
+                    category_candidate_reference = None
+                    category_resolution_status = category_result.status
+                    category_candidate_references = tuple(
+                        category_result.candidate_references
+                    )
                 else:
                     grounded_result = _OllamaStructuredResult.model_validate_json(
                         envelope.message.content
@@ -1454,6 +1539,9 @@ class OllamaOwnerChatProvider:
             semantic_operation=semantic_operation,
             entity_kind=entity_kind,
             entity_query=entity_query,
+            category_candidate_reference=category_candidate_reference,
+            category_resolution_status=category_resolution_status,
+            category_candidate_references=category_candidate_references,
             validated_result_status=(
                 synthesis_result.validated_result_status
                 if request.mode == "operational_synthesis"
@@ -1462,6 +1550,20 @@ class OllamaOwnerChatProvider:
         )
 
     def _request_payload(self, request: OwnerChatRequest) -> dict[str, Any]:
+        if request.mode == "category_resolution":
+            return {
+                "model": self.model,
+                "stream": False,
+                "format": _CategoryResolutionStructuredResult.model_json_schema(),
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": _category_resolution_instructions(request),
+                    },
+                    {"role": "user", "content": request.messages[-1].content},
+                ],
+                "options": {"num_predict": request.max_output_tokens, "temperature": 0},
+            }
         if request.mode == "conversation":
             instructions = _conversation_instructions(request)
             messages: list[dict[str, str]] = [
@@ -1778,6 +1880,8 @@ class GeminiOwnerChatProvider:
                 if request.mode == "operational"
                 else _OperationalSynthesisStructuredResult
                 if request.mode == "operational_synthesis"
+                else _CategoryResolutionStructuredResult
+                if request.mode == "category_resolution"
                 else _OllamaStructuredResult
             )
             try:
@@ -1791,6 +1895,9 @@ class GeminiOwnerChatProvider:
                     provider_identifier="gemini",
                     model_identifier=self.model,
                 ) from None
+            category_resolution_status = None
+            category_candidate_references: tuple[str, ...] = ()
+            category_candidate_reference = None
             if isinstance(structured, _ConversationStructuredResult):
                 semantic_operation = None
                 entity_kind = None
@@ -1834,10 +1941,28 @@ class GeminiOwnerChatProvider:
                 semantic_operation = None
                 entity_kind = None
                 entity_query = None
+                category_candidate_reference = None
+            elif isinstance(structured, _CategoryResolutionStructuredResult):
+                reply = ""
+                requires_business_knowledge = False
+                cited_source_ids = ()
+                proposed_knowledge = ()
+                decision = "final"
+                tool_name = None
+                tool_arguments = None
+                preference_key = None
+                location_reference = None
+                semantic_operation = None
+                entity_kind = None
+                entity_query = None
+                category_candidate_reference = None
+                category_resolution_status = structured.status
+                category_candidate_references = tuple(structured.candidate_references)
             else:
                 semantic_operation = None
                 entity_kind = None
                 entity_query = None
+                category_candidate_reference = None
                 if any(
                     fact.expires_at is not None
                     and fact.expires_at <= request.requested_at
@@ -1942,6 +2067,9 @@ class GeminiOwnerChatProvider:
             semantic_operation=semantic_operation,
             entity_kind=entity_kind,
             entity_query=entity_query,
+            category_candidate_reference=category_candidate_reference,
+            category_resolution_status=category_resolution_status,
+            category_candidate_references=category_candidate_references,
             validated_result_status=(
                 structured.validated_result_status
                 if isinstance(structured, _OperationalSynthesisStructuredResult)
@@ -1950,6 +2078,26 @@ class GeminiOwnerChatProvider:
         )
 
     def _request_payload(self, request: OwnerChatRequest) -> dict[str, Any]:
+        if request.mode == "category_resolution":
+            return {
+                "systemInstruction": {
+                    "parts": [{"text": _category_resolution_instructions(request)}]
+                },
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": request.messages[-1].content}],
+                    }
+                ],
+                "generationConfig": {
+                    "maxOutputTokens": request.max_output_tokens,
+                    "responseMimeType": "application/json",
+                    "responseJsonSchema": (
+                        _CategoryResolutionStructuredResult.model_json_schema()
+                    ),
+                    "thinkingConfig": self._thinking_config(),
+                },
+            }
         if request.mode == "conversation":
             instructions = _conversation_instructions(request)
             return {
@@ -2087,11 +2235,15 @@ class GeminiOwnerChatProvider:
         payload: object | None,
         response_model: type[_OllamaStructuredResult]
         | type[_ConversationStructuredResult]
-        | type[_OperationalStructuredResult] = _OllamaStructuredResult,
+        | type[_OperationalStructuredResult]
+        | type[_OperationalSynthesisStructuredResult]
+        | type[_CategoryResolutionStructuredResult] = _OllamaStructuredResult,
     ) -> tuple[
         _OllamaStructuredResult
         | _ConversationStructuredResult
-        | _OperationalStructuredResult,
+        | _OperationalStructuredResult
+        | _OperationalSynthesisStructuredResult
+        | _CategoryResolutionStructuredResult,
         str,
     ]:
         if GeminiOwnerChatProvider._is_blocked(payload, None):

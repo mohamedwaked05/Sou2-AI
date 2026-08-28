@@ -19,6 +19,7 @@ from app.agent.owner_chat_provider import (
     OwnerChatRequest,
     OwnerChatResult,
     ProviderBusinessProfile,
+    ProviderCategoryCandidate,
     ProviderKnowledge,
     ProviderMessage,
     ProviderSource,
@@ -139,6 +140,24 @@ def operational_synthesis_request() -> OwnerChatRequest:
         mode="operational_synthesis",
         tools=(),
         validated_result_status="data",
+    )
+
+
+def category_resolution_request() -> OwnerChatRequest:
+    return replace(
+        operational_request(),
+        mode="category_resolution",
+        messages=(ProviderMessage(role="owner", content="drinks"),),
+        max_output_tokens=64,
+        tools=(),
+        category_candidates=(
+            ProviderCategoryCandidate(
+                external_category_id="category-7", label="Beverages"
+            ),
+            ProviderCategoryCandidate(
+                external_category_id="category-8", label="Pantry"
+            ),
+        ),
     )
 
 
@@ -345,6 +364,48 @@ def test_operational_synthesis_rejects_a_disconnected_source_claim() -> None:
 
     with pytest.raises(OwnerChatProviderInvalidResponse):
         provider.generate(operational_synthesis_request())
+
+
+@pytest.mark.parametrize("adapter", ["ollama", "gemini"])
+def test_category_resolution_returns_only_validated_candidate_references(
+    adapter: str,
+) -> None:
+    captured: dict[str, object] = {}
+    structured = {"status": "matched", "candidate_references": ["category-7"]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        if adapter == "ollama":
+            return httpx.Response(
+                200,
+                json={
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(structured),
+                    }
+                },
+            )
+        return gemini_successful_transport(structured).handle_request(request)
+
+    provider: OwnerChatProvider = (
+        ollama_provider(httpx.MockTransport(handler))
+        if adapter == "ollama"
+        else gemini_provider(httpx.MockTransport(handler))
+    )
+    result = provider.generate(category_resolution_request())
+
+    assert result.reply == ""
+    assert result.category_resolution_status == "matched"
+    assert result.category_candidate_references == ("category-7",)
+    schema = (
+        captured["format"]
+        if adapter == "ollama"
+        else captured["generationConfig"]["responseJsonSchema"]
+    )
+    assert (
+        schema
+        == owner_chat_provider._CategoryResolutionStructuredResult.model_json_schema()
+    )
 
 
 def test_operational_provider_response_rejects_unknown_fields() -> None:
