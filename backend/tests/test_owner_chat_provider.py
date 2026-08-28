@@ -221,6 +221,9 @@ def test_ollama_operational_decision_stays_provider_neutral_and_strict() -> None
                             "reply": None,
                             "tool_name": "current_inventory",
                             "arguments": {"limit": 5},
+                            "semantic_operation": "inventory_list",
+                            "entity_kind": None,
+                            "entity_query": None,
                         }
                     ),
                 },
@@ -257,6 +260,9 @@ def test_gemini_operational_final_uses_only_normalized_tool_context() -> None:
                 "reply": "There are 8 available units in the current result.",
                 "tool_name": None,
                 "arguments": None,
+                "semantic_operation": "inventory_list",
+                "entity_kind": None,
+                "entity_query": None,
             }
         ).handle_request(request)
 

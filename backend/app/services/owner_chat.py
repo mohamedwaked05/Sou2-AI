@@ -11,7 +11,7 @@ import time
 import traceback
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from fastapi import status
@@ -86,6 +86,7 @@ from app.services.business_profiles import is_business_profile_complete
 from app.services.businesses import load_full_access_business
 from app.services.conversations import get_default_conversation, load_conversation
 from app.tools.operational import (
+    CURRENT_INVENTORY_TOOL,
     OperationalToolExecutor,
     ToolExecutionError,
 )
@@ -1568,6 +1569,51 @@ def _planned_metric(arguments: object) -> str | None:
     )
 
 
+def _consistent_operational_plan(
+    result: OwnerChatResult,
+) -> tuple[OwnerChatResult, str]:
+    """Derive inventory execution from validated semantic intent, not tool choice."""
+
+    if result.semantic_operation not in {
+        "inventory_product",
+        "inventory_category",
+        "inventory_list",
+    }:
+        return result, "accepted"
+
+    arguments: dict[str, object] = {}
+    if result.semantic_operation == "inventory_product":
+        arguments["product_filter"] = result.entity_query
+    elif result.semantic_operation == "inventory_category":
+        arguments["category_filter"] = result.entity_query
+    if (
+        result.tool_name == CURRENT_INVENTORY_TOOL
+        and isinstance(result.tool_arguments, dict)
+        and isinstance(result.tool_arguments.get("location_reference"), str)
+    ):
+        arguments["location_reference"] = result.tool_arguments["location_reference"]
+
+    is_consistent = (
+        result.decision == "tool"
+        and result.tool_name == CURRENT_INVENTORY_TOOL
+        and result.tool_arguments == arguments
+    )
+    if is_consistent:
+        return result, "accepted"
+    return (
+        replace(
+            result,
+            decision="tool",
+            reply="",
+            tool_name=CURRENT_INVENTORY_TOOL,
+            tool_arguments=arguments,
+            preference_key=None,
+            location_reference=None,
+        ),
+        "normalized",
+    )
+
+
 def _operational_result_with_usage(
     result: OwnerChatResult, usage: TokenUsage
 ) -> OwnerChatResult:
@@ -2085,10 +2131,17 @@ def _run_operational_loop(
                     else aggregate_usage
                 )
             raise
+        original_action = result.decision
+        result, consistency_outcome = _consistent_operational_plan(result)
         _logger.info(
-            "owner_chat_operational_plan action=%s tool=%s metric=%s "
-            "validation=accepted",
+            "owner_chat_operational_plan semantic_operation=%s entity_kind=%s "
+            "original_action=%s effective_action=%s consistency_outcome=%s "
+            "effective_tool=%s metric=%s validation=accepted",
+            result.semantic_operation,
+            result.entity_kind,
+            original_action,
             result.decision,
+            consistency_outcome,
             result.tool_name if result.decision == "tool" else None,
             _planned_metric(result.tool_arguments),
         )
@@ -2493,6 +2546,21 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
     if not isinstance(result, OwnerChatResult):
         raise OwnerChatProviderInvalidResponse
     if request.mode == "operational":
+        expected_entity_kind = {
+            "inventory_product": "product",
+            "inventory_category": "category",
+        }.get(result.semantic_operation)
+        if result.semantic_operation is None or (
+            expected_entity_kind is not None
+            and (
+                result.entity_kind != expected_entity_kind
+                or not isinstance(result.entity_query, str)
+                or not result.entity_query.strip()
+            )
+        ):
+            raise OwnerChatProviderInvalidResponse(
+                reason="invalid_operational_semantics"
+            )
         if result.proposed_knowledge or result.cited_source_ids:
             raise OwnerChatProviderInvalidResponse(
                 reason="invalid_operational_response"

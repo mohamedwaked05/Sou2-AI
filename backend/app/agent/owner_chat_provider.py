@@ -272,6 +272,21 @@ class OwnerChatResult:
     tool_arguments: dict[str, Any] | None = None
     preference_key: str | None = None
     location_reference: str | None = None
+    semantic_operation: (
+        Literal[
+            "inventory_product",
+            "inventory_category",
+            "inventory_list",
+            "restocking",
+            "sales_summary",
+            "preference",
+            "knowledge",
+            "unsupported",
+        ]
+        | None
+    ) = None
+    entity_kind: Literal["product", "category"] | None = None
+    entity_query: str | None = None
     validated_result_status: (
         Literal[
             "data",
@@ -353,6 +368,21 @@ class DeterministicMockOwnerChatProvider:
             reply = (
                 "Live operational data is unavailable through the configured "
                 "development provider."
+            )
+            input_tokens = self.estimate_input_tokens(request)
+            output_tokens = estimate_utf8_tokens(reply)
+            return OwnerChatResult(
+                reply=reply,
+                decision="unavailable",
+                semantic_operation="unsupported",
+                usage=TokenUsage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    total_tokens=input_tokens + output_tokens,
+                    authoritative=False,
+                ),
+                provider_identifier="mock",
+                model_identifier="deterministic",
             )
 
         if request.mode == "customer":
@@ -630,9 +660,33 @@ class _OperationalStructuredResult(BaseModel):
     arguments: dict[str, Any] | None = None
     preference_key: Literal["default_inventory_location"] | None = None
     location_reference: str | None = None
+    semantic_operation: Literal[
+        "inventory_product",
+        "inventory_category",
+        "inventory_list",
+        "restocking",
+        "sales_summary",
+        "preference",
+        "knowledge",
+        "unsupported",
+    ]
+    entity_kind: Literal["product", "category"] | None = None
+    entity_query: str | None = None
 
     @model_validator(mode="after")
     def validate_decision(self) -> _OperationalStructuredResult:
+        requires_entity = {
+            "inventory_product": "product",
+            "inventory_category": "category",
+        }
+        expected_entity_kind = requires_entity.get(self.semantic_operation)
+        if expected_entity_kind is not None:
+            if self.entity_kind != expected_entity_kind or not self.entity_query:
+                raise ValueError(
+                    "This semantic operation requires its unresolved entity."
+                )
+        elif self.entity_kind is not None or self.entity_query is not None:
+            raise ValueError("Only entity-scoped operations may include an entity.")
         if self.decision == "tool":
             if (
                 not self.tool_name
@@ -914,7 +968,9 @@ def _operational_instructions(request: OwnerChatRequest) -> str:
     context = _operational_context(request)
     return (
         "You answer an authenticated business owner's live operational question. "
-        "Choose exactly one decision: request one approved tool, give a final answer, "
+        "First classify the latest request with semantic_operation. This is required "
+        "even if you give a final answer. Choose exactly one decision: request one "
+        "approved tool, give a final answer, "
         "set or clear an approved preference, or state that the capability is "
         "unavailable. Tool names and schemas are "
         "fixed by approved_tools. Never invent, rename, define, or call another tool. "
@@ -935,7 +991,10 @@ def _operational_instructions(request: OwnerChatRequest) -> str:
         "and do not use documents or assumptions. Use quantities only when all "
         "applicable resolutions are resolved, and keep separate branch and warehouse "
         "rows separate. "
-        "For category inventory, use current_inventory with category_filter set to "
+        "For category inventory, set semantic_operation to inventory_category and "
+        "entity_kind to category with entity_query set to "
+        "the owner's unresolved category concept. Then use current_inventory with "
+        "category_filter set to "
         "the owner's unresolved category concept. The bounded source-defined "
         "category_candidates may help interpret that concept, but an absent or "
         "truncated candidate list is never proof that the category is unavailable. "
@@ -1033,6 +1092,9 @@ def _owner_chat_result_from_operational(
     dict[str, Any] | None,
     str | None,
     str | None,
+    str,
+    str | None,
+    str | None,
 ]:
     return (
         structured.reply or "",
@@ -1044,6 +1106,9 @@ def _owner_chat_result_from_operational(
         structured.arguments,
         structured.preference_key,
         structured.location_reference,
+        structured.semantic_operation,
+        structured.entity_kind,
+        structured.entity_query,
     )
 
 
@@ -1218,6 +1283,9 @@ class OllamaOwnerChatProvider:
                     usage_uncertain=True,
                 ) from None
             try:
+                semantic_operation = None
+                entity_kind = None
+                entity_query = None
                 if request.mode == "conversation":
                     conversation_result = (
                         _ConversationStructuredResult.model_validate_json(
@@ -1257,6 +1325,9 @@ class OllamaOwnerChatProvider:
                         tool_arguments,
                         preference_key,
                         location_reference,
+                        semantic_operation,
+                        entity_kind,
+                        entity_query,
                     ) = _owner_chat_result_from_operational(operational_result)
                 elif request.mode == "operational_synthesis":
                     synthesis_result = (
@@ -1273,6 +1344,9 @@ class OllamaOwnerChatProvider:
                     tool_arguments = None
                     preference_key = None
                     location_reference = None
+                    semantic_operation = None
+                    entity_kind = None
+                    entity_query = None
                 else:
                     grounded_result = _OllamaStructuredResult.model_validate_json(
                         envelope.message.content
@@ -1377,6 +1451,9 @@ class OllamaOwnerChatProvider:
             tool_arguments=tool_arguments,
             preference_key=preference_key,
             location_reference=location_reference,
+            semantic_operation=semantic_operation,
+            entity_kind=entity_kind,
+            entity_query=entity_query,
             validated_result_status=(
                 synthesis_result.validated_result_status
                 if request.mode == "operational_synthesis"
@@ -1715,6 +1792,9 @@ class GeminiOwnerChatProvider:
                     model_identifier=self.model,
                 ) from None
             if isinstance(structured, _ConversationStructuredResult):
+                semantic_operation = None
+                entity_kind = None
+                entity_query = None
                 reply = structured.reply
                 requires_business_knowledge = structured.requires_business_knowledge
                 cited_source_ids: tuple[str, ...] = ()
@@ -1737,6 +1817,9 @@ class GeminiOwnerChatProvider:
                     tool_arguments,
                     preference_key,
                     location_reference,
+                    semantic_operation,
+                    entity_kind,
+                    entity_query,
                 ) = _owner_chat_result_from_operational(structured)
             elif isinstance(structured, _OperationalSynthesisStructuredResult):
                 reply = structured.reply
@@ -1748,7 +1831,13 @@ class GeminiOwnerChatProvider:
                 tool_arguments = None
                 preference_key = None
                 location_reference = None
+                semantic_operation = None
+                entity_kind = None
+                entity_query = None
             else:
+                semantic_operation = None
+                entity_kind = None
+                entity_query = None
                 if any(
                     fact.expires_at is not None
                     and fact.expires_at <= request.requested_at
@@ -1850,6 +1939,9 @@ class GeminiOwnerChatProvider:
             tool_arguments=tool_arguments,
             preference_key=preference_key,
             location_reference=location_reference,
+            semantic_operation=semantic_operation,
+            entity_kind=entity_kind,
+            entity_query=entity_query,
             validated_result_status=(
                 structured.validated_result_status
                 if isinstance(structured, _OperationalSynthesisStructuredResult)

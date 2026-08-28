@@ -623,6 +623,63 @@ def test_unknown_category_reaches_inventory_resolution_without_source_fallback(
     )
 
 
+def test_inventory_category_semantics_normalize_a_provider_final_to_inventory(
+    api_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"semantic-category-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.category_resolution = CategoryResolution(
+        status="not_found", metadata=metadata(rows=0)
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                reply="No lookup is needed.",
+                semantic_operation="inventory_category",
+                entity_kind="category",
+                entity_query="unresolved future category",
+            ),
+            usage_result(reply="No matching category was found."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+    diagnostic_messages: list[str] = []
+    monkeypatch.setattr(
+        owner_chat._logger,
+        "info",
+        lambda message, *args: diagnostic_messages.append(message % args),
+    )
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "an arbitrary category request",
+        f"semantic-category-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.category_references == ["unresolved future category"]
+    assert source.calls == []
+    assert len(provider.requests) == 2
+    assert provider.requests[0].mode == "operational"
+    assert provider.requests[1].mode == "operational_synthesis"
+    assert any(
+        "semantic_operation=inventory_category" in message
+        and "entity_kind=category" in message
+        and "original_action=final" in message
+        and "effective_action=tool" in message
+        and "consistency_outcome=normalized" in message
+        and "effective_tool=current_inventory" in message
+        for message in diagnostic_messages
+    )
+    assert all(
+        "unresolved future category" not in message for message in diagnostic_messages
+    )
+
+
 def test_category_reference_is_resolved_and_never_trusted_as_a_source_identifier(
     api_client: TestClient, db_session: Session
 ) -> None:
@@ -1429,6 +1486,7 @@ class BlockingOperationalProvider(SequenceProvider):
 
 
 def usage_result(**values: object) -> OwnerChatResult:
+    values.setdefault("semantic_operation", "unsupported")
     return OwnerChatResult(
         usage=TokenUsage(
             input_tokens=10,
