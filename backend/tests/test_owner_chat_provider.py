@@ -287,6 +287,26 @@ def test_operational_preference_plan_satisfies_required_schema() -> None:
     assert structured.location_reference == "Jbeil Branch"
 
 
+@pytest.mark.parametrize("location_reference", ["   ", "x" * 256])
+def test_operational_preference_plan_rejects_unbounded_location_reference(
+    location_reference: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        owner_chat_provider._OperationalStructuredResult.model_validate(
+            {
+                "decision": "set_preference",
+                "reply": None,
+                "tool_name": None,
+                "arguments": None,
+                "preference_key": "default_inventory_location",
+                "location_reference": location_reference,
+                "semantic_operation": "preference",
+                "entity_kind": None,
+                "entity_query": None,
+            }
+        )
+
+
 def test_legacy_typed_preference_plan_is_structurally_normalized() -> None:
     structured = owner_chat_provider._OperationalStructuredResult.model_validate(
         {
@@ -319,6 +339,47 @@ def test_conflicting_preference_semantics_are_rejected() -> None:
                 "entity_query": None,
             }
         )
+
+
+def test_schema_validation_diagnostics_redact_unknown_field_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logged: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        owner_chat_provider.logger,
+        "warning",
+        lambda *arguments: logged.append(arguments),
+    )
+    with pytest.raises(ValidationError) as raised:
+        owner_chat_provider._OperationalStructuredResult.model_validate(
+            {
+                "decision": "set_preference",
+                "reply": None,
+                "tool_name": None,
+                "arguments": None,
+                "preference_key": "default_inventory_location",
+                "location_reference": "   ",
+                "semantic_operation": "preference",
+                "entity_kind": None,
+                "entity_query": None,
+                "private provider field": "must not be logged",
+            }
+        )
+
+    owner_chat_provider._log_schema_validation_diagnostics(
+        raised.value,
+        owner_chat_provider._OperationalStructuredResult,
+    )
+
+    assert logged == [
+        (
+            "owner_chat_provider schema_validation_failed fields=%s",
+            (
+                ("location_reference", "value_error"),
+                ("<unknown>", "extra_forbidden"),
+            ),
+        )
+    ]
 
 
 def test_gemini_operational_final_uses_only_normalized_tool_context() -> None:
