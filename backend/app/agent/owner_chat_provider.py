@@ -6,14 +6,21 @@ import json
 import logging
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
 from typing import Annotated, Any, Literal, Protocol, runtime_checkable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from fastapi import Depends
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from app.core.config import Settings, get_settings
 
@@ -309,6 +316,19 @@ class OwnerChatResult:
         ]
         | None
     ) = None
+
+
+def normalize_legacy_operational_preference(
+    result: OwnerChatResult,
+) -> OwnerChatResult:
+    """Normalize only an older typed preference action with no semantic field."""
+
+    if (
+        result.decision in {"set_preference", "clear_preference"}
+        and result.semantic_operation is None
+    ):
+        return replace(result, semantic_operation="preference")
+    return result
 
 
 @runtime_checkable
@@ -683,7 +703,7 @@ class _OperationalStructuredResult(BaseModel):
     tool_name: str | None = None
     arguments: dict[str, Any] | None = None
     preference_key: Literal["default_inventory_location"] | None = None
-    location_reference: str | None = None
+    location_reference: str | None = Field(default=None, min_length=1, max_length=255)
     semantic_operation: Literal[
         "inventory_product",
         "inventory_category",
@@ -696,6 +716,32 @@ class _OperationalStructuredResult(BaseModel):
     ]
     entity_kind: Literal["product", "category"] | None = None
     entity_query: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_preference_semantics(cls, value: object) -> object:
+        """Supply the required semantic operation for an older typed action only."""
+
+        if not isinstance(value, dict):
+            return value
+        if (
+            value.get("decision") in {"set_preference", "clear_preference"}
+            and value.get("semantic_operation") is None
+        ):
+            normalized = dict(value)
+            normalized["semantic_operation"] = "preference"
+            return normalized
+        return value
+
+    @field_validator("location_reference")
+    @classmethod
+    def normalize_location_reference(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("Location references cannot be blank.")
+        return normalized
 
     @model_validator(mode="after")
     def validate_decision(self) -> _OperationalStructuredResult:
@@ -711,6 +757,11 @@ class _OperationalStructuredResult(BaseModel):
                 )
         elif self.entity_kind is not None or self.entity_query is not None:
             raise ValueError("Only entity-scoped operations may include an entity.")
+        if self.decision in {"set_preference", "clear_preference"}:
+            if self.semantic_operation != "preference":
+                raise ValueError("Preference actions require preference semantics.")
+        elif self.semantic_operation == "preference":
+            raise ValueError("Preference semantics require a preference action.")
         if self.decision == "tool":
             if (
                 not self.tool_name
@@ -1054,10 +1105,12 @@ def _operational_instructions(request: OwnerChatRequest) -> str:
         "cannot be calculated, name only its safe missing input concepts, and offer "
         "the listed supported metrics without relabeling or silently substituting "
         "one as another. Preserve the owner's language and style. "
-        "For a future inventory-location instruction, use set_preference with only "
+        "For a future inventory-location instruction, set semantic_operation to "
+        "preference and use set_preference with only "
         "default_inventory_location and the unresolved location_reference. Interpret "
         "against the bounded source-defined location_candidates but never invent a "
-        "location identifier. Use clear_preference only for that approved key. These "
+        "location identifier. Use clear_preference with semantic_operation preference "
+        "only for that approved key. These "
         "actions do not run inventory queries. "
         "pending_product_candidates, when supplied, are source-derived options from "
         "only the immediately preceding unresolved product clarification. Use them "
@@ -1186,6 +1239,31 @@ def _canonical_citation_labels(
     return tuple(canonical)
 
 
+def _log_schema_validation_diagnostics(
+    error: ValidationError, response_model: type[BaseModel]
+) -> None:
+    """Log only declared top-level paths and Pydantic error types."""
+
+    declared_fields = frozenset(response_model.model_fields)
+    diagnostics: list[tuple[str, str]] = []
+    for item in error.errors():
+        location = item.get("loc")
+        field = (
+            location[0]
+            if isinstance(location, tuple) and location and isinstance(location[0], str)
+            else "<model>"
+        )
+        safe_field = field if field in declared_fields else "<unknown>"
+        error_type = item.get("type")
+        diagnostics.append(
+            (safe_field, error_type if isinstance(error_type, str) else "unknown")
+        )
+    logger.warning(
+        "owner_chat_provider schema_validation_failed fields=%s",
+        tuple(diagnostics),
+    )
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(
         value,
@@ -1263,6 +1341,14 @@ class OllamaOwnerChatProvider:
                 provider_identifier="ollama",
                 model_identifier=self.model,
             ) from None
+        except ValidationError as exc:
+            _log_schema_validation_diagnostics(exc, _SummaryStructuredResult)
+            raise OwnerChatProviderInvalidResponse(
+                reason="invalid_structured_response",
+                usage=usage,
+                provider_identifier="ollama",
+                model_identifier=self.model,
+            ) from None
         except ValueError:
             raise OwnerChatProviderInvalidResponse(
                 reason="invalid_structured_response",
@@ -1332,6 +1418,15 @@ class OllamaOwnerChatProvider:
                 )
             try:
                 envelope = _OllamaChatResponse.model_validate(response_payload)
+            except ValidationError as exc:
+                _log_schema_validation_diagnostics(exc, _OllamaChatResponse)
+                raise OwnerChatProviderInvalidResponse(
+                    reason="invalid_envelope",
+                    usage=usage,
+                    provider_identifier="ollama",
+                    model_identifier=self.model,
+                    usage_uncertain=True,
+                ) from None
             except ValueError:
                 raise OwnerChatProviderInvalidResponse(
                     reason="invalid_envelope",
@@ -1471,6 +1566,26 @@ class OllamaOwnerChatProvider:
                     tool_arguments = None
                     preference_key = None
                     location_reference = None
+            except ValidationError as exc:
+                response_model = (
+                    _ConversationStructuredResult
+                    if request.mode == "conversation"
+                    else _OperationalStructuredResult
+                    if request.mode == "operational"
+                    else _OperationalSynthesisStructuredResult
+                    if request.mode == "operational_synthesis"
+                    else _CategoryResolutionStructuredResult
+                    if request.mode == "category_resolution"
+                    else _OllamaStructuredResult
+                )
+                _log_schema_validation_diagnostics(exc, response_model)
+                raise OwnerChatProviderInvalidResponse(
+                    reason="invalid_structured_response",
+                    usage=usage,
+                    provider_identifier="ollama",
+                    model_identifier=self.model,
+                    usage_uncertain=True,
+                ) from None
             except ValueError:
                 raise OwnerChatProviderInvalidResponse(
                     reason="invalid_structured_response",
@@ -2261,7 +2376,8 @@ class GeminiOwnerChatProvider:
             raise _GeminiResponseParseError("invalid_json") from None
         try:
             return response_model.model_validate(decoded), text
-        except ValueError:
+        except ValidationError as exc:
+            _log_schema_validation_diagnostics(exc, response_model)
             raise _GeminiResponseParseError("schema_validation_failed") from None
 
     @staticmethod

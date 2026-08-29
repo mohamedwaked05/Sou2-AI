@@ -268,6 +268,59 @@ def test_ollama_operational_decision_stays_provider_neutral_and_strict() -> None
     assert "retrieved_sources" not in serialized
 
 
+def test_operational_preference_plan_satisfies_required_schema() -> None:
+    structured = owner_chat_provider._OperationalStructuredResult.model_validate(
+        {
+            "decision": "set_preference",
+            "reply": None,
+            "tool_name": None,
+            "arguments": None,
+            "preference_key": "default_inventory_location",
+            "location_reference": "Jbeil Branch",
+            "semantic_operation": "preference",
+            "entity_kind": None,
+            "entity_query": None,
+        }
+    )
+
+    assert structured.semantic_operation == "preference"
+    assert structured.location_reference == "Jbeil Branch"
+
+
+def test_legacy_typed_preference_plan_is_structurally_normalized() -> None:
+    structured = owner_chat_provider._OperationalStructuredResult.model_validate(
+        {
+            "decision": "clear_preference",
+            "reply": None,
+            "tool_name": None,
+            "arguments": None,
+            "preference_key": "default_inventory_location",
+            "location_reference": None,
+            "entity_kind": None,
+            "entity_query": None,
+        }
+    )
+
+    assert structured.semantic_operation == "preference"
+
+
+def test_conflicting_preference_semantics_are_rejected() -> None:
+    with pytest.raises(ValidationError):
+        owner_chat_provider._OperationalStructuredResult.model_validate(
+            {
+                "decision": "set_preference",
+                "reply": None,
+                "tool_name": None,
+                "arguments": None,
+                "preference_key": "default_inventory_location",
+                "location_reference": "Jbeil Branch",
+                "semantic_operation": "inventory_list",
+                "entity_kind": None,
+                "entity_query": None,
+            }
+        )
+
+
 def test_gemini_operational_final_uses_only_normalized_tool_context() -> None:
     captured: dict[str, object] = {}
 
@@ -1566,7 +1619,19 @@ def test_gemini_invalid_json_or_schema_is_safe(
     assert raised.value.reason == reason
     assert "test-key-not-production" not in repr(raised.value)
     assert "private provider body" not in repr(raised.value)
-    assert logged == []
+    if reason == "invalid_json":
+        assert logged == []
+    else:
+        assert len(logged) == 1
+        diagnostic = logged[0]
+        assert diagnostic[0] == (
+            "owner_chat_provider schema_validation_failed fields=%s"
+        )
+        assert all(
+            isinstance(item[0], str) and isinstance(item[1], str)
+            for item in diagnostic[1]
+        )
+        assert "private provider body" not in repr(diagnostic)
 
 
 @pytest.mark.parametrize(

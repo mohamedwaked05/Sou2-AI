@@ -1395,6 +1395,60 @@ def test_inventory_planning_ignores_history_and_applies_saved_location(
     assert saved.location_external_id == "BR-JBEIL"
 
 
+def test_replacing_location_preference_updates_only_its_scope(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"location-replace-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    configure_operational_chat(db_session, business["id"], source, SequenceProvider([]))
+    active = db_session.scalar(
+        select(OperationalDataSourceConfig).where(
+            OperationalDataSourceConfig.business_id == uuid.UUID(str(business["id"]))
+        )
+    )
+    assert active is not None
+    db_session.add(
+        UserOperationalPreference(
+            user_id=user.id,
+            business_id=uuid.UUID(str(business["id"])),
+            source_id=active.id,
+            preference_key="default_inventory_location",
+            location_type="branch",
+            location_external_id="BR-OTHER",
+        )
+    )
+    db_session.commit()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key="default_inventory_location",
+                location_reference="Jbeil Branch",
+            ),
+            usage_result(reply="The default inventory location was updated."),
+        ]
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Use Jbeil Branch for future inventory questions.",
+        f"location-replace-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    saved = db_session.scalar(select(UserOperationalPreference))
+    assert saved is not None
+    assert saved.user_id == user.id
+    assert saved.business_id == uuid.UUID(str(business["id"]))
+    assert saved.source_id == active.id
+    assert saved.location_external_id == "BR-JBEIL"
+
+
 def test_location_preference_clear_is_idempotent_and_never_reads_inventory(
     api_client: TestClient, db_session: Session
 ) -> None:
@@ -1427,6 +1481,11 @@ def test_location_preference_clear_is_idempotent_and_never_reads_inventory(
                 preference_key="default_inventory_location",
             ),
             usage_result(reply="The default inventory location is cleared."),
+            usage_result(
+                decision="clear_preference",
+                preference_key="default_inventory_location",
+            ),
+            usage_result(reply="The default inventory location is cleared."),
         ]
     )
     app.dependency_overrides[get_owner_chat_provider] = lambda: provider
@@ -1438,9 +1497,22 @@ def test_location_preference_clear_is_idempotent_and_never_reads_inventory(
         "Do not use my inventory location default anymore.",
         f"location-clear-{uuid.uuid4()}",
     )
+    repeated = submit(
+        api_client,
+        user,
+        business["id"],
+        "Do not use my inventory location default anymore.",
+        f"location-clear-repeat-{uuid.uuid4()}",
+    )
 
     assert response.status_code == 200, response.text
-    assert provider.requests[1].mode == "operational_synthesis"
+    assert repeated.status_code == 200, repeated.text
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "operational_synthesis",
+        "operational",
+        "operational_synthesis",
+    ]
     assert source.calls == []
     assert (
         db_session.scalar(
@@ -1498,6 +1570,76 @@ def test_ambiguous_location_preference_is_not_saved_or_exposes_source_ids(
         "South Branch",
     ]
     assert "external_location_id" not in str(supplied)
+    assert db_session.scalar(select(UserOperationalPreference)) is None
+    assert source.calls == []
+
+
+def test_hallucinated_location_reference_is_not_saved(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"location-unknown-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key="default_inventory_location",
+                location_reference="BR-JBEIL",
+            ),
+            usage_result(reply="Please choose one of the available locations."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Use that location by default.",
+        f"location-unknown-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    supplied = provider.requests[1].tool_results[0].output
+    assert supplied["action"] == "not_saved"
+    assert supplied["resolution"] == {"status": "not_found", "candidates": []}
+    assert db_session.scalar(select(UserOperationalPreference)) is None
+    assert source.calls == []
+
+
+def test_conflicting_preference_plan_never_acknowledges_or_saves(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"location-conflict-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key="default_inventory_location",
+                location_reference="Jbeil Branch",
+                semantic_operation="inventory_list",
+            )
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Use Jbeil Branch by default.",
+        f"location-conflict-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "assistant_invalid_response"
     assert db_session.scalar(select(UserOperationalPreference)) is None
     assert source.calls == []
 
@@ -1781,7 +1923,14 @@ class BlockingOperationalProvider(SequenceProvider):
 
 
 def usage_result(**values: object) -> OwnerChatResult:
-    values.setdefault("semantic_operation", "unsupported")
+    values.setdefault(
+        "semantic_operation",
+        (
+            "preference"
+            if values.get("decision") in {"set_preference", "clear_preference"}
+            else "unsupported"
+        ),
+    )
     return OwnerChatResult(
         usage=TokenUsage(
             input_tokens=10,

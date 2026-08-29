@@ -40,6 +40,7 @@ from app.agent.owner_chat_provider import (
     ProviderWorkingShift,
     TokenUsage,
     estimate_utf8_tokens,
+    normalize_legacy_operational_preference,
 )
 from app.core.config import Settings
 from app.core.exceptions import ApplicationError
@@ -1959,26 +1960,36 @@ def _save_inventory_location_preference(
         )
     if location_reference is None:
         raise ToolExecutionError("invalid_arguments")
-    resolution = executor.resolve_location(user, business_id, location_reference)
-    if resolution.status != "resolved" or resolution.location is None:
+    candidates = executor.location_candidates(user, business_id)
+    current_source = executor._active_source(business_id)
+    if current_source is None or current_source.id != source.id:
+        raise ToolExecutionError("integration_unavailable")
+    normalized_reference = " ".join(location_reference.split()).casefold()
+    matched_candidates = tuple(
+        candidate
+        for candidate in candidates
+        if normalized_reference in " ".join(candidate.label.split()).casefold()
+    )
+    if len(matched_candidates) != 1:
+        resolution_status = "ambiguous" if matched_candidates else "not_found"
         return ProviderToolResult(
             tool_name="inventory_location_preference",
             output={
                 "action": "not_saved",
                 "capability": "inventory_location_preference",
                 "resolution": {
-                    "status": resolution.status,
+                    "status": resolution_status,
                     "candidates": [
                         {
                             "label": candidate.label,
                             "location_type": candidate.location_type,
                         }
-                        for candidate in resolution.candidates
+                        for candidate in matched_candidates
                     ],
                 },
             },
         )
-    location = resolution.location
+    location = matched_candidates[0]
     if existing is None:
         session.add(
             UserOperationalPreference(
@@ -2767,6 +2778,7 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
     if not isinstance(result, OwnerChatResult):
         raise OwnerChatProviderInvalidResponse
     if request.mode == "operational":
+        result = normalize_legacy_operational_preference(result)
         expected_entity_kind = {
             "inventory_product": "product",
             "inventory_category": "category",
@@ -2786,6 +2798,13 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
             raise OwnerChatProviderInvalidResponse(
                 reason="invalid_operational_response"
             )
+        if result.semantic_operation == "preference" and result.decision not in {
+            "set_preference",
+            "clear_preference",
+        }:
+            raise OwnerChatProviderInvalidResponse(
+                reason="invalid_operational_semantics"
+            )
         if result.decision == "tool":
             if (
                 result.reply
@@ -2797,7 +2816,8 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
                 )
         elif result.decision == "set_preference":
             if (
-                result.reply
+                result.semantic_operation != "preference"
+                or result.reply
                 or result.tool_name is not None
                 or result.tool_arguments is not None
                 or result.preference_key != "default_inventory_location"
@@ -2809,7 +2829,8 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
                 )
         elif result.decision == "clear_preference":
             if (
-                result.reply
+                result.semantic_operation != "preference"
+                or result.reply
                 or result.tool_name is not None
                 or result.tool_arguments is not None
                 or result.preference_key != "default_inventory_location"
