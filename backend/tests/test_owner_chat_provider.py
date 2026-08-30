@@ -22,6 +22,8 @@ from app.agent.owner_chat_provider import (
     ProviderCategoryCandidate,
     ProviderKnowledge,
     ProviderMessage,
+    ProviderPreferenceCapability,
+    ProviderPreferenceLocationCandidate,
     ProviderSource,
     ProviderToolDefinition,
     ProviderToolResult,
@@ -161,6 +163,29 @@ def category_resolution_request() -> OwnerChatRequest:
     )
 
 
+def preference_resolution_request() -> OwnerChatRequest:
+    return replace(
+        operational_request(),
+        mode="preference_resolution",
+        messages=(
+            ProviderMessage(role="owner", content="Use Jbeil Branch from now on."),
+        ),
+        max_output_tokens=64,
+        tools=(),
+        preference_capabilities=(
+            ProviderPreferenceCapability(
+                preference_key="default_inventory_location",
+                actions=("set_preference", "clear_preference"),
+            ),
+        ),
+        preference_location_candidates=(
+            ProviderPreferenceLocationCandidate(
+                reference="location_1", label="Jbeil Branch", location_type="branch"
+            ),
+        ),
+    )
+
+
 def request_with_source() -> OwnerChatRequest:
     return replace(
         provider_request(),
@@ -287,6 +312,22 @@ def test_operational_preference_plan_satisfies_required_schema() -> None:
     assert structured.location_reference == "Jbeil Branch"
 
 
+def _operational_preference_payload(**changes: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "decision": "set_preference",
+        "reply": None,
+        "tool_name": None,
+        "arguments": None,
+        "preference_key": "default_inventory_location",
+        "location_reference": "Safe Branch",
+        "semantic_operation": "preference",
+        "entity_kind": None,
+        "entity_query": None,
+    }
+    payload.update(changes)
+    return payload
+
+
 @pytest.mark.parametrize("location_reference", ["   ", "x" * 256])
 def test_operational_preference_plan_rejects_unbounded_location_reference(
     location_reference: str,
@@ -305,6 +346,175 @@ def test_operational_preference_plan_rejects_unbounded_location_reference(
                 "entity_query": None,
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        (
+            {"semantic_operation": "inventory_product"},
+            "planner_entity_semantic_mismatch",
+        ),
+        (
+            {
+                "decision": "final",
+                "reply": "Safe reply.",
+                "preference_key": None,
+                "location_reference": None,
+                "semantic_operation": "inventory_list",
+                "entity_kind": "product",
+                "entity_query": "safe",
+            },
+            "planner_unexpected_entity_fields",
+        ),
+        (
+            {"semantic_operation": "inventory_list"},
+            "planner_preference_action_requires_preference_semantic",
+        ),
+        (
+            {
+                "decision": "final",
+                "reply": "Safe reply.",
+                "preference_key": None,
+                "location_reference": None,
+            },
+            "planner_preference_semantic_requires_preference_action",
+        ),
+        (
+            {
+                "decision": "tool",
+                "reply": "Safe reply.",
+                "tool_name": "current_inventory",
+                "arguments": {},
+                "preference_key": None,
+                "location_reference": None,
+                "semantic_operation": "inventory_list",
+            },
+            "planner_tool_reply_conflict",
+        ),
+        (
+            {
+                "decision": "tool",
+                "tool_name": "current_inventory",
+                "arguments": {},
+                "location_reference": None,
+                "semantic_operation": "inventory_list",
+            },
+            "planner_tool_preference_fields_conflict",
+        ),
+        ({"reply": "Safe reply."}, "planner_set_preference_reply_conflict"),
+        (
+            {"tool_name": "current_inventory", "arguments": {}},
+            "planner_set_preference_tool_fields_conflict",
+        ),
+        (
+            {"decision": "clear_preference", "reply": "Safe reply."},
+            "planner_clear_preference_reply_conflict",
+        ),
+        (
+            {
+                "decision": "clear_preference",
+                "tool_name": "current_inventory",
+                "arguments": {},
+                "location_reference": None,
+            },
+            "planner_clear_preference_tool_fields_conflict",
+        ),
+        (
+            {
+                "decision": "final",
+                "preference_key": None,
+                "location_reference": None,
+                "semantic_operation": "inventory_list",
+            },
+            "planner_missing_final_reply",
+        ),
+        (
+            {
+                "decision": "final",
+                "reply": "Safe reply.",
+                "tool_name": "current_inventory",
+                "arguments": {},
+                "preference_key": None,
+                "location_reference": None,
+                "semantic_operation": "inventory_list",
+            },
+            "planner_final_tool_fields_conflict",
+        ),
+        (
+            {
+                "decision": "final",
+                "reply": "Safe reply.",
+                "semantic_operation": "inventory_list",
+            },
+            "planner_final_preference_fields_conflict",
+        ),
+    ],
+)
+def test_operational_model_validator_branches_have_stable_reason_codes(
+    changes: dict[str, object], reason: str
+) -> None:
+    with pytest.raises(ValidationError) as raised:
+        owner_chat_provider._OperationalStructuredResult.model_validate(
+            _operational_preference_payload(**changes)
+        )
+
+    assert raised.value.errors(include_input=False)[0]["type"] == reason
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        (
+            {
+                "subject_key": "safe",
+                "content": "safe",
+                "kind": "permanent",
+                "category": "policy",
+                "expires_at": "2026-08-30T00:00:00Z",
+            },
+            "knowledge_permanent_expiry_conflict",
+        ),
+        (
+            {
+                "subject_key": "safe",
+                "content": "safe",
+                "kind": "temporary",
+                "category": "policy",
+            },
+            "knowledge_temporary_missing_expiry",
+        ),
+    ],
+)
+def test_knowledge_model_validator_branches_have_stable_reason_codes(
+    payload: dict[str, object], reason: str
+) -> None:
+    with pytest.raises(ValidationError) as raised:
+        owner_chat_provider._OllamaProposedKnowledge.model_validate(payload)
+
+    assert raised.value.errors(include_input=False)[0]["type"] == reason
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        (
+            {"status": "matched", "candidate_references": ["safe", "safe"]},
+            "category_duplicate_references",
+        ),
+        (
+            {"status": "matched", "candidate_references": []},
+            "category_status_reference_mismatch",
+        ),
+    ],
+)
+def test_category_model_validator_branches_have_stable_reason_codes(
+    payload: dict[str, object], reason: str
+) -> None:
+    with pytest.raises(ValidationError) as raised:
+        owner_chat_provider._CategoryResolutionStructuredResult.model_validate(payload)
+
+    assert raised.value.errors(include_input=False)[0]["type"] == reason
 
 
 def test_legacy_typed_preference_plan_is_structurally_normalized() -> None:
@@ -352,34 +562,124 @@ def test_schema_validation_diagnostics_redact_unknown_field_paths(
     )
     with pytest.raises(ValidationError) as raised:
         owner_chat_provider._OperationalStructuredResult.model_validate(
-            {
-                "decision": "set_preference",
-                "reply": None,
-                "tool_name": None,
-                "arguments": None,
-                "preference_key": "default_inventory_location",
-                "location_reference": "   ",
-                "semantic_operation": "preference",
-                "entity_kind": None,
-                "entity_query": None,
-                "private provider field": "must not be logged",
-            }
+            _operational_preference_payload(
+                location_reference="   ",
+                **{"private provider field": "must not be logged"},
+            )
         )
 
     owner_chat_provider._log_schema_validation_diagnostics(
         raised.value,
         owner_chat_provider._OperationalStructuredResult,
+        _operational_preference_payload(
+            location_reference="   ",
+            **{"private provider field": "must not be logged"},
+        ),
     )
 
     assert logged == [
         (
-            "owner_chat_provider schema_validation_failed fields=%s",
+            "owner_chat_provider schema_validation_failed reason=%s fingerprint=%s",
+            "planner_location_reference_invalid",
             (
-                ("location_reference", "value_error"),
-                ("<unknown>", "extra_forbidden"),
+                ("action", "set_preference"),
+                ("semantic_operation", "preference"),
+                ("preference_action", "set_preference"),
+                ("preference_key", "default_inventory_location"),
+                ("location_reference", "invalid"),
+                ("tool_fields", "absent"),
+                ("reason", "planner_location_reference_invalid"),
             ),
         )
     ]
+    assert "must not be logged" not in repr(logged)
+    assert len(repr(logged)) < 1_000
+
+
+def test_schema_validation_diagnostics_redact_provider_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logged: list[tuple[object, ...]] = []
+    payload = _operational_preference_payload(
+        decision="unapproved-secret-action",
+        semantic_operation="unapproved-secret-semantic",
+        preference_key="unapproved-secret-key",
+        location_reference="Private location name",
+        tool_name="private_tool_name",
+        arguments={"private_argument": "must not be logged"},
+    )
+    monkeypatch.setattr(
+        owner_chat_provider.logger,
+        "warning",
+        lambda *arguments: logged.append(arguments),
+    )
+    with pytest.raises(ValidationError) as raised:
+        owner_chat_provider._OperationalStructuredResult.model_validate(payload)
+
+    owner_chat_provider._log_schema_validation_diagnostics(
+        raised.value,
+        owner_chat_provider._OperationalStructuredResult,
+        payload,
+    )
+
+    assert logged[0][0] == (
+        "owner_chat_provider schema_validation_failed reason=%s fingerprint=%s"
+    )
+    assert logged[0][1] == "planner_action_invalid"
+    assert logged[0][2] == (
+        ("action", "invalid"),
+        ("semantic_operation", "invalid"),
+        ("preference_action", "invalid"),
+        ("preference_key", "invalid"),
+        ("location_reference", "present"),
+        ("tool_fields", "present"),
+        ("reason", "planner_action_invalid"),
+    )
+    assert len(repr(logged)) < 1_000
+    for secret in (
+        "unapproved-secret-action",
+        "unapproved-secret-semantic",
+        "unapproved-secret-key",
+        "Private location name",
+        "private_tool_name",
+        "private_argument",
+        "must not be logged",
+    ):
+        assert secret not in repr(logged)
+
+
+def test_gemini_invalid_operational_plan_logs_safe_fingerprint_and_is_uncertain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logged: list[tuple[object, ...]] = []
+    structured = _operational_preference_payload(
+        semantic_operation="inventory_list",
+        location_reference="Private location name",
+        arguments={"private_argument": "must not be logged"},
+    )
+    monkeypatch.setattr(
+        owner_chat_provider.logger,
+        "warning",
+        lambda *arguments: logged.append(arguments),
+    )
+
+    with pytest.raises(OwnerChatProviderInvalidResponse) as raised:
+        gemini_provider(gemini_successful_transport(structured)).generate(
+            operational_request()
+        )
+
+    assert raised.value.reason == "schema_validation_failed"
+    assert raised.value.usage_uncertain is True
+    assert raised.value.usage is not None
+    diagnostic = logged[0]
+    assert diagnostic[1] == "planner_preference_action_requires_preference_semantic"
+    assert diagnostic[2][-1] == (
+        "reason",
+        "planner_preference_action_requires_preference_semantic",
+    )
+    assert len(repr(diagnostic)) < 1_000
+    for secret in ("Private location name", "private_argument", "must not be logged"):
+        assert secret not in repr(diagnostic)
 
 
 def test_gemini_operational_final_uses_only_normalized_tool_context() -> None:
@@ -520,6 +820,75 @@ def test_category_resolution_returns_only_validated_candidate_references(
         schema
         == owner_chat_provider._CategoryResolutionStructuredResult.model_json_schema()
     )
+
+
+def test_incomplete_typed_preference_plan_is_an_interpreted_intent() -> None:
+    result = owner_chat_provider._OperationalStructuredResult.model_validate(
+        {
+            "decision": "set_preference",
+            "semantic_operation": "preference",
+        }
+    )
+
+    assert result.preference_key is None
+    assert result.location_reference is None
+
+
+def test_operational_intent_with_no_tool_proposal_remains_valid() -> None:
+    result = owner_chat_provider._OperationalStructuredResult.model_validate(
+        {
+            "decision": "tool",
+            "semantic_operation": "inventory_product",
+            "entity_kind": "product",
+            "entity_query": "PEPSI-1500",
+        }
+    )
+
+    assert result.tool_name is None
+    assert result.arguments is None
+    assert result.semantic_operation == "inventory_product"
+
+
+@pytest.mark.parametrize("adapter", ["ollama", "gemini"])
+def test_preference_resolution_returns_only_bounded_references(adapter: str) -> None:
+    captured: dict[str, object] = {}
+    structured = {
+        "status": "matched",
+        "preference_key": "default_inventory_location",
+        "location_candidate_references": ["location_1"],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        if adapter == "ollama":
+            return httpx.Response(
+                200,
+                json={
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(structured),
+                    }
+                },
+            )
+        return gemini_successful_transport(structured).handle_request(request)
+
+    provider: OwnerChatProvider = (
+        ollama_provider(httpx.MockTransport(handler))
+        if adapter == "ollama"
+        else gemini_provider(httpx.MockTransport(handler))
+    )
+    result = provider.generate(preference_resolution_request())
+
+    assert result.preference_resolution_status == "matched"
+    assert result.preference_resolution_key == "default_inventory_location"
+    assert result.preference_location_candidate_references == ("location_1",)
+    system = (
+        captured["messages"][0]["content"]
+        if adapter == "ollama"
+        else captured["systemInstruction"]["parts"][0]["text"]
+    )
+    assert "business_profile" not in system
+    assert "approved_tools" not in system
 
 
 def test_operational_provider_response_rejects_unknown_fields() -> None:
@@ -1686,12 +2055,10 @@ def test_gemini_invalid_json_or_schema_is_safe(
         assert len(logged) == 1
         diagnostic = logged[0]
         assert diagnostic[0] == (
-            "owner_chat_provider schema_validation_failed fields=%s"
+            "owner_chat_provider schema_validation_failed reason=%s fingerprint=%s"
         )
-        assert all(
-            isinstance(item[0], str) and isinstance(item[1], str)
-            for item in diagnostic[1]
-        )
+        assert diagnostic[1] == "provider_schema_invalid"
+        assert diagnostic[2][-1] == ("reason", "provider_schema_invalid")
         assert "private provider body" not in repr(diagnostic)
 
 

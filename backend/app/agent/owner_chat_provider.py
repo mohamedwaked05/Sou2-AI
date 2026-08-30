@@ -21,6 +21,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from app.core.config import Settings, get_settings
 
@@ -197,6 +198,23 @@ class ProviderLocationCandidate:
 
 
 @dataclass(frozen=True)
+class ProviderPreferenceCapability:
+    """One bounded preference command supported by the platform."""
+
+    preference_key: Literal["default_inventory_location"]
+    actions: tuple[Literal["set_preference", "clear_preference"], ...]
+
+
+@dataclass(frozen=True)
+class ProviderPreferenceLocationCandidate:
+    """A request-local reference to a source location for preference resolution."""
+
+    reference: str
+    label: str
+    location_type: Literal["branch", "warehouse"]
+
+
+@dataclass(frozen=True)
 class ProviderProductCandidate:
     """A source-derived candidate for one immediately pending clarification."""
 
@@ -219,6 +237,7 @@ class OwnerChatRequest:
         "operational",
         "operational_synthesis",
         "category_resolution",
+        "preference_resolution",
         "customer",
     ] = "grounded"
     tools: tuple[ProviderToolDefinition, ...] = ()
@@ -237,6 +256,8 @@ class OwnerChatRequest:
     ) = None
     category_candidates: tuple[ProviderCategoryCandidate, ...] = ()
     location_candidates: tuple[ProviderLocationCandidate, ...] = ()
+    preference_capabilities: tuple[ProviderPreferenceCapability, ...] = ()
+    preference_location_candidates: tuple[ProviderPreferenceLocationCandidate, ...] = ()
     pending_product_candidates: tuple[ProviderProductCandidate, ...] = ()
 
 
@@ -304,6 +325,11 @@ class OwnerChatResult:
         None
     )
     category_candidate_references: tuple[str, ...] = ()
+    preference_resolution_status: Literal["matched", "ambiguous", "no_match"] | None = (
+        None
+    )
+    preference_resolution_key: str | None = None
+    preference_location_candidate_references: tuple[str, ...] = ()
     validated_result_status: (
         Literal[
             "data",
@@ -406,6 +432,20 @@ class DeterministicMockOwnerChatProvider:
                 provider_identifier="mock",
                 model_identifier="deterministic",
                 category_resolution_status="no_match",
+            )
+
+        if request.mode == "preference_resolution":
+            input_tokens = self.estimate_input_tokens(request)
+            return OwnerChatResult(
+                usage=TokenUsage(
+                    input_tokens=input_tokens,
+                    output_tokens=0,
+                    total_tokens=input_tokens,
+                    authoritative=False,
+                ),
+                provider_identifier="mock",
+                model_identifier="deterministic",
+                preference_resolution_status="no_match",
             )
 
         if request.mode == "operational":
@@ -608,6 +648,12 @@ class DeterministicMockOwnerChatProvider:
         return (next_midnight - timedelta(microseconds=1)).astimezone(UTC)
 
 
+def _structured_validation_error(reason: str) -> PydanticCustomError:
+    """Create a provider-safe, stable schema-validation error."""
+
+    return PydanticCustomError(reason, "Invalid structured provider response.")
+
+
 class _OllamaProposedKnowledge(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -635,9 +681,9 @@ class _OllamaProposedKnowledge(BaseModel):
     @model_validator(mode="after")
     def validate_lifecycle(self) -> _OllamaProposedKnowledge:
         if self.kind == "permanent" and self.expires_at is not None:
-            raise ValueError("Permanent facts cannot expire.")
+            raise _structured_validation_error("knowledge_permanent_expiry_conflict")
         if self.kind == "temporary" and self.expires_at is None:
-            raise ValueError("Temporary facts require an expiry.")
+            raise _structured_validation_error("knowledge_temporary_missing_expiry")
         return self
 
 
@@ -752,54 +798,52 @@ class _OperationalStructuredResult(BaseModel):
         expected_entity_kind = requires_entity.get(self.semantic_operation)
         if expected_entity_kind is not None:
             if self.entity_kind != expected_entity_kind or not self.entity_query:
-                raise ValueError(
-                    "This semantic operation requires its unresolved entity."
-                )
+                raise _structured_validation_error("planner_entity_semantic_mismatch")
         elif self.entity_kind is not None or self.entity_query is not None:
-            raise ValueError("Only entity-scoped operations may include an entity.")
+            raise _structured_validation_error("planner_unexpected_entity_fields")
         if self.decision in {"set_preference", "clear_preference"}:
             if self.semantic_operation != "preference":
-                raise ValueError("Preference actions require preference semantics.")
+                raise _structured_validation_error(
+                    "planner_preference_action_requires_preference_semantic"
+                )
         elif self.semantic_operation == "preference":
-            raise ValueError("Preference semantics require a preference action.")
+            raise _structured_validation_error(
+                "planner_preference_semantic_requires_preference_action"
+            )
         if self.decision == "tool":
-            if (
-                not self.tool_name
-                or self.arguments is None
-                or self.reply is not None
-                or self.preference_key is not None
-                or self.location_reference is not None
-            ):
-                raise ValueError("Tool decisions require only a tool and arguments.")
+            if self.reply is not None:
+                raise _structured_validation_error("planner_tool_reply_conflict")
+            if self.preference_key is not None or self.location_reference is not None:
+                raise _structured_validation_error(
+                    "planner_tool_preference_fields_conflict"
+                )
         elif self.decision == "set_preference":
-            if (
-                self.reply is not None
-                or self.tool_name is not None
-                or self.arguments is not None
-                or self.preference_key != "default_inventory_location"
-                or not self.location_reference
-            ):
-                raise ValueError(
-                    "Preference updates require a key and location reference."
+            if self.reply is not None:
+                raise _structured_validation_error(
+                    "planner_set_preference_reply_conflict"
+                )
+            if self.tool_name is not None or self.arguments is not None:
+                raise _structured_validation_error(
+                    "planner_set_preference_tool_fields_conflict"
                 )
         elif self.decision == "clear_preference":
-            if (
-                self.reply is not None
-                or self.tool_name is not None
-                or self.arguments is not None
-                or self.preference_key != "default_inventory_location"
-                or self.location_reference is not None
-            ):
-                raise ValueError("Preference clearing requires only an approved key.")
-        elif (
-            self.reply is None
-            or not self.reply.strip()
-            or self.tool_name is not None
-            or self.arguments is not None
-            or self.preference_key is not None
-            or self.location_reference is not None
-        ):
-            raise ValueError("Final decisions require only a nonblank reply.")
+            if self.reply is not None:
+                raise _structured_validation_error(
+                    "planner_clear_preference_reply_conflict"
+                )
+            if self.tool_name is not None or self.arguments is not None:
+                raise _structured_validation_error(
+                    "planner_clear_preference_tool_fields_conflict"
+                )
+        else:
+            if self.reply is None or not self.reply.strip():
+                raise _structured_validation_error("planner_missing_final_reply")
+            if self.tool_name is not None or self.arguments is not None:
+                raise _structured_validation_error("planner_final_tool_fields_conflict")
+            if self.preference_key is not None or self.location_reference is not None:
+                raise _structured_validation_error(
+                    "planner_final_preference_fields_conflict"
+                )
         return self
 
 
@@ -832,13 +876,46 @@ class _CategoryResolutionStructuredResult(BaseModel):
     def validate_references(self) -> _CategoryResolutionStructuredResult:
         count = len(self.candidate_references)
         if len(set(self.candidate_references)) != count:
-            raise ValueError("Category references must be unique.")
+            raise _structured_validation_error("category_duplicate_references")
         if (
             (self.status == "matched" and count != 1)
             or (self.status == "ambiguous" and count < 2)
             or (self.status == "no_match" and count != 0)
         ):
-            raise ValueError("Category resolution status does not match references.")
+            raise _structured_validation_error("category_status_reference_mismatch")
+        return self
+
+
+class _PreferenceResolutionStructuredResult(BaseModel):
+    """A bounded, non-executable match for an incomplete preference intent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["matched", "ambiguous", "no_match"]
+    preference_key: Literal["default_inventory_location"] | None = None
+    location_candidate_references: list[str] = []
+
+    @model_validator(mode="after")
+    def validate_references(self) -> _PreferenceResolutionStructuredResult:
+        count = len(self.location_candidate_references)
+        if len(set(self.location_candidate_references)) != count:
+            raise _structured_validation_error(
+                "preference_duplicate_location_references"
+            )
+        if (
+            (self.status == "matched" and (self.preference_key is None or count != 1))
+            or (
+                self.status == "ambiguous"
+                and (self.preference_key is not None or count < 2)
+            )
+            or (
+                self.status == "no_match"
+                and (self.preference_key is not None or count != 0)
+            )
+        ):
+            raise _structured_validation_error(
+                "preference_resolution_status_reference_mismatch"
+            )
         return self
 
 
@@ -1106,11 +1183,14 @@ def _operational_instructions(request: OwnerChatRequest) -> str:
         "the listed supported metrics without relabeling or silently substituting "
         "one as another. Preserve the owner's language and style. "
         "For a future inventory-location instruction, set semantic_operation to "
-        "preference and use set_preference with only "
-        "default_inventory_location and the unresolved location_reference. Interpret "
-        "against the bounded source-defined location_candidates but never invent a "
-        "location identifier. Use clear_preference with semantic_operation preference "
-        "only for that approved key. These "
+        "preference and decision to set_preference. Set preference_key to "
+        "default_inventory_location and location_reference to the owner's unresolved "
+        "location phrase. Interpret only against the bounded source-defined "
+        "location_candidates but never invent a location identifier. If either field "
+        "cannot be supplied, keep the typed preference action and omit only that "
+        "field; the backend will perform bounded resolution. Use clear_preference "
+        "with semantic_operation preference and preference_key "
+        "default_inventory_location only for that approved key. These "
         "actions do not run inventory queries. "
         "pending_product_candidates, when supplied, are source-derived options from "
         "only the immediately preceding unresolved product clarification. Use them "
@@ -1162,6 +1242,37 @@ def _category_resolution_instructions(request: OwnerChatRequest) -> str:
         "multiple candidates, and no_match otherwise. Never invent references. "
         "Return JSON only. Candidates follow:\n"
         f"{json.dumps(candidates, ensure_ascii=False, separators=(',', ':'))}"
+    )
+
+
+def _preference_resolution_instructions(request: OwnerChatRequest) -> str:
+    context = {
+        "supported_preference_capabilities": [
+            {
+                "preference_key": capability.preference_key,
+                "actions": list(capability.actions),
+            }
+            for capability in request.preference_capabilities
+        ],
+        "location_candidates": [
+            {
+                "reference": candidate.reference,
+                "label": candidate.label,
+                "location_type": candidate.location_type,
+            }
+            for candidate in request.preference_location_candidates
+        ],
+    }
+    return (
+        "Resolve one incomplete typed preference instruction using only the supplied "
+        "bounded capabilities and location candidates. Return matched only with one "
+        "supported preference_key and exactly one supplied "
+        "location_candidate_reference. "
+        "Return ambiguous with two or more supplied location_candidate_references and "
+        "no preference_key. Return no_match with no key or references. Never invent "
+        "or transform references, keys, labels, or identifiers. Return JSON only. "
+        "Bounded context follows:\n"
+        f"{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}"
     )
 
 
@@ -1239,29 +1350,171 @@ def _canonical_citation_labels(
     return tuple(canonical)
 
 
-def _log_schema_validation_diagnostics(
-    error: ValidationError, response_model: type[BaseModel]
-) -> None:
-    """Log only declared top-level paths and Pydantic error types."""
+_OPERATIONAL_ACTIONS = frozenset(
+    {"final", "tool", "unavailable", "set_preference", "clear_preference"}
+)
+_SEMANTIC_OPERATIONS = frozenset(
+    {
+        "inventory_product",
+        "inventory_category",
+        "inventory_list",
+        "restocking",
+        "sales_summary",
+        "preference",
+        "knowledge",
+        "unsupported",
+    }
+)
+_STABLE_SCHEMA_REASON_CODES = frozenset(
+    {
+        "knowledge_permanent_expiry_conflict",
+        "knowledge_temporary_missing_expiry",
+        "planner_entity_semantic_mismatch",
+        "planner_unexpected_entity_fields",
+        "planner_preference_action_requires_preference_semantic",
+        "planner_preference_semantic_requires_preference_action",
+        "planner_missing_tool_fields",
+        "planner_tool_reply_conflict",
+        "planner_set_preference_reply_conflict",
+        "planner_clear_preference_reply_conflict",
+        "planner_tool_preference_fields_conflict",
+        "planner_set_preference_tool_fields_conflict",
+        "planner_clear_preference_tool_fields_conflict",
+        "planner_invalid_preference_key",
+        "planner_missing_location_reference",
+        "planner_unexpected_location_reference",
+        "planner_missing_final_reply",
+        "planner_final_tool_fields_conflict",
+        "planner_final_preference_fields_conflict",
+        "category_duplicate_references",
+        "category_status_reference_mismatch",
+        "preference_duplicate_location_references",
+        "preference_resolution_status_reference_mismatch",
+    }
+)
 
-    declared_fields = frozenset(response_model.model_fields)
-    diagnostics: list[tuple[str, str]] = []
-    for item in error.errors():
+
+def _safe_enum_state(value: object, allowed: frozenset[str]) -> str:
+    if value is None:
+        return "missing"
+    if isinstance(value, str) and value in allowed:
+        return value
+    return "invalid"
+
+
+def _planner_fingerprint(
+    payload: object | None, reason: str
+) -> tuple[tuple[str, str], ...]:
+    """Return a bounded diagnostic that never includes provider-supplied values."""
+
+    value = payload if isinstance(payload, dict) else {}
+    action = _safe_enum_state(value.get("decision"), _OPERATIONAL_ACTIONS)
+    preference_action = (
+        action
+        if action in {"set_preference", "clear_preference"}
+        else "missing"
+        if action == "missing"
+        else "invalid"
+        if action == "invalid"
+        else "none"
+    )
+    preference_key = _safe_enum_state(
+        value.get("preference_key"), frozenset({"default_inventory_location"})
+    )
+    location_reference = value.get("location_reference")
+    location_state = (
+        "missing"
+        if location_reference is None
+        else "present"
+        if isinstance(location_reference, str)
+        and 1 <= len(location_reference) <= 255
+        and bool(location_reference.strip())
+        else "invalid"
+    )
+    return (
+        ("action", action),
+        (
+            "semantic_operation",
+            _safe_enum_state(value.get("semantic_operation"), _SEMANTIC_OPERATIONS),
+        ),
+        ("preference_action", preference_action),
+        ("preference_key", preference_key),
+        ("location_reference", location_state),
+        (
+            "tool_fields",
+            "present"
+            if value.get("tool_name") is not None or value.get("arguments") is not None
+            else "absent",
+        ),
+        ("reason", reason),
+    )
+
+
+def _validation_reason_code(
+    error: ValidationError, response_model: type[BaseModel]
+) -> str:
+    """Map Pydantic failures to a stable code without examining their values."""
+
+    fields = frozenset(response_model.model_fields)
+    errors = error.errors(include_input=False)
+    for item in errors:
+        error_type = item.get("type")
+        if isinstance(error_type, str) and error_type in _STABLE_SCHEMA_REASON_CODES:
+            return error_type
+    for item in errors:
         location = item.get("loc")
         field = (
             location[0]
             if isinstance(location, tuple) and location and isinstance(location[0], str)
-            else "<model>"
+            else None
         )
-        safe_field = field if field in declared_fields else "<unknown>"
+        if field not in fields:
+            continue
         error_type = item.get("type")
-        diagnostics.append(
-            (safe_field, error_type if isinstance(error_type, str) else "unknown")
-        )
+        missing = error_type == "missing"
+        if field == "decision":
+            return "planner_action_missing" if missing else "planner_action_invalid"
+        if field == "semantic_operation":
+            return (
+                "planner_semantic_operation_missing"
+                if missing
+                else "planner_semantic_operation_invalid"
+            )
+        if field == "preference_key":
+            return (
+                "planner_preference_key_missing"
+                if missing
+                else "planner_invalid_preference_key"
+            )
+        if field == "location_reference":
+            return (
+                "planner_location_reference_missing"
+                if missing
+                else "planner_location_reference_invalid"
+            )
+    return "provider_schema_invalid"
+
+
+def _log_schema_validation_diagnostics(
+    error: ValidationError,
+    response_model: type[BaseModel],
+    payload: object | None = None,
+) -> None:
+    """Log a bounded structural fingerprint, never provider text or values."""
+
+    reason = _validation_reason_code(error, response_model)
     logger.warning(
-        "owner_chat_provider schema_validation_failed fields=%s",
-        tuple(diagnostics),
+        "owner_chat_provider schema_validation_failed reason=%s fingerprint=%s",
+        reason,
+        _planner_fingerprint(payload, reason),
     )
+
+
+def _safe_structured_payload(value: str) -> object | None:
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return None
 
 
 def _canonical_json(value: object) -> str:
@@ -1419,7 +1672,9 @@ class OllamaOwnerChatProvider:
             try:
                 envelope = _OllamaChatResponse.model_validate(response_payload)
             except ValidationError as exc:
-                _log_schema_validation_diagnostics(exc, _OllamaChatResponse)
+                _log_schema_validation_diagnostics(
+                    exc, _OllamaChatResponse, response_payload
+                )
                 raise OwnerChatProviderInvalidResponse(
                     reason="invalid_envelope",
                     usage=usage,
@@ -1442,6 +1697,9 @@ class OllamaOwnerChatProvider:
                 category_candidate_reference = None
                 category_resolution_status = None
                 category_candidate_references: tuple[str, ...] = ()
+                preference_resolution_status = None
+                preference_resolution_key = None
+                preference_location_candidate_references: tuple[str, ...] = ()
                 if request.mode == "conversation":
                     conversation_result = (
                         _ConversationStructuredResult.model_validate_json(
@@ -1527,6 +1785,30 @@ class OllamaOwnerChatProvider:
                     category_candidate_references = tuple(
                         category_result.candidate_references
                     )
+                elif request.mode == "preference_resolution":
+                    preference_result = (
+                        _PreferenceResolutionStructuredResult.model_validate_json(
+                            envelope.message.content
+                        )
+                    )
+                    reply = ""
+                    requires_business_knowledge = False
+                    cited_source_ids = ()
+                    proposed_knowledge = ()
+                    decision = "final"
+                    tool_name = None
+                    tool_arguments = None
+                    preference_key = None
+                    location_reference = None
+                    semantic_operation = None
+                    entity_kind = None
+                    entity_query = None
+                    category_candidate_reference = None
+                    preference_resolution_status = preference_result.status
+                    preference_resolution_key = preference_result.preference_key
+                    preference_location_candidate_references = tuple(
+                        preference_result.location_candidate_references
+                    )
                 else:
                     grounded_result = _OllamaStructuredResult.model_validate_json(
                         envelope.message.content
@@ -1576,9 +1858,15 @@ class OllamaOwnerChatProvider:
                     if request.mode == "operational_synthesis"
                     else _CategoryResolutionStructuredResult
                     if request.mode == "category_resolution"
+                    else _PreferenceResolutionStructuredResult
+                    if request.mode == "preference_resolution"
                     else _OllamaStructuredResult
                 )
-                _log_schema_validation_diagnostics(exc, response_model)
+                _log_schema_validation_diagnostics(
+                    exc,
+                    response_model,
+                    _safe_structured_payload(envelope.message.content),
+                )
                 raise OwnerChatProviderInvalidResponse(
                     reason="invalid_structured_response",
                     usage=usage,
@@ -1657,6 +1945,11 @@ class OllamaOwnerChatProvider:
             category_candidate_reference=category_candidate_reference,
             category_resolution_status=category_resolution_status,
             category_candidate_references=category_candidate_references,
+            preference_resolution_status=preference_resolution_status,
+            preference_resolution_key=preference_resolution_key,
+            preference_location_candidate_references=(
+                preference_location_candidate_references
+            ),
             validated_result_status=(
                 synthesis_result.validated_result_status
                 if request.mode == "operational_synthesis"
@@ -1674,6 +1967,20 @@ class OllamaOwnerChatProvider:
                     {
                         "role": "system",
                         "content": _category_resolution_instructions(request),
+                    },
+                    {"role": "user", "content": request.messages[-1].content},
+                ],
+                "options": {"num_predict": request.max_output_tokens, "temperature": 0},
+            }
+        if request.mode == "preference_resolution":
+            return {
+                "model": self.model,
+                "stream": False,
+                "format": _PreferenceResolutionStructuredResult.model_json_schema(),
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": _preference_resolution_instructions(request),
                     },
                     {"role": "user", "content": request.messages[-1].content},
                 ],
@@ -1997,6 +2304,8 @@ class GeminiOwnerChatProvider:
                 if request.mode == "operational_synthesis"
                 else _CategoryResolutionStructuredResult
                 if request.mode == "category_resolution"
+                else _PreferenceResolutionStructuredResult
+                if request.mode == "preference_resolution"
                 else _OllamaStructuredResult
             )
             try:
@@ -2013,6 +2322,9 @@ class GeminiOwnerChatProvider:
             category_resolution_status = None
             category_candidate_references: tuple[str, ...] = ()
             category_candidate_reference = None
+            preference_resolution_status = None
+            preference_resolution_key = None
+            preference_location_candidate_references: tuple[str, ...] = ()
             if isinstance(structured, _ConversationStructuredResult):
                 semantic_operation = None
                 entity_kind = None
@@ -2073,6 +2385,25 @@ class GeminiOwnerChatProvider:
                 category_candidate_reference = None
                 category_resolution_status = structured.status
                 category_candidate_references = tuple(structured.candidate_references)
+            elif isinstance(structured, _PreferenceResolutionStructuredResult):
+                reply = ""
+                requires_business_knowledge = False
+                cited_source_ids = ()
+                proposed_knowledge = ()
+                decision = "final"
+                tool_name = None
+                tool_arguments = None
+                preference_key = None
+                location_reference = None
+                semantic_operation = None
+                entity_kind = None
+                entity_query = None
+                category_candidate_reference = None
+                preference_resolution_status = structured.status
+                preference_resolution_key = structured.preference_key
+                preference_location_candidate_references = tuple(
+                    structured.location_candidate_references
+                )
             else:
                 semantic_operation = None
                 entity_kind = None
@@ -2185,6 +2516,11 @@ class GeminiOwnerChatProvider:
             category_candidate_reference=category_candidate_reference,
             category_resolution_status=category_resolution_status,
             category_candidate_references=category_candidate_references,
+            preference_resolution_status=preference_resolution_status,
+            preference_resolution_key=preference_resolution_key,
+            preference_location_candidate_references=(
+                preference_location_candidate_references
+            ),
             validated_result_status=(
                 structured.validated_result_status
                 if isinstance(structured, _OperationalSynthesisStructuredResult)
@@ -2209,6 +2545,26 @@ class GeminiOwnerChatProvider:
                     "responseMimeType": "application/json",
                     "responseJsonSchema": (
                         _CategoryResolutionStructuredResult.model_json_schema()
+                    ),
+                    "thinkingConfig": self._thinking_config(),
+                },
+            }
+        if request.mode == "preference_resolution":
+            return {
+                "systemInstruction": {
+                    "parts": [{"text": _preference_resolution_instructions(request)}]
+                },
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": request.messages[-1].content}],
+                    }
+                ],
+                "generationConfig": {
+                    "maxOutputTokens": request.max_output_tokens,
+                    "responseMimeType": "application/json",
+                    "responseJsonSchema": (
+                        _PreferenceResolutionStructuredResult.model_json_schema()
                     ),
                     "thinkingConfig": self._thinking_config(),
                 },
@@ -2352,13 +2708,15 @@ class GeminiOwnerChatProvider:
         | type[_ConversationStructuredResult]
         | type[_OperationalStructuredResult]
         | type[_OperationalSynthesisStructuredResult]
-        | type[_CategoryResolutionStructuredResult] = _OllamaStructuredResult,
+        | type[_CategoryResolutionStructuredResult]
+        | type[_PreferenceResolutionStructuredResult] = _OllamaStructuredResult,
     ) -> tuple[
         _OllamaStructuredResult
         | _ConversationStructuredResult
         | _OperationalStructuredResult
         | _OperationalSynthesisStructuredResult
-        | _CategoryResolutionStructuredResult,
+        | _CategoryResolutionStructuredResult
+        | _PreferenceResolutionStructuredResult,
         str,
     ]:
         if GeminiOwnerChatProvider._is_blocked(payload, None):
@@ -2377,7 +2735,7 @@ class GeminiOwnerChatProvider:
         try:
             return response_model.model_validate(decoded), text
         except ValidationError as exc:
-            _log_schema_validation_diagnostics(exc, response_model)
+            _log_schema_validation_diagnostics(exc, response_model, decoded)
             raise _GeminiResponseParseError("schema_validation_failed") from None
 
     @staticmethod

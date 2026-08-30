@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 
 from fastapi import status
 from sqlalchemy import and_, or_, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -32,6 +33,8 @@ from app.agent.owner_chat_provider import (
     ProviderKnowledge,
     ProviderLocationCandidate,
     ProviderMessage,
+    ProviderPreferenceCapability,
+    ProviderPreferenceLocationCandidate,
     ProviderProductCandidate,
     ProviderSource,
     ProviderToolDefinition,
@@ -56,6 +59,7 @@ from app.database.models import (
     OwnerChatMessage,
     OwnerConversation,
     OwnerConversationSummary,
+    PendingOwnerOperationalPreference,
     User,
     UserOperationalPreference,
 )
@@ -88,8 +92,11 @@ from app.services.businesses import load_full_access_business
 from app.services.conversations import get_default_conversation, load_conversation
 from app.tools.operational import (
     CURRENT_INVENTORY_TOOL,
+    RESTOCKING_RECOMMENDATIONS_TOOL,
+    SALES_SUMMARY_TOOL,
     OperationalToolExecutor,
     ToolExecutionError,
+    _contains_control_payload,
 )
 
 _logger = logging.getLogger(__name__)
@@ -99,6 +106,8 @@ CHAT_CONTEXT_MESSAGE_LIMIT = 12
 # response-only synthesis. Reserve for the complete bounded path up front.
 MAX_OPERATIONAL_PROVIDER_CALLS = 3
 CATEGORY_RESOLUTION_MAX_OUTPUT_TOKENS = 64
+PREFERENCE_RESOLUTION_MAX_OUTPUT_TOKENS = 64
+PREFERENCE_PENDING_TTL = timedelta(minutes=15)
 HISTORY_PAGE_SIZE = 50
 ABANDONED_TURN_RECOVERY_BATCH_SIZE = 100
 HIGH_CONFIDENCE_EVIDENCE_SIMILARITY = 0.65
@@ -115,12 +124,54 @@ PROVIDER_WEEKDAYS = (
 _SAFE_FINANCIAL_METRICS = frozenset(
     {"revenue", "gross_profit", "net_profit", "sales_count", "inventory_value"}
 )
+_PREFERENCE_CAPABILITIES = (
+    ProviderPreferenceCapability(
+        preference_key="default_inventory_location",
+        actions=("set_preference", "clear_preference"),
+    ),
+)
 
 
 @dataclass(frozen=True)
 class _Claim:
     message_id: uuid.UUID
     token: uuid.UUID
+
+
+@dataclass(frozen=True)
+class _InterpretedPreferenceIntent:
+    """Typed planner intent that cannot write until bounded resolution succeeds."""
+
+    action: str
+    preference_key: str | None
+    location_reference: str | None
+
+
+@dataclass(frozen=True)
+class _ValidatedPreferenceCommand:
+    """The scoped persistence contract, built only from approved bounded values."""
+
+    action: str
+    preference_key: str
+    location_external_id: str | None = None
+    location_type: str | None = None
+
+
+@dataclass(frozen=True)
+class _PendingPreferenceCandidate:
+    reference: str
+    external_location_id: str
+    location_type: str
+
+
+@dataclass(frozen=True)
+class _ValidatedOperationalCommand:
+    """Backend-created operational command; provider proposals are never executable."""
+
+    tool_name: str
+    arguments: dict[str, object]
+    provider_tool_fields: str
+    consistency_outcome: str
 
 
 @dataclass(frozen=True)
@@ -1572,6 +1623,19 @@ def _usage_for_result(
             sort_keys=True,
             separators=(",", ":"),
         )
+    elif request.mode == "preference_resolution":
+        output = json.dumps(
+            {
+                "status": result.preference_resolution_status,
+                "preference_key": result.preference_resolution_key,
+                "location_candidate_references": (
+                    result.preference_location_candidate_references
+                ),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     else:
         output = (
             result.reply
@@ -1604,63 +1668,143 @@ def _planned_metric(arguments: object) -> str | None:
     )
 
 
+def _validated_provider_arguments(
+    executor: OperationalToolExecutor, tool_name: str, arguments: object
+) -> dict[str, object] | None:
+    """Validate a proposal without retaining it as an executable command."""
+
+    if not isinstance(arguments, dict):
+        return None
+    definition = executor.registry[tool_name]
+    input_schema = definition.provider_input_schema or definition.input_schema
+    try:
+        encoded = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
+        validated = input_schema.model_validate_json(encoded, strict=True)
+    except TypeError, ValueError:
+        return None
+    return validated.model_dump(mode="json", exclude_none=True)
+
+
+def _backend_operational_command(
+    result: OwnerChatResult,
+    executor: OperationalToolExecutor,
+    category_candidates: tuple[ProviderCategoryCandidate, ...],
+) -> _ValidatedOperationalCommand | None:
+    """Derive one allowlisted command from semantic intent and typed inputs only."""
+
+    tool_by_operation = {
+        "inventory_product": CURRENT_INVENTORY_TOOL,
+        "inventory_category": CURRENT_INVENTORY_TOOL,
+        "inventory_list": CURRENT_INVENTORY_TOOL,
+        "restocking": RESTOCKING_RECOMMENDATIONS_TOOL,
+        "sales_summary": SALES_SUMMARY_TOOL,
+    }
+    tool_name = tool_by_operation.get(result.semantic_operation)
+    if tool_name is None:
+        return None
+
+    if result.tool_name is not None and result.tool_name not in executor.registry:
+        raise OwnerChatProviderInvalidResponse(reason="prohibited_provider_tool")
+    if result.tool_arguments is not None and _contains_control_payload(
+        result.tool_arguments
+    ):
+        raise OwnerChatProviderInvalidResponse(reason="prohibited_provider_arguments")
+
+    proposal_fields = (
+        "present"
+        if result.tool_name is not None or result.tool_arguments is not None
+        else "missing"
+    )
+    proposal = _validated_provider_arguments(executor, tool_name, result.tool_arguments)
+    arguments: dict[str, object] = {}
+
+    if tool_name == CURRENT_INVENTORY_TOOL:
+        # Only the typed semantic entity can scope an inventory lookup. A provider
+        # may propose an owner-facing location reference, which is separately
+        # resolved by _prepare_inventory_location_arguments below.
+        if proposal is not None:
+            limit = proposal.get("limit")
+            location_reference = proposal.get("location_reference")
+            if isinstance(limit, int) and not isinstance(limit, bool):
+                arguments["limit"] = limit
+            if isinstance(location_reference, str):
+                arguments["location_reference"] = location_reference
+        if result.semantic_operation == "inventory_product":
+            arguments["product_filter"] = result.entity_query
+        elif result.semantic_operation == "inventory_category":
+            candidate = next(
+                (
+                    item
+                    for item in category_candidates
+                    if item.external_category_id == result.category_candidate_reference
+                ),
+                None,
+            )
+            if result.category_candidate_reference is not None and candidate is None:
+                raise OwnerChatProviderInvalidResponse(
+                    reason="invalid_category_candidate_reference"
+                )
+            arguments["category_filter"] = (
+                candidate.label if candidate is not None else result.entity_query
+            )
+    elif tool_name == RESTOCKING_RECOMMENDATIONS_TOOL:
+        # Restocking without a typed product/category intent is intentionally a
+        # bounded recommendation list; provider filters and source IDs are ignored.
+        if proposal is not None:
+            limit = proposal.get("limit")
+            if isinstance(limit, int) and not isinstance(limit, bool):
+                arguments["limit"] = limit
+    else:
+        # Sales has no safe unfiltered default: a strict typed metric and reporting
+        # scope are required before the backend creates the command.
+        if proposal is None:
+            return None
+        for field in ("start_date", "end_date", "metric"):
+            value = proposal.get(field)
+            if not isinstance(value, str) or not value:
+                return None
+            arguments[field] = value
+
+    proposal_matches = (
+        result.decision == "tool"
+        and result.tool_name == tool_name
+        and proposal is not None
+        and {
+            key: value
+            for key, value in proposal.items()
+            if key in arguments or key == "location_reference"
+        }
+        == arguments
+    )
+    return _ValidatedOperationalCommand(
+        tool_name=tool_name,
+        arguments=arguments,
+        provider_tool_fields=proposal_fields,
+        consistency_outcome="accepted" if proposal_matches else "normalized",
+    )
+
+
 def _consistent_operational_plan(
     result: OwnerChatResult,
+    executor: OperationalToolExecutor,
     category_candidates: tuple[ProviderCategoryCandidate, ...],
-) -> tuple[OwnerChatResult, str]:
-    """Derive inventory execution from validated semantic intent, not tool choice."""
+) -> tuple[OwnerChatResult, _ValidatedOperationalCommand | None]:
+    """Replace an interpreted plan with the backend-created executable command."""
 
-    if result.semantic_operation not in {
-        "inventory_product",
-        "inventory_category",
-        "inventory_list",
-    }:
-        return result, "accepted"
-
-    arguments: dict[str, object] = {}
-    if result.semantic_operation == "inventory_product":
-        arguments["product_filter"] = result.entity_query
-    elif result.semantic_operation == "inventory_category":
-        candidate = next(
-            (
-                item
-                for item in category_candidates
-                if item.external_category_id == result.category_candidate_reference
-            ),
-            None,
-        )
-        if result.category_candidate_reference is not None and candidate is None:
-            raise OwnerChatProviderInvalidResponse(
-                reason="invalid_category_candidate_reference"
-            )
-        arguments["category_filter"] = (
-            candidate.label if candidate is not None else result.entity_query
-        )
-    if (
-        result.tool_name == CURRENT_INVENTORY_TOOL
-        and isinstance(result.tool_arguments, dict)
-        and isinstance(result.tool_arguments.get("location_reference"), str)
-    ):
-        arguments["location_reference"] = result.tool_arguments["location_reference"]
-
-    is_consistent = (
-        result.decision == "tool"
-        and result.tool_name == CURRENT_INVENTORY_TOOL
-        and result.tool_arguments == arguments
-    )
-    if is_consistent:
-        return result, "accepted"
+    command = _backend_operational_command(result, executor, category_candidates)
+    if command is None:
+        return result, None
     return (
         replace(
             result,
             decision="tool",
             reply="",
-            tool_name=CURRENT_INVENTORY_TOOL,
-            tool_arguments=arguments,
+            tool_name=command.tool_name,
+            tool_arguments=command.arguments,
             preference_key=None,
             location_reference=None,
         ),
-        "normalized",
+        command,
     )
 
 
@@ -1932,13 +2076,284 @@ def _prepare_inventory_location_arguments(
     )
 
 
+def _supported_preference_keys(action: str) -> tuple[str, ...]:
+    return tuple(
+        capability.preference_key
+        for capability in _PREFERENCE_CAPABILITIES
+        if action in capability.actions
+    )
+
+
+def _interpret_preference_intent(
+    result: OwnerChatResult,
+) -> _InterpretedPreferenceIntent:
+    if result.decision not in {"set_preference", "clear_preference"}:
+        raise OwnerChatProviderInvalidResponse(reason="invalid_operational_response")
+    if (
+        result.semantic_operation != "preference"
+        or result.reply
+        or result.tool_name is not None
+        or result.tool_arguments is not None
+    ):
+        raise OwnerChatProviderInvalidResponse(reason="invalid_operational_response")
+    if (
+        result.preference_key is not None
+        and result.preference_key not in _supported_preference_keys(result.decision)
+    ):
+        raise OwnerChatProviderInvalidResponse(reason="invalid_operational_response")
+    return _InterpretedPreferenceIntent(
+        action=result.decision,
+        preference_key=result.preference_key,
+        location_reference=result.location_reference,
+    )
+
+
+def _resolved_preference_key(intent: _InterpretedPreferenceIntent) -> str | None:
+    if intent.preference_key is not None:
+        return intent.preference_key
+    supported_keys = _supported_preference_keys(intent.action)
+    return supported_keys[0] if len(supported_keys) == 1 else None
+
+
+def _preference_location_candidates(
+    candidates: tuple[object, ...],
+) -> tuple[ProviderPreferenceLocationCandidate, ...]:
+    resolved: list[ProviderPreferenceLocationCandidate] = []
+    for index, candidate in enumerate(candidates, start=1):
+        label = getattr(candidate, "label", None)
+        location_type = getattr(candidate, "location_type", None)
+        if not isinstance(label, str) or location_type not in {"branch", "warehouse"}:
+            continue
+        resolved.append(
+            ProviderPreferenceLocationCandidate(
+                reference=f"location_{index}", label=label, location_type=location_type
+            )
+        )
+    return tuple(resolved)
+
+
+def _deterministic_preference_location(
+    location_reference: str | None,
+    candidates: tuple[object, ...],
+) -> object | None:
+    if not isinstance(location_reference, str) or not location_reference.strip():
+        return None
+    normalized_reference = " ".join(location_reference.split()).casefold()
+    matches = tuple(
+        candidate
+        for candidate in candidates
+        if normalized_reference
+        in " ".join(str(getattr(candidate, "label", "")).split()).casefold()
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+def _validated_preference_command(
+    intent: _InterpretedPreferenceIntent,
+    preference_key: str | None,
+    location: object | None = None,
+) -> _ValidatedPreferenceCommand | None:
+    if preference_key not in _supported_preference_keys(intent.action):
+        return None
+    if intent.action == "clear_preference":
+        return _ValidatedPreferenceCommand(
+            action=intent.action,
+            preference_key=preference_key,
+            location_external_id=getattr(location, "external_location_id", None),
+            location_type=getattr(location, "location_type", None),
+        )
+    external_id = getattr(location, "external_location_id", None)
+    location_type = getattr(location, "location_type", None)
+    if not isinstance(external_id, str) or location_type not in {"branch", "warehouse"}:
+        return None
+    return _ValidatedPreferenceCommand(
+        action=intent.action,
+        preference_key=preference_key,
+        location_external_id=external_id,
+        location_type=location_type,
+    )
+
+
+def _build_preference_resolution_request(
+    request: OwnerChatRequest,
+    candidates: tuple[ProviderPreferenceLocationCandidate, ...],
+) -> OwnerChatRequest:
+    """Create a compact resolver request with no chat, RAG, or business context."""
+
+    return replace(
+        request,
+        messages=(request.messages[-1],),
+        rolling_summary=None,
+        max_output_tokens=min(
+            request.max_output_tokens, PREFERENCE_RESOLUTION_MAX_OUTPUT_TOKENS
+        ),
+        mode="preference_resolution",
+        tools=(),
+        tool_results=(),
+        category_candidates=(),
+        location_candidates=(),
+        pending_product_candidates=(),
+        preference_capabilities=_PREFERENCE_CAPABILITIES,
+        preference_location_candidates=candidates,
+    )
+
+
+def _pending_candidate_records(
+    pending: PendingOwnerOperationalPreference,
+) -> tuple[_PendingPreferenceCandidate, ...]:
+    records: list[_PendingPreferenceCandidate] = []
+    for value in pending.candidate_references:
+        if not isinstance(value, dict):
+            continue
+        reference = value.get("reference")
+        external_id = value.get("external_location_id")
+        location_type = value.get("location_type")
+        if (
+            isinstance(reference, str)
+            and isinstance(external_id, str)
+            and location_type in {"branch", "warehouse"}
+        ):
+            records.append(
+                _PendingPreferenceCandidate(reference, external_id, location_type)
+            )
+    return tuple(records)
+
+
+def _active_pending_preference(
+    session: Session,
+    user: User,
+    business_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    source_id: uuid.UUID | None,
+) -> PendingOwnerOperationalPreference | None:
+    pending_rows = session.scalars(
+        select(PendingOwnerOperationalPreference)
+        .where(
+            PendingOwnerOperationalPreference.user_id == user.id,
+            PendingOwnerOperationalPreference.business_id == business_id,
+            PendingOwnerOperationalPreference.conversation_id == conversation_id,
+            PendingOwnerOperationalPreference.state == "pending",
+        )
+        .with_for_update()
+    ).all()
+    now = utc_now()
+    active: PendingOwnerOperationalPreference | None = None
+    for pending in pending_rows:
+        if pending.expires_at <= now:
+            pending.state = "expired"
+            pending.version += 1
+        elif source_id is None or pending.source_id != source_id:
+            pending.state = "invalidated"
+            pending.version += 1
+        else:
+            active = pending
+    if any(item.state != "pending" for item in pending_rows):
+        session.commit()
+    return active
+
+
+def _store_pending_preference(
+    session: Session,
+    user: User,
+    business_id: uuid.UUID,
+    source_id: uuid.UUID,
+    owner_message_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    candidates: tuple[object, ...],
+) -> PendingOwnerOperationalPreference:
+    references = [
+        {
+            "reference": f"location_{index}",
+            "external_location_id": str(candidate.external_location_id),
+            "location_type": str(candidate.location_type),
+        }
+        for index, candidate in enumerate(candidates, start=1)
+        if isinstance(getattr(candidate, "external_location_id", None), str)
+        and getattr(candidate, "location_type", None) in {"branch", "warehouse"}
+    ]
+    if not references:
+        raise ToolExecutionError("invalid_arguments")
+    now = utc_now()
+    statement = insert(PendingOwnerOperationalPreference).values(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        business_id=business_id,
+        source_id=source_id,
+        conversation_id=conversation_id,
+        originating_message_id=owner_message_id,
+        operation="set_preference",
+        preference_key="default_inventory_location",
+        expected_field="location",
+        candidate_references=references,
+        state="pending",
+        version=1,
+        expires_at=now + PREFERENCE_PENDING_TTL,
+    )
+    statement = statement.on_conflict_do_update(
+        index_elements=(
+            "user_id",
+            "business_id",
+            "source_id",
+            "conversation_id",
+            "preference_key",
+        ),
+        index_where=PendingOwnerOperationalPreference.state == "pending",
+        set_={
+            "originating_message_id": owner_message_id,
+            "candidate_references": references,
+            "expected_field": "location",
+            "version": PendingOwnerOperationalPreference.version + 1,
+            "expires_at": now + PREFERENCE_PENDING_TTL,
+            "updated_at": now,
+        },
+    )
+    session.execute(statement)
+    pending = session.scalar(
+        select(PendingOwnerOperationalPreference)
+        .where(
+            PendingOwnerOperationalPreference.user_id == user.id,
+            PendingOwnerOperationalPreference.business_id == business_id,
+            PendingOwnerOperationalPreference.source_id == source_id,
+            PendingOwnerOperationalPreference.conversation_id == conversation_id,
+            PendingOwnerOperationalPreference.preference_key
+            == "default_inventory_location",
+            PendingOwnerOperationalPreference.state == "pending",
+        )
+        .with_for_update()
+    )
+    if pending is None:  # pragma: no cover - guarded by the partial unique index
+        raise ToolExecutionError("invalid_arguments")
+    return pending
+
+
+def _finish_pending_preference(
+    pending: PendingOwnerOperationalPreference | None, state: str
+) -> None:
+    if pending is not None and pending.state == "pending":
+        pending.state = state
+        pending.version += 1
+
+
+def _supersede_pending_preference(
+    session: Session,
+    user: User,
+    business_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    source_id: uuid.UUID,
+) -> None:
+    pending = _active_pending_preference(
+        session, user, business_id, conversation_id, source_id
+    )
+    _finish_pending_preference(pending, "superseded")
+
+
 def _save_inventory_location_preference(
     session: Session,
     executor: OperationalToolExecutor,
     user: User,
     business_id: uuid.UUID,
-    action: str,
-    location_reference: str | None,
+    command: _ValidatedPreferenceCommand,
+    pending: PendingOwnerOperationalPreference | None = None,
 ) -> ProviderToolResult:
     source = executor._active_source(business_id)
     if source is None:
@@ -1947,68 +2362,94 @@ def _save_inventory_location_preference(
         UserOperationalPreference.user_id == user.id,
         UserOperationalPreference.business_id == business_id,
         UserOperationalPreference.source_id == source.id,
-        UserOperationalPreference.preference_key == "default_inventory_location",
+        UserOperationalPreference.preference_key == command.preference_key,
     )
-    existing = session.scalar(statement)
-    if action == "clear_preference":
-        if existing is not None:
+    existing = session.scalar(statement.with_for_update())
+    if command.action == "clear_preference":
+        matches_requested_location = command.location_external_id is None or (
+            existing is not None
+            and existing.location_external_id == command.location_external_id
+            and existing.location_type == command.location_type
+        )
+        if existing is not None and matches_requested_location:
             session.delete(existing)
+            _finish_pending_preference(pending, "completed")
             session.commit()
+            action = "cleared"
+        elif existing is not None:
+            _finish_pending_preference(pending, "completed")
+            session.commit()
+            action = "no_matching_saved_preference"
+        else:
+            _finish_pending_preference(pending, "completed")
+            session.commit()
+            action = "no_saved_preference"
         return ProviderToolResult(
             tool_name="inventory_location_preference",
-            output={"action": "cleared", "capability": "inventory_location_preference"},
+            output={"action": action, "capability": "inventory_location_preference"},
         )
-    if location_reference is None:
+    if command.location_external_id is None or command.location_type is None:
         raise ToolExecutionError("invalid_arguments")
     candidates = executor.location_candidates(user, business_id)
     current_source = executor._active_source(business_id)
     if current_source is None or current_source.id != source.id:
         raise ToolExecutionError("integration_unavailable")
-    normalized_reference = " ".join(location_reference.split()).casefold()
-    matched_candidates = tuple(
-        candidate
-        for candidate in candidates
-        if normalized_reference in " ".join(candidate.label.split()).casefold()
+    location = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.external_location_id == command.location_external_id
+            and candidate.location_type == command.location_type
+        ),
+        None,
     )
-    if len(matched_candidates) != 1:
-        resolution_status = "ambiguous" if matched_candidates else "not_found"
-        return ProviderToolResult(
-            tool_name="inventory_location_preference",
-            output={
-                "action": "not_saved",
-                "capability": "inventory_location_preference",
-                "resolution": {
-                    "status": resolution_status,
-                    "candidates": [
-                        {
-                            "label": candidate.label,
-                            "location_type": candidate.location_type,
-                        }
-                        for candidate in matched_candidates
-                    ],
-                },
-            },
-        )
-    location = matched_candidates[0]
+    if location is None:
+        raise ToolExecutionError("invalid_arguments")
     if existing is None:
-        session.add(
-            UserOperationalPreference(
+        inserted = session.scalar(
+            insert(UserOperationalPreference)
+            .values(
+                id=uuid.uuid4(),
                 user_id=user.id,
                 business_id=business_id,
                 source_id=source.id,
-                preference_key="default_inventory_location",
+                preference_key=command.preference_key,
                 location_type=location.location_type,
                 location_external_id=location.external_location_id,
             )
+            .on_conflict_do_nothing(
+                index_elements=("user_id", "business_id", "source_id", "preference_key")
+            )
+            .returning(UserOperationalPreference.id)
         )
+        if inserted is not None:
+            action = "created"
+        else:
+            existing = session.scalar(statement.with_for_update())
+            if existing is None:  # pragma: no cover - conflict row must be visible
+                raise ToolExecutionError("persistence_failed")
+            action = (
+                "already_set"
+                if existing.location_type == location.location_type
+                and existing.location_external_id == location.external_location_id
+                else "replaced"
+            )
     else:
+        action = (
+            "already_set"
+            if existing.location_type == location.location_type
+            and existing.location_external_id == location.external_location_id
+            else "replaced"
+        )
+    if existing is not None and action == "replaced":
         existing.location_type = location.location_type
         existing.location_external_id = location.external_location_id
+    _finish_pending_preference(pending, "completed")
     session.commit()
     return ProviderToolResult(
         tool_name="inventory_location_preference",
         output={
-            "action": "saved",
+            "action": action,
             "capability": "inventory_location_preference",
             "location": {
                 "label": location.label,
@@ -2141,6 +2582,298 @@ def _bounded_category_resolution_reply(
     return replies[language]
 
 
+def _preference_resolution_reply(
+    status: str,
+    references: tuple[str, ...],
+    candidates: tuple[ProviderPreferenceLocationCandidate, ...],
+) -> str:
+    if status == "ambiguous":
+        labels = tuple(
+            candidate.label
+            for candidate in candidates
+            if candidate.reference in references
+        )
+        if len(labels) >= 2:
+            return (
+                f"I found several locations: {'; '.join(labels[:5])}. "
+                "Which one do you mean?"
+            )
+    if status == "no_match":
+        return (
+            "I couldn't match that preference to an available location. "
+            "Please choose one."
+        )
+    return "I couldn't safely set that preference. Please choose an available location."
+
+
+def _preference_acknowledgement(action: str) -> str:
+    replies = {
+        "created": "Your default inventory location was saved.",
+        "replaced": "Your default inventory location was replaced.",
+        "already_set": "That inventory location is already your default.",
+        "cleared": "Your default inventory location was cleared.",
+        "no_saved_preference": "No default inventory location was saved.",
+        "no_matching_saved_preference": (
+            "No matching saved inventory location was found."
+        ),
+    }
+    return replies.get(action, "I couldn't safely save that preference.")
+
+
+def _pending_resolver_candidates(
+    pending: PendingOwnerOperationalPreference,
+    source_candidates: tuple[object, ...],
+) -> tuple[tuple[ProviderPreferenceLocationCandidate, ...], dict[str, object]]:
+    source_by_identity = {
+        (
+            getattr(candidate, "external_location_id", None),
+            getattr(candidate, "location_type", None),
+        ): candidate
+        for candidate in source_candidates
+    }
+    candidates: list[ProviderPreferenceLocationCandidate] = []
+    candidate_by_reference: dict[str, object] = {}
+    for record in _pending_candidate_records(pending):
+        candidate = source_by_identity.get(
+            (record.external_location_id, record.location_type)
+        )
+        label = getattr(candidate, "label", None)
+        if not isinstance(label, str):
+            continue
+        candidates.append(
+            ProviderPreferenceLocationCandidate(
+                reference=record.reference,
+                label=label,
+                location_type=record.location_type,
+            )
+        )
+        candidate_by_reference[record.reference] = candidate
+    return tuple(candidates), candidate_by_reference
+
+
+def _preference_result(
+    output: ProviderToolResult,
+    usage: TokenUsage | None,
+    provider_identifier: str | None,
+    model_identifier: str | None,
+) -> tuple[OwnerChatResult, TokenUsage | None]:
+    action = output.output.get("action") if isinstance(output.output, dict) else None
+    return (
+        OwnerChatResult(
+            reply=_preference_acknowledgement(
+                action if isinstance(action, str) else ""
+            ),
+            usage=usage,
+            provider_identifier=provider_identifier,
+            model_identifier=model_identifier,
+        ),
+        usage,
+    )
+
+
+def _run_preference_intent(
+    session: Session,
+    business_id: uuid.UUID,
+    claim: _Claim,
+    user: User,
+    provider: OwnerChatProvider,
+    request: OwnerChatRequest,
+    result: OwnerChatResult,
+    aggregate_usage: TokenUsage,
+    executor: OperationalToolExecutor,
+) -> tuple[OwnerChatResult, TokenUsage]:
+    intent = _interpret_preference_intent(result)
+    source = executor._active_source(business_id)
+    if source is None:
+        return (
+            OwnerChatResult(
+                reply="The connected inventory source is unavailable.",
+                usage=aggregate_usage,
+                provider_identifier=result.provider_identifier,
+                model_identifier=result.model_identifier,
+            ),
+            aggregate_usage,
+        )
+    owner_message = session.get(OwnerChatMessage, claim.message_id)
+    if owner_message is None:  # pragma: no cover - claim invariants protect this
+        raise ToolExecutionError("invalid_arguments")
+    _supersede_pending_preference(
+        session, user, business_id, owner_message.conversation_id, source.id
+    )
+    preference_key = _resolved_preference_key(intent)
+    source_candidates = tuple(executor.location_candidates(user, business_id))
+    location = _deterministic_preference_location(
+        intent.location_reference, source_candidates
+    )
+    command = _validated_preference_command(intent, preference_key, location)
+    if command is not None and command.action == "clear_preference":
+        if intent.location_reference is not None and location is None:
+            return (
+                OwnerChatResult(
+                    reply="No matching saved inventory location was found.",
+                    usage=aggregate_usage,
+                    provider_identifier=result.provider_identifier,
+                    model_identifier=result.model_identifier,
+                ),
+                aggregate_usage,
+            )
+        saved = _save_inventory_location_preference(
+            session, executor, user, business_id, command
+        )
+        response, usage = _preference_result(
+            saved, aggregate_usage, result.provider_identifier, result.model_identifier
+        )
+        assert usage is not None
+        return response, usage
+
+    command = _validated_preference_command(intent, preference_key, location)
+    if command is not None:
+        saved = _save_inventory_location_preference(
+            session, executor, user, business_id, command
+        )
+        response, usage = _preference_result(
+            saved, aggregate_usage, result.provider_identifier, result.model_identifier
+        )
+        assert usage is not None
+        return response, usage
+
+    resolver_candidates = _preference_location_candidates(source_candidates)
+    resolved_location: object | None = None
+    if resolver_candidates:
+        resolver_request = _build_preference_resolution_request(
+            request, resolver_candidates
+        )
+        try:
+            resolver_result = _validate_result(
+                provider.generate(resolver_request), resolver_request
+            )
+        except OwnerChatProviderError:
+            resolver_result = None
+        if resolver_result is not None:
+            aggregate_usage = _add_usage(
+                aggregate_usage,
+                _usage_for_result(provider, resolver_request, resolver_result),
+            )
+            if (
+                resolver_result.preference_resolution_status == "matched"
+                and resolver_result.preference_resolution_key == preference_key
+                and len(resolver_result.preference_location_candidate_references) == 1
+            ):
+                by_reference = {
+                    candidate.reference: source_candidate
+                    for candidate, source_candidate in zip(
+                        resolver_candidates, source_candidates, strict=True
+                    )
+                }
+                resolved_location = by_reference.get(
+                    resolver_result.preference_location_candidate_references[0]
+                )
+    command = _validated_preference_command(intent, preference_key, resolved_location)
+    if command is not None:
+        saved = _save_inventory_location_preference(
+            session, executor, user, business_id, command
+        )
+        response, usage = _preference_result(
+            saved, aggregate_usage, result.provider_identifier, result.model_identifier
+        )
+        assert usage is not None
+        return response, usage
+    _store_pending_preference(
+        session,
+        user,
+        business_id,
+        source.id,
+        claim.message_id,
+        owner_message.conversation_id,
+        source_candidates,
+    )
+    session.commit()
+    return (
+        OwnerChatResult(
+            reply=_preference_resolution_reply("ambiguous", (), resolver_candidates),
+            usage=aggregate_usage,
+            provider_identifier=result.provider_identifier,
+            model_identifier=result.model_identifier,
+        ),
+        aggregate_usage,
+    )
+
+
+def _complete_pending_preference_if_selected(
+    session: Session,
+    business_id: uuid.UUID,
+    claim: _Claim,
+    user: User,
+    provider: OwnerChatProvider,
+    request: OwnerChatRequest,
+    result: OwnerChatResult,
+    aggregate_usage: TokenUsage,
+    executor: OperationalToolExecutor,
+) -> tuple[OwnerChatResult, TokenUsage] | None:
+    if result.decision not in {"final", "unavailable"}:
+        return None
+    owner_message = session.get(OwnerChatMessage, claim.message_id)
+    source = executor._active_source(business_id)
+    if owner_message is None:
+        return None
+    pending = _active_pending_preference(
+        session,
+        user,
+        business_id,
+        owner_message.conversation_id,
+        source.id if source is not None else None,
+    )
+    if pending is None or source is None:
+        return None
+    resolver_candidates, candidate_by_reference = _pending_resolver_candidates(
+        pending, tuple(executor.location_candidates(user, business_id))
+    )
+    if not resolver_candidates:
+        _finish_pending_preference(pending, "invalidated")
+        session.commit()
+        return None
+    resolver_request = _build_preference_resolution_request(
+        request, resolver_candidates
+    )
+    try:
+        resolver_result = _validate_result(
+            provider.generate(resolver_request), resolver_request
+        )
+    except OwnerChatProviderError:
+        return None
+    aggregate_usage = _add_usage(
+        aggregate_usage, _usage_for_result(provider, resolver_request, resolver_result)
+    )
+    if (
+        resolver_result.preference_resolution_status != "matched"
+        or resolver_result.preference_resolution_key != pending.preference_key
+        or len(resolver_result.preference_location_candidate_references) != 1
+    ):
+        return None
+    location = candidate_by_reference.get(
+        resolver_result.preference_location_candidate_references[0]
+    )
+    command = _validated_preference_command(
+        _InterpretedPreferenceIntent(
+            action="set_preference",
+            preference_key=pending.preference_key,
+            location_reference=None,
+        ),
+        pending.preference_key,
+        location,
+    )
+    if command is None:
+        return None
+    saved = _save_inventory_location_preference(
+        session, executor, user, business_id, command, pending
+    )
+    response, usage = _preference_result(
+        saved, aggregate_usage, result.provider_identifier, result.model_identifier
+    )
+    assert usage is not None
+    return response, usage
+
+
 def _exact_category_candidate_reference(
     category_query: str,
     category_candidates: tuple[ProviderCategoryCandidate, ...],
@@ -2255,20 +2988,24 @@ def _run_operational_loop(
         # A planner-provided reference is untrusted until it is revalidated against
         # the exact bounded candidates in a separate compact request.
         result = replace(result, category_candidate_reference=None)
-        result, consistency_outcome = _consistent_operational_plan(
-            result, request.category_candidates
+        result, command = _consistent_operational_plan(
+            result, executor, request.category_candidates
         )
         _logger.info(
             "owner_chat_operational_plan semantic_operation=%s entity_kind=%s "
             "original_action=%s effective_action=%s consistency_outcome=%s "
-            "effective_tool=%s metric=%s validation=accepted",
+            "plan_contract=interpreted provider_tool_fields=%s "
+            "tool_derivation=semantic_registry effective_tool=%s metric=%s "
+            "execution_validation=%s",
             result.semantic_operation,
             result.entity_kind,
             original_action,
             result.decision,
-            consistency_outcome,
+            command.consistency_outcome if command is not None else "accepted",
+            command.provider_tool_fields if command is not None else "missing",
             result.tool_name if result.decision == "tool" else None,
             _planned_metric(result.tool_arguments),
+            "accepted" if command is not None else "rejected",
         )
         call_usage = _usage_for_result(provider, request, result)
         if call_usage.output_tokens > request.max_output_tokens:
@@ -2278,6 +3015,27 @@ def _run_operational_loop(
                 model_identifier=result.model_identifier,
             )
         aggregate_usage = _add_usage(aggregate_usage, call_usage)
+
+        if result.semantic_operation == "sales_summary" and command is None:
+            _logger.info(
+                "owner_chat_operational_dispatch outcome=clarification "
+                "tool_derivation=semantic_registry effective_tool=%s "
+                "execution_validation=rejected",
+                SALES_SUMMARY_TOOL,
+            )
+            return (
+                OwnerChatResult(
+                    reply=(
+                        "Please specify the sales metric and a date range so I can run "
+                        "a bounded report."
+                    ),
+                    usage=aggregate_usage,
+                    provider_identifier=result.provider_identifier,
+                    model_identifier=result.model_identifier,
+                    decision="final",
+                ),
+                aggregate_usage,
+            )
 
         if (
             result.semantic_operation == "inventory_category"
@@ -2289,12 +3047,16 @@ def _run_operational_loop(
             )
             if exact_reference is not None:
                 result = replace(result, category_candidate_reference=exact_reference)
-                result, redispatch_outcome = _consistent_operational_plan(
-                    result, request.category_candidates
+                result, redispatch_command = _consistent_operational_plan(
+                    result, executor, request.category_candidates
                 )
                 _logger.info(
                     "owner_chat_category_resolution outcome=exact redispatch=%s",
-                    redispatch_outcome,
+                    (
+                        redispatch_command.consistency_outcome
+                        if redispatch_command is not None
+                        else "rejected"
+                    ),
                 )
             else:
                 category_request = _build_category_resolution_request(
@@ -2353,13 +3115,17 @@ def _run_operational_loop(
                                     category_result.category_candidate_references[0]
                                 ),
                             )
-                            result, redispatch_outcome = _consistent_operational_plan(
-                                result, request.category_candidates
+                            result, redispatch_command = _consistent_operational_plan(
+                                result, executor, request.category_candidates
                             )
                             _logger.info(
                                 "owner_chat_category_resolution outcome=matched "
                                 "redispatch=%s",
-                                redispatch_outcome,
+                                (
+                                    redispatch_command.consistency_outcome
+                                    if redispatch_command is not None
+                                    else "rejected"
+                                ),
                             )
                         elif category_result.category_resolution_status == "ambiguous":
                             reply = _bounded_category_resolution_reply(
@@ -2413,6 +3179,20 @@ def _run_operational_loop(
             )
             return resolved_result, aggregate_usage
 
+        pending_completion = _complete_pending_preference_if_selected(
+            session,
+            business_id,
+            claim,
+            user,
+            provider,
+            request,
+            result,
+            aggregate_usage,
+            executor,
+        )
+        if pending_completion is not None:
+            return pending_completion
+
         if result.decision == "unavailable":
             _logger.info(
                 "owner_chat_operational_dispatch outcome=provider_unavailable "
@@ -2446,31 +3226,228 @@ def _run_operational_loop(
             ), aggregate_usage
 
         if result.decision in {"set_preference", "clear_preference"}:
-            try:
-                preference_result = _save_inventory_location_preference(
-                    session,
-                    executor,
-                    user,
-                    business_id,
-                    result.decision,
-                    result.location_reference,
+            return _run_preference_intent(
+                session,
+                business_id,
+                claim,
+                user,
+                provider,
+                request,
+                result,
+                aggregate_usage,
+                executor,
+            )
+            intent = _interpret_preference_intent(result)
+            source_candidates = tuple(executor.location_candidates(user, business_id))
+            preference_plan = (
+                "complete"
+                if intent.preference_key is not None
+                and (
+                    intent.action == "clear_preference"
+                    or intent.location_reference is not None
                 )
-            except ToolExecutionError:
-                _logger.info(
-                    "owner_chat_operational_dispatch outcome=preference_error "
-                    "final_synthesis_path=deterministic"
+                else "incomplete"
+            )
+            preference_resolution = "deterministic"
+            resolver_invoked = False
+            command = _validated_preference_command(
+                intent,
+                _resolved_preference_key(intent),
+                _deterministic_preference_location(
+                    intent.location_reference, source_candidates
+                ),
+            )
+            if (
+                intent.action == "set_preference"
+                and command is None
+                and preference_plan == "incomplete"
+            ):
+                resolver_invoked = True
+                resolver_candidates = _preference_location_candidates(source_candidates)
+                resolver_request = _build_preference_resolution_request(
+                    request, resolver_candidates
                 )
-                return (
-                    _operational_synthesis_fallback(
-                        {
-                            "action": "not_saved",
-                            "capability": "inventory_location_preference",
-                        },
+                try:
+                    resolver_result = _validate_result(
+                        provider.generate(resolver_request), resolver_request
+                    )
+                except OwnerChatProviderInvalidResponse as exc:
+                    failure_usage = exc.usage
+                    if failure_usage is None and exc.usage_uncertain:
+                        estimated_input = provider.estimate_input_tokens(
+                            resolver_request
+                        )
+                        failure_usage = TokenUsage(
+                            input_tokens=estimated_input,
+                            output_tokens=resolver_request.max_output_tokens,
+                            total_tokens=(
+                                estimated_input + resolver_request.max_output_tokens
+                            ),
+                            authoritative=False,
+                        )
+                    if failure_usage is not None:
+                        aggregate_usage = _add_usage(aggregate_usage, failure_usage)
+                    _logger.info(
+                        "owner_chat_preference preference_plan=%s "
+                        "preference_resolution=invalid resolver_invoked=true "
+                        "preference_persisted=false",
+                        preference_plan,
+                    )
+                    return (
+                        OwnerChatResult(
+                            reply=_preference_resolution_reply("invalid", (), ()),
+                            usage=aggregate_usage,
+                            provider_identifier=result.provider_identifier,
+                            model_identifier=result.model_identifier,
+                        ),
                         aggregate_usage,
-                        result.provider_identifier,
-                        result.model_identifier,
-                    ),
-                    aggregate_usage,
+                    )
+                except OwnerChatProviderError as exc:
+                    failure_usage = exc.usage
+                    if failure_usage is None and exc.usage_uncertain:
+                        estimated_input = provider.estimate_input_tokens(
+                            resolver_request
+                        )
+                        failure_usage = TokenUsage(
+                            input_tokens=estimated_input,
+                            output_tokens=resolver_request.max_output_tokens,
+                            total_tokens=(
+                                estimated_input + resolver_request.max_output_tokens
+                            ),
+                            authoritative=False,
+                        )
+                    if failure_usage is not None:
+                        aggregate_usage = _add_usage(aggregate_usage, failure_usage)
+                    _logger.info(
+                        "owner_chat_preference preference_plan=%s "
+                        "preference_resolution=provider_failure resolver_invoked=true "
+                        "preference_persisted=false",
+                        preference_plan,
+                    )
+                    return (
+                        OwnerChatResult(
+                            reply=_preference_resolution_reply(
+                                "provider_failure", (), ()
+                            ),
+                            usage=aggregate_usage,
+                            provider_identifier=result.provider_identifier,
+                            model_identifier=result.model_identifier,
+                        ),
+                        aggregate_usage,
+                    )
+                resolver_usage = _usage_for_result(
+                    provider, resolver_request, resolver_result
+                )
+                aggregate_usage = _add_usage(aggregate_usage, resolver_usage)
+                preference_resolution = (
+                    resolver_result.preference_resolution_status or "invalid"
+                )
+                candidate_by_reference = {
+                    provider_candidate.reference: source_candidate
+                    for provider_candidate, source_candidate in zip(
+                        resolver_candidates, source_candidates, strict=True
+                    )
+                }
+                if preference_resolution == "matched":
+                    location_reference = (
+                        resolver_result.preference_location_candidate_references[0]
+                    )
+                    command = _validated_preference_command(
+                        intent,
+                        resolver_result.preference_resolution_key,
+                        candidate_by_reference.get(location_reference),
+                    )
+                    if command is None:
+                        preference_resolution = "invalid"
+                if command is None:
+                    _logger.info(
+                        "owner_chat_preference preference_plan=%s "
+                        "preference_resolution=%s "
+                        "resolver_invoked=true preference_persisted=false",
+                        preference_plan,
+                        preference_resolution,
+                    )
+                    return (
+                        OwnerChatResult(
+                            reply=_preference_resolution_reply(
+                                preference_resolution,
+                                resolver_result.preference_location_candidate_references,
+                                resolver_candidates,
+                            ),
+                            usage=aggregate_usage,
+                            provider_identifier=result.provider_identifier,
+                            model_identifier=result.model_identifier,
+                        ),
+                        aggregate_usage,
+                    )
+            if command is None:
+                matches = tuple(
+                    candidate
+                    for candidate in source_candidates
+                    if isinstance(intent.location_reference, str)
+                    and " ".join(intent.location_reference.split()).casefold()
+                    in " ".join(candidate.label.split()).casefold()
+                )
+                preference_result = ProviderToolResult(
+                    tool_name="inventory_location_preference",
+                    output={
+                        "action": "not_saved",
+                        "capability": "inventory_location_preference",
+                        "resolution": {
+                            "status": "ambiguous" if matches else "not_found",
+                            "candidates": [
+                                {
+                                    "label": candidate.label,
+                                    "location_type": candidate.location_type,
+                                }
+                                for candidate in matches
+                            ],
+                        },
+                    },
+                )
+                _logger.info(
+                    "owner_chat_preference preference_plan=%s preference_resolution=%s "
+                    "resolver_invoked=%s preference_persisted=false",
+                    preference_plan,
+                    preference_resolution,
+                    str(resolver_invoked).lower(),
+                )
+            else:
+                try:
+                    preference_result = _save_inventory_location_preference(
+                        session,
+                        executor,
+                        user,
+                        business_id,
+                        command,
+                    )
+                except ToolExecutionError:
+                    _logger.info(
+                        "owner_chat_preference preference_plan=%s "
+                        "preference_resolution=%s "
+                        "resolver_invoked=%s preference_persisted=false",
+                        preference_plan,
+                        preference_resolution,
+                        str(resolver_invoked).lower(),
+                    )
+                    return (
+                        _operational_synthesis_fallback(
+                            {
+                                "action": "not_saved",
+                                "capability": "inventory_location_preference",
+                            },
+                            aggregate_usage,
+                            result.provider_identifier,
+                            result.model_identifier,
+                        ),
+                        aggregate_usage,
+                    )
+                _logger.info(
+                    "owner_chat_preference preference_plan=%s preference_resolution=%s "
+                    "resolver_invoked=%s preference_persisted=true",
+                    preference_plan,
+                    preference_resolution,
+                    str(resolver_invoked).lower(),
                 )
             synthesis_prepared = _build_operational_synthesis_request(
                 session,
@@ -2808,8 +3785,14 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
         if result.decision == "tool":
             if (
                 result.reply
-                or not isinstance(result.tool_name, str)
-                or not isinstance(result.tool_arguments, dict)
+                or (
+                    result.tool_name is not None
+                    and not isinstance(result.tool_name, str)
+                )
+                or (
+                    result.tool_arguments is not None
+                    and not isinstance(result.tool_arguments, dict)
+                )
             ):
                 raise OwnerChatProviderInvalidResponse(
                     reason="invalid_operational_response"
@@ -2820,25 +3803,22 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
                 or result.reply
                 or result.tool_name is not None
                 or result.tool_arguments is not None
-                or result.preference_key != "default_inventory_location"
-                or not isinstance(result.location_reference, str)
-                or not result.location_reference.strip()
             ):
                 raise OwnerChatProviderInvalidResponse(
                     reason="invalid_operational_response"
                 )
+            _interpret_preference_intent(result)
         elif result.decision == "clear_preference":
             if (
                 result.semantic_operation != "preference"
                 or result.reply
                 or result.tool_name is not None
                 or result.tool_arguments is not None
-                or result.preference_key != "default_inventory_location"
-                or result.location_reference is not None
             ):
                 raise OwnerChatProviderInvalidResponse(
                     reason="invalid_operational_response"
                 )
+            _interpret_preference_intent(result)
         elif result.decision in {"final", "unavailable"}:
             if (
                 not isinstance(result.reply, str)
@@ -2906,6 +3886,60 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
         ):
             raise OwnerChatProviderInvalidResponse(
                 reason="invalid_category_resolution_response"
+            )
+    elif request.mode == "preference_resolution":
+        candidate_references = {
+            candidate.reference for candidate in request.preference_location_candidates
+        }
+        supported_keys = {
+            capability.preference_key for capability in request.preference_capabilities
+        }
+        result_references = result.preference_location_candidate_references
+        status = result.preference_resolution_status
+        if (
+            result.reply
+            or result.proposed_knowledge
+            or result.cited_source_ids
+            or result.requires_business_knowledge
+            or result.decision != "final"
+            or result.tool_name is not None
+            or result.tool_arguments is not None
+            or result.preference_key is not None
+            or result.location_reference is not None
+            or result.semantic_operation is not None
+            or result.entity_kind is not None
+            or result.entity_query is not None
+            or result.category_candidate_reference is not None
+            or result.validated_result_status is not None
+            or status not in {"matched", "ambiguous", "no_match"}
+            or result.preference_resolution_key not in supported_keys | {None}
+            or not isinstance(result_references, tuple)
+            or any(
+                not isinstance(reference, str) or reference not in candidate_references
+                for reference in result_references
+            )
+            or len(set(result_references)) != len(result_references)
+            or (
+                status == "matched"
+                and (
+                    result.preference_resolution_key is None
+                    or len(result_references) != 1
+                )
+            )
+            or (
+                status == "ambiguous"
+                and (
+                    result.preference_resolution_key is not None
+                    or len(result_references) < 2
+                )
+            )
+            or (
+                status == "no_match"
+                and (result.preference_resolution_key is not None or result_references)
+            )
+        ):
+            raise OwnerChatProviderInvalidResponse(
+                reason="invalid_preference_resolution_response"
             )
     else:
         if (

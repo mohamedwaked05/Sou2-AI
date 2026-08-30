@@ -23,7 +23,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import ENUM, UUID
+from sqlalchemy.dialects.postgresql import ENUM, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.database.base import Base
@@ -1693,6 +1693,111 @@ class UserOperationalPreference(Base):
     preference_key: Mapped[str] = mapped_column(String(64), nullable=False)
     location_type: Mapped[str] = mapped_column(String(16), nullable=False)
     location_external_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class PendingOwnerOperationalPreference(Base):
+    """One resumable, source-bounded preference clarification for an owner chat."""
+
+    __tablename__ = "pending_owner_operational_preferences"
+    __table_args__ = (
+        CheckConstraint(
+            "operation = 'set_preference'",
+            name="ck_pending_owner_preference_operation",
+        ),
+        CheckConstraint(
+            "preference_key = 'default_inventory_location'",
+            name="ck_pending_owner_preference_key",
+        ),
+        CheckConstraint(
+            "expected_field = 'location'",
+            name="ck_pending_owner_preference_expected_field",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'completed', 'superseded', 'expired', 'invalidated')",
+            name="ck_pending_owner_preference_state",
+        ),
+        CheckConstraint(
+            "version > 0",
+            name="ck_pending_owner_preference_version",
+        ),
+        CheckConstraint(
+            "expires_at > created_at",
+            name="ck_pending_owner_preference_expiry",
+        ),
+        ForeignKeyConstraint(
+            ["source_id", "business_id"],
+            ["operational_data_sources.id", "operational_data_sources.business_id"],
+            ondelete="CASCADE",
+            name="fk_pending_owner_preference_source_scope",
+        ),
+        ForeignKeyConstraint(
+            ["conversation_id", "business_id"],
+            ["owner_conversations.id", "owner_conversations.business_id"],
+            ondelete="CASCADE",
+            name="fk_pending_owner_preference_conversation_scope",
+        ),
+        ForeignKeyConstraint(
+            ["conversation_id", "originating_message_id"],
+            ["owner_chat_messages.conversation_id", "owner_chat_messages.id"],
+            ondelete="CASCADE",
+            name="fk_pending_owner_preference_originating_message",
+        ),
+        Index(
+            "uq_pending_owner_preference_active_scope",
+            "user_id",
+            "business_id",
+            "source_id",
+            "conversation_id",
+            "preference_key",
+            unique=True,
+            postgresql_where=text("state = 'pending'"),
+        ),
+        Index(
+            "ix_pending_owner_preference_lookup",
+            "user_id",
+            "business_id",
+            "conversation_id",
+            "state",
+            "expires_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False
+    )
+    originating_message_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False
+    )
+    operation: Mapped[str] = mapped_column(String(32), nullable=False)
+    preference_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    expected_field: Mapped[str] = mapped_column(String(32), nullable=False)
+    candidate_references: Mapped[list[dict[str, str]]] = mapped_column(
+        JSONB, nullable=False
+    )
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
