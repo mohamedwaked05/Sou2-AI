@@ -1367,6 +1367,7 @@ class OwnerChatMessage(Base):
     conversation: Mapped[OwnerConversation] = relationship(
         back_populates="messages", foreign_keys=[conversation_id]
     )
+    operational_clarification: Mapped[dict[str, object] | None] = mapped_column(JSONB)
     reply_to_message: Mapped[OwnerChatMessage | None] = relationship(
         remote_side=[id], foreign_keys=[reply_to_message_id]
     )

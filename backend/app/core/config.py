@@ -134,6 +134,8 @@ class Settings(BaseSettings):
     trusted_https_termination: bool = False
     log_level: str = "INFO"
     owner_chat_provider: Literal["mock", "ollama", "gemini"] = "mock"
+    development_owner_chat_minute_limit: int | None = Field(default=None, ge=3, le=120)
+    development_owner_chat_hour_limit: int | None = Field(default=None, ge=20, le=2000)
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_chat_model: str = "qwen2.5:7b"
     gemini_chat_model: str = "gemini-3-flash-preview"
@@ -297,6 +299,13 @@ class Settings(BaseSettings):
             or not self.gemini_api_key.get_secret_value().strip()
         ):
             raise ValueError("GEMINI_API_KEY is required when using Gemini.")
+        if (
+            self.development_owner_chat_minute_limit is not None
+            or self.development_owner_chat_hour_limit is not None
+        ) and self.environment.casefold() != "development":
+            raise ValueError(
+                "Owner-chat limit overrides require ENVIRONMENT=development."
+            )
         if self.environment.lower() != "production":
             if self.hsts_enabled:
                 raise ValueError("HSTS is enabled only in production.")

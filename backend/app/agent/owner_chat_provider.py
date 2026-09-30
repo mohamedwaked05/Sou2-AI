@@ -259,6 +259,8 @@ class OwnerChatRequest:
     preference_capabilities: tuple[ProviderPreferenceCapability, ...] = ()
     preference_location_candidates: tuple[ProviderPreferenceLocationCandidate, ...] = ()
     pending_product_candidates: tuple[ProviderProductCandidate, ...] = ()
+    pending_sales_clarification: bool = False
+    reporting_timezone: str | None = None
 
 
 @dataclass(frozen=True)
@@ -314,6 +316,8 @@ class OwnerChatResult:
             "sales_summary",
             "preference",
             "knowledge",
+            "conversation",
+            "product_price",
             "unsupported",
         ]
         | None
@@ -758,6 +762,8 @@ class _OperationalStructuredResult(BaseModel):
         "sales_summary",
         "preference",
         "knowledge",
+        "conversation",
+        "product_price",
         "unsupported",
     ]
     entity_kind: Literal["product", "category"] | None = None
@@ -1024,6 +1030,8 @@ def _provider_neutral_request_input(request: OwnerChatRequest) -> dict[str, Any]
                 {"label": candidate.label, "sku": candidate.sku}
                 for candidate in request.pending_product_candidates
             ],
+            pending_sales_clarification=request.pending_sales_clarification,
+            reporting_timezone=request.reporting_timezone or request.profile.timezone,
         )
     return payload
 
@@ -1103,6 +1111,8 @@ def _conversation_instructions(request: OwnerChatRequest) -> str:
 def _operational_context(request: OwnerChatRequest) -> dict[str, Any]:
     return {
         "request_time_utc": request.requested_at.isoformat(),
+        "reporting_timezone": request.reporting_timezone or request.profile.timezone,
+        "pending_sales_clarification": request.pending_sales_clarification,
         "approved_tools": [
             {
                 "name": tool.name,
@@ -1139,7 +1149,15 @@ def _operational_context(request: OwnerChatRequest) -> dict[str, Any]:
 def _operational_instructions(request: OwnerChatRequest) -> str:
     context = _operational_context(request)
     return (
-        "You answer an authenticated business owner's live operational question. "
+        "Interpret an authenticated business owner's current message. A connected "
+        "source does not make every message operational. Classify greetings, thanks, "
+        "casual conversation, and general advice as semantic_operation=conversation "
+        "with decision=final; the backend will run conversation mode. Classify stable "
+        "business knowledge as knowledge with decision=final; the backend will use "
+        "its existing grounded path. Never answer live values from memory. Current "
+        "product prices are not supplied by these tools; classify a price request "
+        "as product_price with decision=final. Historical receipt prices do not "
+        "establish current prices. "
         "First classify the latest request with semantic_operation. This is required "
         "even if you give a final answer. Choose exactly one decision: request one "
         "approved tool, give a final answer, "
@@ -1174,6 +1192,15 @@ def _operational_instructions(request: OwnerChatRequest) -> str:
         "has zero, one, or multiple matches. Never treat a category label or "
         "identifier as trusted without backend resolution. "
         "Sales metrics are typed: revenue is not profit. For every request for an "
+        "explicit metric and last month, previous month, or latest completed month, "
+        "use sales_summary with metric and date_range=previous_completed_month. The "
+        "backend computes calendar boundaries in reporting_timezone. Do not ask "
+        "for dates already expressed as a bounded calendar month. Sales without a "
+        "metric or dates needs clarification. If pending_sales_clarification is true, "
+        "use use_pending_clarification=true only when the current message directly "
+        "answers that immediately previous sales clarification. Ask for an explicit "
+        "metric; 'available sales metric' does not select between revenue and count. "
+        "Never reuse pending state for an unrelated or new request. For every "
         "approved financial metric, request sales_summary with that exact metric enum "
         "even when connector support is unknown. The backend, not you, decides "
         "whether the connected source can calculate it. If an operational result has "
@@ -1362,6 +1389,8 @@ _SEMANTIC_OPERATIONS = frozenset(
         "sales_summary",
         "preference",
         "knowledge",
+        "conversation",
+        "product_price",
         "unsupported",
     }
 )

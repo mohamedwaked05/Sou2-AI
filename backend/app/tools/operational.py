@@ -9,6 +9,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import date
 from types import MappingProxyType
 from typing import Any, Literal
 
@@ -45,6 +46,7 @@ from app.schemas.operational import (
     LocationResolution,
     LocationResolutionQuery,
     MetricCapabilityResult,
+    OperationalMetric,
     ProductResolution,
     ProductResolutionQuery,
     RestockingQuery,
@@ -120,6 +122,18 @@ class CurrentInventoryPlannerInput(BaseModel):
 
 class BestSellingProductsToolInput(BestSellersQuery):
     limit: int = Field(default=10, ge=1, le=MAX_BEST_SELLER_RESULTS)
+
+
+class SalesSummaryPlannerInput(BaseModel):
+    """Interpretation only: the backend supplies and validates reporting bounds."""
+
+    model_config = ConfigDict(extra="forbid")
+    start_date: date | None = None
+    end_date: date | None = None
+    metric: OperationalMetric | None = None
+    date_range: Literal["previous_completed_month"] | None = None
+    use_pending_clarification: bool = False
+    branch_external_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class RestockingRecommendationsToolInput(RestockingQuery):
@@ -339,6 +353,7 @@ def build_operational_tool_registry(
                 "returns a typed capability result when required inputs are missing."
             ),
             input_schema=SalesQuery,
+            provider_input_schema=SalesSummaryPlannerInput,
             output_schema=(SalesSummary, MetricCapabilityResult),
             capability="sales_summaries",
             result_limit=1,
@@ -890,3 +905,19 @@ class OperationalToolExecutor:
             and not isinstance(enforced, bool)
             and 1 <= enforced <= maximum
         )
+
+    def sales_reporting_context(
+        self, user: User, business_id: uuid.UUID
+    ) -> tuple[str, tuple[str, ...]]:
+        """Read allowlisted mapping semantics in the authorized source scope."""
+        load_full_access_business(self._session, user, business_id)
+        source = self._active_source(business_id)
+        if source is None:
+            raise ToolExecutionError("integration_unavailable")
+        self._source_capabilities(source)
+        mapping = self._profiles.get_mapping(
+            source.mapping_profile_key, source.mapping_profile_version
+        )
+        if mapping is None:
+            raise ToolExecutionError("integration_unavailable")
+        return mapping.source_timezone, mapping.supported_metrics

@@ -547,3 +547,15 @@ def test_denied_operations_do_not_change_source_fixture(
             connection.scalar(text("SELECT count(*) FROM minimarket.catalog_items"))
             == 8
         )
+
+
+def test_live_catalogue_contract_does_not_supply_a_current_price(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    resolution = operational_adapter.resolve_product(
+        ProductResolutionQuery(reference="Pepsi Bottle 1.5 L")
+    )
+    assert resolution.status == "resolved" and resolution.product is not None
+    assert resolution.product.name == "Pepsi Bottle 1.5 L"
+    assert "price" not in resolution.product.model_dump()
+    assert "unit_price" not in resolution.product.model_dump()

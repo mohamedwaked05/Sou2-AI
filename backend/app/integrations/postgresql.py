@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from datetime import UTC, datetime, time
 from functools import lru_cache
@@ -270,7 +271,8 @@ _PRODUCT_RESOLUTION_TOKEN_SQL = text(
     )
     SELECT *, 'partial_name' AS match_type
     FROM matches
-    WHERE matched_terms > 0
+    WHERE matched_terms = (SELECT max(matched_terms) FROM matches)
+      AND matched_terms > 0
     ORDER BY matched_terms DESC, product_name, external_product_id
     LIMIT :row_limit
     """
@@ -577,6 +579,22 @@ class PostgreSQLOperationalAdapter:
                         },
                     ).mappings()
                 )
+                if not rows:
+                    spaced_units = re.sub(
+                        r"(?<=\d)(ml|kg|g|l)\b", r" \1", normalized_reference
+                    )
+                    if spaced_units != normalized_reference:
+                        normalized_reference = spaced_units
+                        rows = list(
+                            connection.execute(
+                                _PRODUCT_RESOLUTION_EXACT_SQL,
+                                {
+                                    "reference": query.reference,
+                                    "normalized_reference": normalized_reference,
+                                    "row_limit": query.candidate_limit + 1,
+                                },
+                            ).mappings()
+                        )
                 if not rows:
                     rows = list(
                         connection.execute(

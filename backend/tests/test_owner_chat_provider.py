@@ -2143,3 +2143,38 @@ def test_gemini_transport_failures_are_safe_and_do_not_leak_details(
     assert raised.value.reason == reason
     assert "private" not in repr(raised.value)
     assert "test-key-not-production" not in repr(raised.value)
+
+
+@pytest.mark.parametrize("adapter", ["ollama", "gemini"])
+@pytest.mark.parametrize("semantic", ["conversation", "knowledge", "product_price"])
+def test_owner_interpreter_has_distinct_nonoperational_routes(adapter, semantic):
+    structured = {
+        "decision": "final",
+        "semantic_operation": semantic,
+        "reply": "Route this message safely.",
+    }
+    transport = (
+        successful_transport(structured)
+        if adapter == "ollama"
+        else gemini_successful_transport(structured)
+    )
+    provider = (
+        ollama_provider(transport)
+        if adapter == "ollama"
+        else gemini_provider(transport)
+    )
+    result = provider.generate(operational_request())
+    assert result.semantic_operation == semantic and result.decision == "final"
+    assert result.tool_name is None and result.tool_arguments is None
+
+
+def test_operational_context_contains_bounded_followup_and_source_timezone():
+    request = replace(
+        operational_request(),
+        pending_sales_clarification=True,
+        reporting_timezone="Asia/Beirut",
+    )
+    context = owner_chat_provider._operational_context(request)
+    assert context["pending_sales_clarification"] is True
+    assert context["reporting_timezone"] == "Asia/Beirut"
+    assert "messages" not in context and "rolling_summary" not in context

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import date
 from decimal import Decimal
 from typing import Literal
@@ -417,6 +418,20 @@ class InventoryQuery(OperationalContract):
         if self.branch_external_id and self.warehouse_external_id:
             raise ValueError("Filter by a branch or a warehouse, not both.")
         return self
+
+
+class PendingInventoryClarification(OperationalContract):
+    """Backend-only context, never provider-created executable arguments."""
+
+    operation: Literal["current_inventory"] = "current_inventory"
+    user_id: uuid.UUID
+    source_id: uuid.UUID
+    source_updated_at: AwareDatetime
+    expires_at: AwareDatetime
+    arguments: InventoryQuery
+    candidates: tuple[ProductResolutionCandidate, ...] = Field(
+        min_length=2, max_length=MAX_PRODUCT_RESOLUTION_CANDIDATES
+    )
 
 
 class ProductResolutionQuery(OperationalContract):

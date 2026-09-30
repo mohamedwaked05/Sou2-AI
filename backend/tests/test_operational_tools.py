@@ -1318,7 +1318,7 @@ def test_incomplete_preference_intent_resolves_once_before_scoped_persistence(
         api_client,
         user,
         business["id"],
-        "from now on just answer from Jbeil branch",
+        "from now on just answer from جبيل",
         f"incomplete-preference-{uuid.uuid4()}",
     )
 
@@ -1505,7 +1505,10 @@ def test_expired_pending_preference_cannot_complete(
                 preference_key=None,
                 location_reference=None,
             ),
-            usage_result(preference_resolution_status="ambiguous"),
+            usage_result(
+                preference_resolution_status="ambiguous",
+                preference_location_candidate_references=("location_1", "location_2"),
+            ),
             usage_result(reply="Jbeil"),
         ]
     )
