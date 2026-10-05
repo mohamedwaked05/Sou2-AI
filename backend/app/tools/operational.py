@@ -329,11 +329,10 @@ def build_operational_tool_registry(
         OperationalToolDefinition(
             name=CURRENT_INVENTORY_TOOL,
             description=(
-                "Retrieve current product inventory, quantities, reservations, and "
-                "availability for an optional exact ID, SKU, barcode, product name, "
-                "approved alias, or source-resolved category and one branch or "
-                "warehouse. Product resolution "
-                "can explicitly be resolved, ambiguous, or not found."
+                "Current inventory, quantities, reservations and availability; "
+                "filter by "
+                "ID, SKU, barcode, name, alias, source-resolved category and branch/"
+                "warehouse. Product resolution: resolved, ambiguous or not_found."
             ),
             input_schema=CurrentInventoryToolInput,
             output_schema=InventoryResult,
@@ -346,11 +345,10 @@ def build_operational_tool_registry(
         OperationalToolDefinition(
             name=SALES_SUMMARY_TOOL,
             description=(
-                "Summarize completed sales and finalized returns/refunds for a "
-                "bounded source-local date range and optional branch. Revenue and "
-                "sales count are typed metrics. Use this approved action for every "
-                "financial metric request; the backend validates source support and "
-                "returns a typed capability result when required inputs are missing."
+                "Completed sales and finalized returns/refunds for bounded "
+                "source-local "
+                "dates and optional branch. All financial metrics use this tool; "
+                "backend validates support and reports missing inputs."
             ),
             input_schema=SalesQuery,
             provider_input_schema=SalesSummaryPlannerInput,
@@ -363,8 +361,8 @@ def build_operational_tool_registry(
         OperationalToolDefinition(
             name=BEST_SELLING_PRODUCTS_TOOL,
             description=(
-                "Rank best-selling products by net quantity for a bounded "
-                "source-local date range and optional branch."
+                "Best sellers by net quantity for bounded source-local dates and "
+                "optional branch."
             ),
             input_schema=BestSellingProductsToolInput,
             output_schema=BestSellingProductsResult,
@@ -376,11 +374,10 @@ def build_operational_tool_registry(
         OperationalToolDefinition(
             name=RESTOCKING_RECOMMENDATIONS_TOOL,
             description=(
-                "Calculate deterministic replenishment quantities from available "
-                "stock, reorder points, and target stock for an optional exact ID, "
-                "SKU, barcode, product name, approved alias, or source-resolved "
-                "category. Product resolution "
-                "can explicitly be resolved, ambiguous, or not found."
+                "Deterministic replenishment from available stock, reorder points and "
+                "target stock; filter by ID, SKU, barcode, name, alias or "
+                "source-resolved category. Product resolution: resolved, ambiguous "
+                "or not_found."
             ),
             input_schema=RestockingRecommendationsToolInput,
             output_schema=RestockingRecommendationsResult,

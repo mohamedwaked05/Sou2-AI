@@ -543,6 +543,15 @@ and other ambiguous post-dispatch failures charge the full reservation. Reported
 authoritative usage is captured before response validation and charged instead of
 the reservation. Idempotent completed turns never reserve twice.
 
+Operational owner turns initially reserve only the complete planner request.
+Before each later resolver, delegated answer, or synthesis call, a protected
+database function atomically resizes that same reservation to prior consumption
+plus the next serialized input estimate and its output cap. The shared allowance
+lock includes concurrent reservations from every channel. Resizing requires the
+current owner claim and an unexpired lease/day; it does not renew either. A budget
+rejection prevents the next dispatch and reconciles already consumed usage. The
+three-call bound, output/reasoning limits, and one rate admission per turn remain.
+
 Owner traffic may use shared tokens plus the owner reserve. The schema identifies
 channel and applies only the shared portion to future customer and WhatsApp
 channels, but those channels are not implemented. Authenticated

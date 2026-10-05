@@ -430,8 +430,23 @@ class PendingInventoryClarification(OperationalContract):
     expires_at: AwareDatetime
     arguments: InventoryQuery
     candidates: tuple[ProductResolutionCandidate, ...] = Field(
-        min_length=2, max_length=MAX_PRODUCT_RESOLUTION_CANDIDATES
+        default=(), max_length=MAX_PRODUCT_RESOLUTION_CANDIDATES
     )
+    category_candidates: tuple[CategoryCandidate, ...] = Field(
+        default=(), max_length=MAX_PRODUCT_RESOLUTION_CANDIDATES
+    )
+    location_candidates: tuple[LocationCandidate, ...] = Field(default=(), max_length=5)
+    location_reference: str | None = Field(default=None, min_length=1, max_length=255)
+    owner_request: str | None = Field(default=None, min_length=1, max_length=14_000)
+
+    @model_validator(mode="after")
+    def validate_choice(self) -> PendingInventoryClarification:
+        groups = (self.candidates, self.category_candidates, self.location_candidates)
+        if sum(bool(group) for group in groups) != 1 or max(map(len, groups)) < 2:
+            raise ValueError(
+                "An inventory clarification requires one ambiguous candidate set."
+            )
+        return self
 
 
 class ProductResolutionQuery(OperationalContract):

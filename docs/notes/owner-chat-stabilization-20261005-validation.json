@@ -1,0 +1,105 @@
+{
+  "review_base": "d8dd8b921bb24f248d43112b4203844d79876797",
+  "frozen_working_sha256": {
+    "backend/app/agent/owner_chat_provider.py": "336631b10f762742f4f2c37e4115a86a81732996de820703e53d09149ed00eb0",
+    "backend/app/schemas/operational.py": "c6246fd74cdab169cd95543e1365b892cd9cc20da36144a7f771c5b86d99cf9d",
+    "backend/app/services/ai_usage.py": "0e71b4e1bd7979c49f0cab5d7d006504da58601286537aa501a3101a742b585b",
+    "backend/app/services/owner_chat.py": "3f6bc3876723c00bc73372de5c1b39935498cd901c35e4233c72e53f356dbc97",
+    "backend/app/tools/operational.py": "bac39d8b053985e615402278085d27a1e16bf01be1d81645d54b6e33fd117b8a",
+    "backend/tests/test_ai_usage.py": "e61572c6bfb4fb841a12619bda20ed60ab2f91dbf9936d3da215e9a5ff7ea4f0",
+    "backend/tests/test_operational_tools.py": "cb96e1ed29c935a75a0c8cec9ba611909186d23e06b0054dc4bf1039af578898",
+    "backend/tests/test_owner_chat_provider.py": "f94163366290cdc98ea183733394c096cf44bebf900c6463779c95455f9c8677",
+    "backend/tests/test_owner_operational_reliability.py": "797f4f691eb3802db3cebeeb3057499cd80187bd2646cd1bc18a4dbaf79d033c",
+    "ARCHITECTURE.md": "9b8d5479f72f595a44e82ac6d748b2504d940da1999edcceb4fae1dd557fd8fc",
+    "backend/alembic/versions/20261005_14_owner_chat_reservation_sizing.py": "03e2c94dcdfdc8f3f10cd9f02d2a04c52acad4b9193ac8e1020a20fb097b2fe1"
+  },
+  "regressions": {
+    "tests.test_owner_chat_provider": 156,
+    "tests.test_owner_operational_reliability": 129,
+    "tests.test_operational_tools": 82,
+    "tests.test_ai_usage": 50
+  },
+  "junit_counts": {
+    "tests": "417",
+    "errors": "0",
+    "failures": "0",
+    "skipped": "0",
+    "time": "92.998"
+  },
+  "evidence_digests_local_only": {
+    "reservation-sizing-20261005-regressions.xml": "c058ad8b6da26e6377e75b7bda21e5b4e04d84075122ae40f9538dbbdf43b687",
+    "reservation-sizing-20261005-summary.json": "f5418f32f409b08e4942ceefdb9e9c82561bc904a4ba14ac8d222d01fb5e28dc",
+    "preference-completion-20261005-summary.json": "5cea2c32f4e04add1a9c42126e2dbaee1a2178705a86a5d2650f2032c3ff5d01",
+    "preference-completion-20261005-live.json": "b6a42ebd0aa78bf0933909aef677f17606141eaed7a3041f891923b46a6b23a2"
+  },
+  "migration": "20261005_14",
+  "migration_verified_on_development": true,
+  "live_sequence": {
+    "initial_ambiguity": "pass",
+    "eh_choices_and_original_expiry": "pass",
+    "warehouse_saved_pending_completed": "pass",
+    "successful_selection_replay_no_calls_charge_mutation": "pass"
+  },
+  "new_attempts": 3,
+  "cumulative_attempts": 22,
+  "ceiling": 25,
+  "new_usage": {
+    "input_tokens": 4286,
+    "output_tokens": 128,
+    "total_tokens": 4414,
+    "ledger_charge": 4414,
+    "unknown_usage_calls": 0
+  },
+  "committed_reservations": [
+    5089,
+    6311,
+    6302
+  ],
+  "provider_consumption": [
+    1323,
+    1534,
+    1557
+  ],
+  "remaining_allowance": 15586,
+  "outstanding_hold": 0,
+  "same_key_selection_replay_new_calls": 0,
+  "same_key_selection_replay_new_charge": 0,
+  "same_key_selection_replay_mutations": 0,
+  "live_resize_calls": 0,
+  "historical_unknown_usage_attempts": [
+    17
+  ],
+  "limitations": [
+    "Live multi-call resizing unverified; no second stage occurred.",
+    "Translations, paraphrases, ordinals and approved aliases can still fail exact selection guards.",
+    "One controlled preference conversation does not validate all owner-chat routes or general token optimization."
+  ],
+  "new_model_generation_during_git_review": 0,
+  "fresh_ruff_check": "pass",
+  "fresh_ruff_format_check": "pass",
+  "review_findings": "No material defect identified in the complete working patch. Provider classification and live multi-call resize limits retained.",
+  "staged_lf_sha256": {
+    "ARCHITECTURE.md": "5efc19505f461370499b44c1dcb3a4a2cc9e403b9ad6f886d98b95a69e060b0e",
+    "backend/alembic/versions/20261005_14_owner_chat_reservation_sizing.py": "03e2c94dcdfdc8f3f10cd9f02d2a04c52acad4b9193ac8e1020a20fb097b2fe1",
+    "backend/app/agent/owner_chat_provider.py": "396cad3da6e07c66e5c05e9748b4ac4811b2084bedcdd1ca4f502ea86e309e42",
+    "backend/app/schemas/operational.py": "c6246fd74cdab169cd95543e1365b892cd9cc20da36144a7f771c5b86d99cf9d",
+    "backend/app/services/ai_usage.py": "0e71b4e1bd7979c49f0cab5d7d006504da58601286537aa501a3101a742b585b",
+    "backend/app/services/owner_chat.py": "405f847875e58796b6fee73a1babef1cf1295e14810cc72e7582059784480d71",
+    "backend/app/tools/operational.py": "0e9d904e1bcfc6707220ada46874adb70e0594b26c05e1898c045ca82600bca6",
+    "backend/tests/test_ai_usage.py": "15644abbe916c416a46e80ddd162b1d759802e6a5dcc4fab0ff8ad4dc8e94007",
+    "backend/tests/test_operational_tools.py": "cb96e1ed29c935a75a0c8cec9ba611909186d23e06b0054dc4bf1039af578898",
+    "backend/tests/test_owner_chat_provider.py": "4b30278c7278f43ead78daee14e7fed3031c499a130ced284da53ec2b64a8dd9",
+    "backend/tests/test_owner_operational_reliability.py": "797f4f691eb3802db3cebeeb3057499cd80187bd2646cd1bc18a4dbaf79d033c"
+  },
+  "git_conversion": "Staged bytes equal the verified frozen working files with CRLF normalized to LF only; no other content changes.",
+  "newline_normalized_paths": [
+    "ARCHITECTURE.md",
+    "backend/app/agent/owner_chat_provider.py",
+    "backend/app/services/owner_chat.py",
+    "backend/app/tools/operational.py",
+    "backend/tests/test_ai_usage.py",
+    "backend/tests/test_owner_chat_provider.py"
+  ],
+  "staged_files_count": 13,
+  "staged_secret_pattern_scan": "No provider/GitHub key or private-key markers detected; selected fixture content reviewed."
+}

@@ -29,6 +29,7 @@ from app.agent.owner_chat_provider import (
     ProviderToolResult,
     ProviderWorkingDay,
     ProviderWorkingShift,
+    TokenUsage,
     create_owner_chat_provider,
     estimate_utf8_tokens,
 )
@@ -2168,6 +2169,391 @@ def test_owner_interpreter_has_distinct_nonoperational_routes(adapter, semantic)
     assert result.tool_name is None and result.tool_arguments is None
 
 
+@pytest.mark.parametrize("semantic", ["conversation", "knowledge", "product_price"])
+def test_gemini_delegated_plan_does_not_require_an_unused_reply(semantic):
+    provider = gemini_provider(
+        gemini_successful_transport(
+            {
+                "decision": "final",
+                "semantic_operation": semantic,
+            }
+        )
+    )
+    result = provider.generate(operational_request())
+    assert result.reply == ""
+    assert result.semantic_operation == semantic
+    assert result.tool_name is None and result.tool_arguments is None
+
+
+def test_gemini_price_plan_still_rejects_inventory_entity_fields():
+    provider = gemini_provider(
+        gemini_successful_transport(
+            {
+                "decision": "final",
+                "semantic_operation": "product_price",
+                "entity_kind": "product",
+                "entity_query": "Pepsi",
+            }
+        )
+    )
+    with pytest.raises(OwnerChatProviderInvalidResponse):
+        provider.generate(operational_request())
+
+
+def test_gemini_price_semantic_cannot_request_an_inventory_tool():
+    provider = gemini_provider(
+        gemini_successful_transport(
+            {
+                "decision": "tool",
+                "semantic_operation": "product_price",
+                "tool_name": "current_inventory",
+                "arguments": {"product_filter": "Pepsi"},
+            }
+        )
+    )
+    with pytest.raises(OwnerChatProviderInvalidResponse):
+        provider.generate(operational_request())
+
+
+def test_gemini_category_reference_cannot_contain_unbounded_generation():
+    provider = gemini_provider(
+        gemini_successful_transport(
+            {
+                "decision": "tool",
+                "semantic_operation": "inventory_category",
+                "entity_kind": "category",
+                "entity_query": "Beverages_" * 100,
+            }
+        )
+    )
+    with pytest.raises(OwnerChatProviderInvalidResponse):
+        provider.generate(operational_request())
+
+
+def test_direct_unsupported_final_still_requires_a_reply():
+    provider = gemini_provider(
+        gemini_successful_transport(
+            {
+                "decision": "final",
+                "semantic_operation": "unsupported",
+            }
+        )
+    )
+    with pytest.raises(OwnerChatProviderInvalidResponse):
+        provider.generate(operational_request())
+
+
+def test_gemini_missing_sales_arguments_is_rejected_without_inference():
+    provider = gemini_provider(
+        gemini_successful_transport(
+            {
+                "decision": "tool",
+                "semantic_operation": "sales_summary",
+            }
+        )
+    )
+    with pytest.raises(OwnerChatProviderInvalidResponse) as raised:
+        provider.generate(operational_request())
+    assert raised.value.reason == "planner_missing_tool_fields"
+    assert raised.value.usage is not None
+
+
+def test_gemini_wire_tool_branches_use_registry_arguments_and_bounded_sales():
+    from app.tools.operational import build_operational_tool_registry
+
+    tools = tuple(
+        ProviderToolDefinition(**d.provider_schema())
+        for d in build_operational_tool_registry(timeout_seconds=2).values()
+    )
+    request = replace(operational_request(), tools=tools)
+    schema = gemini_provider(gemini_successful_transport({}))._request_payload(request)[
+        "generationConfig"
+    ]["responseJsonSchema"]
+    branches = [b for b in schema["anyOf"] if "tool_name" in b["properties"]]
+    assert len(branches) == len(tools)
+    for tool in tools:
+        tool_branches = [
+            b for b in branches if b["properties"]["tool_name"]["enum"] == [tool.name]
+        ]
+        assert tool_branches
+        for branch in tool_branches:
+            assert {"tool_name", "arguments"} <= set(branch["required"])
+        args = tool_branches[0]["properties"]["arguments"]
+        assert args["additionalProperties"] is False
+        assert set(args["properties"]) == set(tool.input_schema["properties"])
+        if tool.name == "sales_summary":
+            monthly, explicit = args["anyOf"]
+            assert args["required"] == ["metric"]
+            assert monthly["required"] == ["date_range"]
+            assert explicit["required"] == ["start_date", "end_date"]
+            assert args["properties"]["metric"]["enum"] == next(
+                option["enum"]
+                for option in tool.input_schema["properties"]["metric"]["anyOf"]
+                if "enum" in option
+            )
+            assert monthly["properties"]["start_date"] == {"type": "null"}
+            assert explicit["properties"]["date_range"] == {"type": "null"}
+        else:
+            assert args == owner_chat_provider._compact_planner_schema(
+                tool.input_schema
+            )
+    assert all(
+        "arguments" not in b["properties"]
+        for b in schema["anyOf"]
+        if "tool" not in b["properties"]["decision"]["enum"]
+    )
+
+
+def test_gemini_planner_branches_require_only_relevant_fields():
+    from app.tools.operational import build_operational_tool_registry
+
+    request = replace(
+        operational_request(),
+        tools=tuple(
+            ProviderToolDefinition(**d.provider_schema())
+            for d in build_operational_tool_registry(timeout_seconds=2).values()
+        ),
+    )
+    schema = gemini_provider(gemini_successful_transport({}))._request_payload(request)[
+        "generationConfig"
+    ]["responseJsonSchema"]
+    seen_decisions = set()
+    for branch in schema["anyOf"]:
+        properties = branch["properties"]
+        assert branch["additionalProperties"] is False
+        for decision in properties["decision"]["enum"]:
+            for operation in properties["semantic_operation"]["enum"]:
+                pair = (decision, operation)
+                assert pair not in seen_decisions
+                seen_decisions.add(pair)
+                if operation in {"inventory_product", "inventory_category"}:
+                    condition = next(
+                        option
+                        for option in branch["anyOf"]
+                        if option["properties"]["semantic_operation"]["enum"]
+                        == [operation]
+                    )
+                    assert {"entity_kind", "entity_query"} <= set(condition["required"])
+                    assert condition["properties"]["entity_kind"]["enum"] == [
+                        "product" if operation == "inventory_product" else "category"
+                    ]
+                elif "entity_kind" in properties:
+                    condition = next(
+                        option
+                        for option in branch["anyOf"]
+                        if operation
+                        in option["properties"]["semantic_operation"]["enum"]
+                    )
+                    # Non-null outer fields intersect null here: omit unused fields.
+                    assert condition["properties"]["entity_kind"] == {"type": "null"}
+                    assert condition["properties"]["entity_query"] == {"type": "null"}
+                else:
+                    assert "entity_kind" not in properties
+                    assert "entity_query" not in properties
+                if decision == "tool":
+                    assert "reply" not in properties
+                    assert "preference_key" not in properties
+                    assert "location_reference" not in properties
+                elif decision == "final" and operation in {
+                    "conversation",
+                    "knowledge",
+                    "product_price",
+                }:
+                    assert set(properties) == {"decision", "semantic_operation"}
+                elif decision in {"final", "unavailable"}:
+                    assert "reply" in branch["required"]
+                    assert "preference_key" not in properties
+                    assert "location_reference" not in properties
+    assert ("tool", "product_price") not in seen_decisions
+    assert ("tool", "conversation") not in seen_decisions
+
+
+@pytest.mark.parametrize(
+    "model,mode,expected",
+    [
+        ("gemini-3.1-flash-lite", "operational", "MINIMAL"),
+        ("gemini-3.1-flash-lite", "operational_synthesis", "LOW"),
+        ("gemini-3.1-flash-lite", "conversation", "LOW"),
+        ("gemini-3.1-flash-lite", "category_resolution", "MINIMAL"),
+        ("gemini-3.1-flash-lite", "preference_resolution", "LOW"),
+        ("gemini-3-flash-preview", "category_resolution", "LOW"),
+        ("gemini-3-flash-preview", "operational", "LOW"),
+    ],
+)
+def test_minimal_thinking_is_scoped_to_supported_flash_lite_bounded_modes(
+    model, mode, expected
+):
+    provider = GeminiOwnerChatProvider(
+        api_key="offline-unused", model=model, timeout_seconds=120
+    )
+    request = replace(operational_request(), mode=mode)
+    config = provider._request_payload(request)["generationConfig"]
+    assert config["thinkingConfig"] == {
+        "thinkingLevel": expected,
+        "includeThoughts": False,
+    }
+    assert config["maxOutputTokens"] == request.max_output_tokens == 512
+
+
+def test_category_resolver_keeps_its_bounded_allowance_and_validates_references():
+    from app.services.owner_chat import _build_category_resolution_request
+
+    request = _build_category_resolution_request(operational_request(), "drinks")
+    provider = GeminiOwnerChatProvider(
+        api_key="offline-unused", model="gemini-3.1-flash-lite", timeout_seconds=120
+    )
+    config = provider._request_payload(request)["generationConfig"]
+    assert config["maxOutputTokens"] == request.max_output_tokens == 64
+    assert config["thinkingConfig"]["thinkingLevel"] == "MINIMAL"
+    assert config["responseJsonSchema"]["properties"]["status"]["enum"] == [
+        "matched",
+        "ambiguous",
+        "no_match",
+    ]
+    assert request.tools == request.tool_results == request.location_candidates == ()
+
+
+@pytest.mark.parametrize("operation", [None, "inventory_list", "preference"])
+def test_pending_preference_transition_contract_is_scoped_to_preference(operation):
+    request = replace(
+        operational_request(),
+        pending_clarification={"operation": operation} if operation else None,
+        messages=(ProviderMessage(role="owner", content="Cancel that choice"),),
+    )
+    provider = gemini_provider(
+        gemini_successful_transport(
+            {
+                "decision": "final",
+                "semantic_operation": "conversation",
+                "pending_reply": "cancel",
+                "pending_request": "Cancel that choice",
+            }
+        )
+    )
+    payload = provider._request_payload(request)
+    branches = payload["generationConfig"]["responseJsonSchema"]["anyOf"]
+    instructions = payload["systemInstruction"]["parts"][0]["text"]
+    assert ("To abandon a pending preference" in instructions) == (
+        operation == "preference"
+    )
+    for branch in branches:
+        properties = branch["properties"]
+        assert ("pending_request" in properties) == (operation == "preference")
+        if operation:
+            assert "pending_reply" in branch["required"]
+            assert ("cancel" in properties["pending_reply"]["enum"]) == (
+                operation == "preference"
+            )
+    if operation == "preference":
+        result = provider.generate(request)
+        assert result.pending_reply == "cancel"
+        assert result.pending_request == "Cancel that choice"
+        assert result.usage.authoritative
+
+
+def test_pending_planner_requires_ai_reply_classification_without_a_repair_call():
+    request = replace(
+        operational_request(),
+        pending_clarification={
+            "operation": "inventory_list",
+            "expected_reply": "selection",
+            "owner_request": "Show stock at North",
+            "question": "Which location?",
+            "candidates": [{"label": "North Branch"}, {"label": "North Warehouse"}],
+        },
+        messages=(ProviderMessage(role="owner", content="yes"),),
+    )
+    provider = gemini_provider(
+        gemini_successful_transport(
+            {"decision": "final", "semantic_operation": "conversation"}
+        )
+    )
+    schema = provider._request_payload(request)["generationConfig"][
+        "responseJsonSchema"
+    ]
+    assert all("pending_reply" in branch["required"] for branch in schema["anyOf"])
+    with pytest.raises(OwnerChatProviderInvalidResponse) as failure:
+        provider.generate(request)
+    assert failure.value.reason == "planner_missing_pending_reply"
+    assert failure.value.usage is not None and failure.value.usage.authoritative
+
+
+@pytest.mark.parametrize(
+    "input_tokens,visible_tokens,reasoning_tokens,raw",
+    [
+        (2019, 7, 490, '{"semantic_operation":"inventory_'),
+        (2012, 6, 490, '{\n  "decision":'),
+    ],
+)
+def test_saved_planner_truncations_preserve_reasoning_usage_without_a_retry(
+    input_tokens, visible_tokens, reasoning_tokens, raw
+):
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "finishReason": "MAX_TOKENS",
+                        "content": {"parts": [{"text": raw}]},
+                    }
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": input_tokens,
+                    "candidatesTokenCount": visible_tokens,
+                    "thoughtsTokenCount": reasoning_tokens,
+                    "totalTokenCount": input_tokens + visible_tokens + reasoning_tokens,
+                },
+            },
+        )
+
+    provider = GeminiOwnerChatProvider(
+        api_key="offline-unused",
+        model="gemini-3.1-flash-lite",
+        timeout_seconds=120,
+        transport=httpx.MockTransport(respond),
+    )
+    with pytest.raises(OwnerChatProviderInvalidResponse) as raised:
+        provider.generate(operational_request())
+    assert raised.value.reason == "output_truncated"
+    assert raised.value.usage == TokenUsage(
+        input_tokens,
+        visible_tokens + reasoning_tokens,
+        input_tokens + visible_tokens + reasoning_tokens,
+        True,
+    )
+    assert len(calls) == 1
+
+
+def test_gemini_relative_sales_plan_cannot_omit_its_period():
+    from app.tools.operational import build_operational_tool_registry
+
+    request = replace(
+        operational_request(),
+        tools=tuple(
+            ProviderToolDefinition(**d.provider_schema())
+            for d in build_operational_tool_registry(timeout_seconds=2).values()
+        ),
+    )
+    provider = gemini_provider(
+        gemini_successful_transport(
+            {
+                "decision": "tool",
+                "semantic_operation": "sales_summary",
+                "tool_name": "sales_summary",
+                "arguments": {"metric": "revenue", "date_range": None},
+            }
+        )
+    )
+    with pytest.raises(OwnerChatProviderInvalidResponse) as raised:
+        provider.generate(request)
+    assert raised.value.reason == "planner_missing_tool_fields"
+    assert raised.value.usage is not None
+
+
 def test_operational_context_contains_bounded_followup_and_source_timezone():
     request = replace(
         operational_request(),
@@ -2178,3 +2564,115 @@ def test_operational_context_contains_bounded_followup_and_source_timezone():
     assert context["pending_sales_clarification"] is True
     assert context["reporting_timezone"] == "Asia/Beirut"
     assert "messages" not in context and "rolling_summary" not in context
+
+
+def test_planner_schema_compaction_preserves_constraints_and_title_properties():
+    schema = {
+        "title": "Display only",
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["title"],
+        "properties": {
+            "title": {"title": "Title", "type": "string", "maxLength": 80},
+            "settings": {
+                "type": "object",
+                "default": {"title": "Keep this data"},
+            },
+        },
+        "$defs": {"Metric": {"title": "Metric", "enum": ["revenue", "sales_count"]}},
+    }
+    compact = owner_chat_provider._compact_planner_schema(schema)
+    assert "title" not in compact
+    assert compact["required"] == ["title"]
+    assert compact["additionalProperties"] is False
+    assert compact["properties"]["title"] == {"type": "string", "maxLength": 80}
+    assert compact["properties"]["settings"]["default"] == {"title": "Keep this data"}
+    assert compact["$defs"]["Metric"] == {"enum": ["revenue", "sales_count"]}
+    assert schema["title"] == "Display only"
+    assert schema["properties"]["title"]["title"] == "Title"
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Give me last months revenue",
+        "Hi, how much milk is available in Jbeil?",
+        "Show inventory for beverages",
+        "From now on, just answer from Jbeil branch.",
+    ],
+)
+@pytest.mark.parametrize("with_candidates", [False, True])
+def test_gemini_compact_planner_preserves_registry_and_pending_context(
+    question, with_candidates
+):
+    from app.agent.owner_chat_provider import (
+        ProviderLocationCandidate,
+        ProviderProductCandidate,
+    )
+    from app.tools.operational import build_operational_tool_registry
+
+    tools = tuple(
+        ProviderToolDefinition(**definition.provider_schema())
+        for definition in build_operational_tool_registry(timeout_seconds=2).values()
+    )
+    request = replace(
+        operational_request(),
+        messages=(ProviderMessage("owner", question),),
+        tools=tools,
+        category_candidates=(ProviderCategoryCandidate("cat-1", "Beverages"),)
+        if with_candidates
+        else (),
+        location_candidates=(ProviderLocationCandidate("Jbeil Branch", "branch"),)
+        if with_candidates
+        else (),
+        pending_product_candidates=(ProviderProductCandidate("Milk 1L", "MILK-1"),),
+        pending_sales_clarification=True,
+        reporting_timezone="Asia/Beirut",
+    )
+    provider = gemini_provider(
+        gemini_successful_transport(
+            {
+                "decision": "final",
+                "semantic_operation": "conversation",
+                "reply": "Hello",
+            }
+        )
+    )
+    payload = provider._request_payload(request)
+    text = payload["systemInstruction"]["parts"][0]["text"]
+    context = json.loads(text.split("Safe context follows:\n", 1)[1])
+    assert [tool["name"] for tool in context["approved_tools"]] == [
+        tool.name for tool in tools
+    ]
+    for original, tool in zip(tools, context["approved_tools"], strict=True):
+        assert tool == {"name": original.name, "description": original.description}
+    # Providers without registry arguments in a wire schema still need the prompt copy.
+    legacy_context = json.loads(
+        owner_chat_provider._operational_instructions(request).split(
+            "Safe context follows:\n", 1
+        )[1]
+    )
+    assert legacy_context["approved_tools"][0]["input_schema"] == tools[0].input_schema
+    assert context["pending_sales_clarification"] is True
+    assert context["reporting_timezone"] == "Asia/Beirut"
+    assert context["pending_product_candidates"] == [
+        {"label": "Milk 1L", "sku": "MILK-1"}
+    ]
+    assert len(context["category_candidates"]) == int(with_candidates)
+    assert len(context["location_candidates"]) == int(with_candidates)
+    assert payload["contents"] == [{"role": "user", "parts": [{"text": question}]}]
+    assert "previous_completed_month" in text
+    assert "default_inventory_location" in text
+    assert "mixed messages prioritize the business request" in text
+    assert "missing/truncated lists do not prove absence" in text
+    response_schema = payload["generationConfig"]["responseJsonSchema"]
+    full = owner_chat_provider._OperationalStructuredResult.model_json_schema()
+    for branch in response_schema["anyOf"]:
+        assert set(full["required"]) <= set(branch["required"])
+    assert {
+        operation
+        for branch in response_schema["anyOf"]
+        for operation in branch["properties"]["semantic_operation"]["enum"]
+    } == set(full["properties"]["semantic_operation"]["enum"])
+    assert payload["generationConfig"]["maxOutputTokens"] == request.max_output_tokens
+    assert provider.generate(request).semantic_operation == "conversation"

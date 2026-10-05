@@ -982,7 +982,7 @@ def test_exact_category_label_bypasses_semantic_resolver_and_releases_reserve(
         daily_usage = connection.execute(
             text("SELECT total_tokens_used FROM business_ai_usage_daily")
         ).one()
-    assert tuple(reservation) == (1566, 20, 4, 24)
+    assert tuple(reservation) == (534, 20, 4, 24)
     assert reservation.total_tokens < reservation.reserved_tokens
     assert tuple(daily_usage) == (24,)
 
@@ -1450,12 +1450,7 @@ def test_pending_preference_location_only_reply_completes_after_reconstruction(
                 preference_resolution_status="ambiguous",
                 preference_location_candidate_references=("location_1", "location_2"),
             ),
-            usage_result(reply="Jbeil"),
-            usage_result(
-                preference_resolution_status="matched",
-                preference_resolution_key="default_inventory_location",
-                preference_location_candidate_references=("location_1",),
-            ),
+            usage_result(reply="Jbeil", pending_reply="selection"),
         ]
     )
     configure_operational_chat(db_session, business["id"], source, provider)
@@ -1481,7 +1476,6 @@ def test_pending_preference_location_only_reply_completes_after_reconstruction(
         "operational",
         "preference_resolution",
         "operational",
-        "preference_resolution",
     ]
     saved = db_session.scalar(select(UserOperationalPreference))
     pending = db_session.scalar(select(PendingOwnerOperationalPreference))
@@ -1581,7 +1575,7 @@ def test_explicit_inventory_location_overrides_saved_preference(
         api_client,
         user,
         business["id"],
-        "How many generic items are at the other location?",
+        "How many generic items are at Other Branch?",
         f"location-override-{uuid.uuid4()}",
     )
 
@@ -1937,8 +1931,9 @@ def test_conflicting_preference_plan_never_acknowledges_or_saves(
     assert source.calls == []
 
 
+@pytest.mark.parametrize("failure", [None, "reported", "unknown", "pre_use"])
 def test_stale_location_preference_is_removed_without_an_inventory_query(
-    api_client: TestClient, db_session: Session
+    api_client: TestClient, db_session: Session, migration_engine: Engine, failure
 ) -> None:
     user, business = active_business(
         api_client, db_session, email=f"location-stale-{uuid.uuid4()}@example.com"
@@ -1962,7 +1957,20 @@ def test_stale_location_preference_is_removed_without_an_inventory_query(
         )
     )
     db_session.commit()
-    provider = SequenceProvider(
+
+    class LocationSynthesisProvider(SequenceProvider):
+        def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
+            if failure and request.mode == "operational_synthesis":
+                self.requests.append(request)
+                raise OwnerChatProviderTimeout(
+                    usage=TokenUsage(17, 4, 21, True)
+                    if failure == "reported"
+                    else None,
+                    usage_uncertain=failure != "pre_use",
+                )
+            return super().generate(request)
+
+    provider = LocationSynthesisProvider(
         [
             usage_result(
                 decision="tool",
@@ -1974,12 +1982,13 @@ def test_stale_location_preference_is_removed_without_an_inventory_query(
     )
     app.dependency_overrides[get_owner_chat_provider] = lambda: provider
 
+    key = f"location-stale-{uuid.uuid4()}"
     response = submit(
         api_client,
         user,
         business["id"],
         "How many generic items do we have?",
-        f"location-stale-{uuid.uuid4()}",
+        key,
     )
 
     assert response.status_code == 200, response.text
@@ -1987,6 +1996,34 @@ def test_stale_location_preference_is_removed_without_an_inventory_query(
     assert provider.requests[1].mode == "operational_synthesis"
     assert provider.requests[1].tool_results[0].output["action"] == "invalidated"
     assert db_session.scalar(select(UserOperationalPreference)) is None
+    replay = submit(
+        api_client, user, business["id"], "How many generic items do we have?", key
+    )
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    assert len(provider.requests) == 2
+    with migration_engine.connect() as connection:
+        usage = connection.execute(
+            text(
+                "SELECT input_tokens, output_tokens, total_tokens, "
+                "counts_authoritative, status FROM ai_usage_reservations"
+            )
+        ).one()
+    failed_input = 17 if failure == "reported" else 10 if failure == "unknown" else 0
+    failed_output = (
+        4
+        if failure == "reported"
+        else provider.requests[1].max_output_tokens
+        if failure == "unknown"
+        else 0
+    )
+    if failure is None:
+        failed_input, failed_output = 10, 2
+    assert usage.input_tokens == 10 + failed_input
+    assert usage.output_tokens == 2 + failed_output
+    assert usage.total_tokens == usage.input_tokens + usage.output_tokens
+    assert usage.counts_authoritative is (failure in {None, "reported"})
+    assert usage.status == "completed"
 
 
 def test_unsupported_profit_uses_capability_fallback_when_synthesis_is_invalid(
@@ -3006,7 +3043,8 @@ def test_synthesis_failure_uses_safe_fallback_and_replay_does_no_work(
             )
         ).one()
     assert reservation.status == "completed"
-    assert reservation.total_tokens < reservation.reserved_tokens
+    # The final hold is prior usage plus this timed-out synthesis call's ceiling.
+    assert reservation.total_tokens == reservation.reserved_tokens == 534
 
 
 def test_concurrent_idempotent_operational_submissions_execute_once(

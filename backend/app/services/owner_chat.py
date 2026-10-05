@@ -70,8 +70,10 @@ from app.rag.embeddings import create_embedding_provider
 from app.rag.retrieval import retrieve
 from app.schemas.operational import (
     BestSellingProductsResult,
+    CategoryCandidate,
     InventoryQuery,
     InventoryResult,
+    LocationCandidate,
     MetricCapabilityResult,
     PendingInventoryClarification,
     ProductResolutionCandidate,
@@ -88,6 +90,7 @@ from app.services.ai_usage import (
     AIUsageReservationClaim,
     reconcile_ai_usage,
     reserve_owner_chat_usage,
+    resize_owner_chat_usage,
 )
 from app.services.api_limits import (
     admit_owner_chat_generation,
@@ -98,6 +101,7 @@ from app.services.business_profiles import is_business_profile_complete
 from app.services.businesses import load_full_access_business
 from app.services.conversations import get_default_conversation, load_conversation
 from app.tools.operational import (
+    BEST_SELLING_PRODUCTS_TOOL,
     CURRENT_INVENTORY_TOOL,
     RESTOCKING_RECOMMENDATIONS_TOOL,
     SALES_SUMMARY_TOOL,
@@ -109,8 +113,7 @@ from app.tools.operational import (
 _logger = logging.getLogger(__name__)
 
 CHAT_CONTEXT_MESSAGE_LIMIT = 12
-# A category inventory turn may need a planner, bounded semantic resolver, and
-# response-only synthesis. Reserve for the complete bounded path up front.
+# A category inventory turn may need a planner, bounded resolver, and synthesis.
 MAX_OPERATIONAL_PROVIDER_CALLS = 3
 CATEGORY_RESOLUTION_MAX_OUTPUT_TOKENS = 64
 PREFERENCE_RESOLUTION_MAX_OUTPUT_TOKENS = 64
@@ -189,6 +192,58 @@ class _PreparedTurn:
     request: OwnerChatRequest
     business: Business
     has_usable_evidence: bool
+
+
+@dataclass
+class _OperationalUsageBudget:
+    """Reserve actual stage payloads while holding all prior call consumption."""
+
+    session: Session
+    business: Business
+    user: User
+    claim: _Claim
+    settings: Settings
+    reservation: AIUsageReservationClaim | None = None
+    usage: TokenUsage | None = None
+    calls: int = 0
+
+    def admit(self, provider: OwnerChatProvider, request: OwnerChatRequest) -> None:
+        if self.calls >= MAX_OPERATIONAL_PROVIDER_CALLS:
+            raise OwnerChatProviderInvalidResponse(
+                reason="provider_call_limit", usage=self.usage, usage_uncertain=False
+            )
+        estimated_input = provider.estimate_input_tokens(request)
+        if self.reservation is None:
+            attempt = _admit_provider_generation(
+                self.session, self.business.id, self.claim, self.settings
+            )
+            try:
+                self.reservation = reserve_owner_chat_usage(
+                    self.session,
+                    business=self.business,
+                    user=self.user,
+                    owner_message_id=self.claim.message_id,
+                    generation_attempt=attempt,
+                    estimated_input_tokens=estimated_input,
+                    max_output_tokens=request.max_output_tokens,
+                    lease_seconds=self.settings.owner_chat_generation_lease_seconds,
+                )
+            except Exception:
+                self.session.rollback()
+                _undo_pre_provider_admission(
+                    self.session, self.business.id, self.claim, attempt
+                )
+                raise
+        else:
+            assert self.usage is not None
+            resize_owner_chat_usage(
+                self.session,
+                reservation=self.reservation,
+                claim_token=self.claim.token,
+                estimated_input_tokens=self.usage.input_tokens + estimated_input,
+                max_output_tokens=self.usage.output_tokens + request.max_output_tokens,
+            )
+        self.calls += 1
 
 
 def _add_usage(current: TokenUsage | None, added: TokenUsage) -> TokenUsage:
@@ -970,6 +1025,8 @@ def _build_operational_request(
     category_candidates: tuple[ProviderCategoryCandidate, ...] = (),
     location_candidates: tuple[ProviderLocationCandidate, ...] = (),
     pending_product_candidates: tuple[ProviderProductCandidate, ...] = (),
+    user: User | None = None,
+    executor: OperationalToolExecutor | None = None,
 ) -> _PreparedTurn:
     owner_message = session.get(OwnerChatMessage, owner_message_id)
     business = _load_provider_business(session, business_id)
@@ -995,6 +1052,13 @@ def _build_operational_request(
         category_candidates=category_candidates,
         location_candidates=location_candidates,
         pending_product_candidates=pending_product_candidates,
+        pending_clarification=(
+            _operational_pending_context(
+                session, executor, user, business_id, owner_message
+            )
+            if executor is not None and user is not None
+            else None
+        ),
     )
     session.commit()
     return _PreparedTurn(request=request, business=business, has_usable_evidence=True)
@@ -1049,6 +1113,7 @@ def _build_category_resolution_request(
         tool_results=(),
         location_candidates=(),
         pending_product_candidates=(),
+        pending_clarification=None,
     )
 
 
@@ -1779,6 +1844,7 @@ def _backend_operational_command(
         "inventory_list": CURRENT_INVENTORY_TOOL,
         "restocking": RESTOCKING_RECOMMENDATIONS_TOOL,
         "sales_summary": SALES_SUMMARY_TOOL,
+        "best_selling_products": BEST_SELLING_PRODUCTS_TOOL,
     }
     tool_name = tool_by_operation.get(result.semantic_operation)
     if tool_name is None:
@@ -1861,6 +1927,10 @@ def _backend_operational_command(
             if not isinstance(value, str) or not value:
                 return None
             arguments[field] = value
+        if proposal.get("branch_external_id") is not None:
+            arguments["branch_external_id"] = proposal["branch_external_id"]
+        if tool_name == BEST_SELLING_PRODUCTS_TOOL and "limit" in proposal:
+            arguments["limit"] = proposal["limit"]
 
     proposal_matches = (
         result.decision == "tool"
@@ -1921,17 +1991,38 @@ def _operational_result_with_usage(
 
 
 def _validated_generation(
-    provider: OwnerChatProvider, request: OwnerChatRequest
+    provider: OwnerChatProvider,
+    request: OwnerChatRequest,
+    budget: _OperationalUsageBudget | None = None,
 ) -> OwnerChatResult:
-    result = provider.generate(request)
+    if budget is not None:
+        budget.admit(provider, request)
     try:
-        return _validate_result(result, request)
+        result = provider.generate(request)
+        try:
+            validated = _validate_result(result, request)
+        except OwnerChatProviderError as exc:
+            if isinstance(result, OwnerChatResult):
+                exc.usage = result.usage
+                exc.provider_identifier = result.provider_identifier
+                exc.model_identifier = result.model_identifier
+            raise
     except OwnerChatProviderError as exc:
-        if isinstance(result, OwnerChatResult):
-            exc.usage = result.usage
-            exc.provider_identifier = result.provider_identifier
-            exc.model_identifier = result.model_identifier
+        if (
+            isinstance(exc, OwnerChatProviderUnavailable)
+            and exc.reason == "rate_limited"
+        ):
+            exc.usage_uncertain = False
+        if budget is not None:
+            budget.usage = _add_usage(
+                budget.usage, _provider_failure_usage(provider, request, exc)
+            )
         raise
+    if budget is not None:
+        budget.usage = _add_usage(
+            budget.usage, _usage_for_result(provider, request, validated)
+        )
+    return validated
 
 
 def _provider_failure_usage(
@@ -1941,9 +2032,20 @@ def _provider_failure_usage(
 ) -> TokenUsage:
     if failure.usage is not None:
         return failure.usage
-    if not failure.usage_uncertain:
+    if not failure.usage_uncertain or (
+        isinstance(failure, OwnerChatProviderUnavailable)
+        and failure.reason == "rate_limited"
+    ):
         return TokenUsage(0, 0, 0, authoritative=False)
     estimated_input = provider.estimate_input_tokens(request)
+    _logger.info(
+        "owner_chat_failed_call mode=%s provider_usage=unknown "
+        "charge_basis=estimated_input_plus_output_limit estimated_input=%s "
+        "output_limit=%s",
+        request.mode,
+        estimated_input,
+        request.max_output_tokens,
+    )
     return TokenUsage(
         estimated_input,
         request.max_output_tokens,
@@ -2006,15 +2108,24 @@ def _operational_synthesis_fallback(
                 )
                 entries.append(
                     f"{_safe_operational_label(item.product.name, 'Product')}: "
-                    f"{item.available_quantity} available "
+                    f"{item.available_quantity} available; "
+                    f"{item.on_hand_quantity} on hand; "
+                    f"{item.reserved_quantity} reserved "
                     f"at {location}"
                 )
             reply = "Current inventory: " + "; ".join(entries) + "."
+            reply += (
+                " Quantities are source stock units; pack/case units were not supplied."
+            )
             if len(output.items) > 10 or output.metadata.is_truncated:
                 reply += (
-                    f" Showing {min(10, len(output.items))} rows; "
-                    "more may be available."
+                    f" Showing {min(10, len(output.items))} of {len(output.items)} "
+                    "returned rows. Ask for a narrower product, category or location."
                 )
+                if output.metadata.is_truncated:
+                    reply += (
+                        " The source result is limited; more rows may be available."
+                    )
         else:
             reply = "No matching inventory rows were returned."
     elif isinstance(output, SalesSummary):
@@ -2100,6 +2211,18 @@ def _operational_synthesis_fallback(
             f"calculated because {missing} is not connected. "
             f"Available alternatives: {alternatives}."
         )
+    elif isinstance(output, dict) and output.get("capability") == "inventory_location":
+        candidates = output.get("candidates", [])
+        reply = (
+            "Which source location do you mean: "
+            + "; ".join(
+                _safe_operational_label(item.get("label"), "location")
+                for item in candidates
+            )
+            + "?"
+            if candidates
+            else "No matching source location was found."
+        )
     elif isinstance(output, dict) and output.get("capability") == (
         "inventory_location_preference"
     ):
@@ -2166,6 +2289,8 @@ def _prepare_inventory_location_arguments(
     user: User,
     business_id: uuid.UUID,
     arguments: dict[str, object],
+    *,
+    owner_message: str | None = None,
 ) -> _InventoryLocationPreparation:
     updated = dict(arguments)
     location_reference = updated.pop("location_reference", None)
@@ -2182,6 +2307,40 @@ def _prepare_inventory_location_arguments(
     current_turn_reference = (
         location_reference or branch_reference or warehouse_reference
     )
+    # A model-expanded label must not erase ambiguity in the owner's source name.
+    # This validates source candidates only after the AI selected inventory.
+    literal_locations = (
+        _preference_locations_in_message(
+            owner_message, tuple(executor.location_candidates(user, business_id))
+        )
+        if owner_message is not None
+        else ()
+    )
+    if len(literal_locations) > 1:
+        return _InventoryLocationPreparation(
+            arguments=updated,
+            result=ProviderToolResult(
+                tool_name="inventory_location",
+                output={
+                    "capability": "inventory_location",
+                    "status": "ambiguous",
+                    "candidates": [
+                        {
+                            "label": candidate.label,
+                            "location_type": candidate.location_type,
+                        }
+                        for candidate in literal_locations
+                    ],
+                },
+            ),
+            location_source="current_turn",
+            location_input_kind="label",
+            preference_loaded=False,
+            preference_applied=False,
+            location_resolution="multiple",
+        )
+    if len(literal_locations) == 1:
+        current_turn_reference = literal_locations[0].external_location_id
     if current_turn_reference:
         if not isinstance(current_turn_reference, str):
             raise ToolExecutionError("invalid_arguments")
@@ -2470,6 +2629,7 @@ def _build_preference_resolution_request(
         location_candidates=(),
         pending_product_candidates=(),
         preference_capabilities=_PREFERENCE_CAPABILITIES,
+        pending_clarification=None,
         preference_location_candidates=candidates,
     )
 
@@ -2957,6 +3117,7 @@ def _run_preference_intent(
     result: OwnerChatResult,
     aggregate_usage: TokenUsage,
     executor: OperationalToolExecutor,
+    budget: _OperationalUsageBudget | None = None,
 ) -> tuple[OwnerChatResult, TokenUsage]:
     intent = _interpret_preference_intent(result)
     source = executor._active_source(business_id)
@@ -2981,10 +3142,12 @@ def _run_preference_intent(
     literal_matches = _preference_location_matches(
         intent.location_reference, source_candidates
     )
-    if intent.location_reference is None and intent.action == "set_preference":
-        literal_matches = _preference_locations_in_message(
+    if intent.action == "set_preference":
+        owner_matches = _preference_locations_in_message(
             owner_message.content, source_candidates
         )
+        if owner_matches:
+            literal_matches = owner_matches
     location = literal_matches[0] if len(literal_matches) == 1 else None
     command = _validated_preference_command(intent, preference_key, location)
     if command is not None and command.action == "clear_preference":
@@ -3039,7 +3202,7 @@ def _run_preference_intent(
             request, resolver_candidates
         )
         try:
-            resolver_result = _validated_generation(provider, resolver_request)
+            resolver_result = _validated_generation(provider, resolver_request, budget)
         except OwnerChatProviderError as exc:
             aggregate_usage = _add_usage(
                 aggregate_usage,
@@ -3147,6 +3310,74 @@ def _clarify_literal_preference_matches(
     )
 
 
+def _validated_pending_preference(
+    session: Session,
+    executor: OperationalToolExecutor,
+    user: User,
+    business_id: uuid.UUID,
+    owner: OwnerChatMessage,
+) -> (
+    tuple[
+        PendingOwnerOperationalPreference,
+        tuple[ProviderPreferenceLocationCandidate, ...],
+        dict[str, object],
+    ]
+    | None
+):
+    """Revalidate scope and the last completed clarification, skipping failed turns."""
+    source = executor._active_source(business_id)
+    pending = _active_pending_preference(
+        session, user, business_id, owner.conversation_id, source.id if source else None
+    )
+    if pending is None or source is None:
+        return None
+    origin = session.get(OwnerChatMessage, pending.originating_message_id)
+    reply = session.scalar(
+        select(OwnerChatMessage).where(
+            OwnerChatMessage.conversation_id == owner.conversation_id,
+            OwnerChatMessage.reply_to_message_id == pending.originating_message_id,
+            OwnerChatMessage.role == ChatMessageRole.ASSISTANT,
+        )
+    )
+    if (
+        origin is None
+        or origin.conversation_id != owner.conversation_id
+        or origin.generation_state != ChatGenerationState.COMPLETED
+        or origin.sequence_number >= owner.sequence_number
+        or reply is None
+    ):
+        _finish_pending_preference(pending, "invalidated")
+        session.commit()
+        return None
+    intervening = session.scalar(
+        select(OwnerChatMessage.id)
+        .where(
+            OwnerChatMessage.conversation_id == owner.conversation_id,
+            OwnerChatMessage.role == ChatMessageRole.OWNER,
+            OwnerChatMessage.generation_state == ChatGenerationState.COMPLETED,
+            OwnerChatMessage.sequence_number > origin.sequence_number,
+            OwnerChatMessage.sequence_number < owner.sequence_number,
+        )
+        .limit(1)
+    )
+    if intervening is not None:
+        _finish_pending_preference(pending, "superseded")
+        session.commit()
+        return None
+    candidates, by_reference = _pending_resolver_candidates(
+        pending, tuple(executor.location_candidates(user, business_id))
+    )
+    if (
+        source.updated_at > reply.created_at
+        or not candidates
+        or len(candidates) != len(_pending_candidate_records(pending))
+    ):
+        _finish_pending_preference(pending, "invalidated")
+        session.commit()
+        return None
+    return pending, candidates, by_reference
+
+
 def _complete_pending_preference_if_selected(
     session: Session,
     business_id: uuid.UUID,
@@ -3158,80 +3389,52 @@ def _complete_pending_preference_if_selected(
     aggregate_usage: TokenUsage,
     executor: OperationalToolExecutor,
 ) -> tuple[OwnerChatResult | None, TokenUsage] | None:
-    if result.decision not in {"final", "unavailable"}:
-        return None
     owner_message = session.get(OwnerChatMessage, claim.message_id)
-    source = executor._active_source(business_id)
     if owner_message is None:
         return None
-    pending = _active_pending_preference(
-        session,
-        user,
-        business_id,
-        owner_message.conversation_id,
-        source.id if source is not None else None,
+    validated = _validated_pending_preference(
+        session, executor, user, business_id, owner_message
     )
-    if pending is None or source is None:
+    if validated is None:
         return None
-    origin = session.get(OwnerChatMessage, pending.originating_message_id)
-    if origin is None or origin.sequence_number != owner_message.sequence_number - 2:
+    pending, resolver_candidates, candidate_by_reference = validated
+    if result.pending_reply in {"cancel", "replace", "unrelated"}:
+        _validate_pending_preference_reply(result, request)
         _finish_pending_preference(pending, "superseded")
         session.commit()
+        if result.pending_reply == "cancel":
+            return OwnerChatResult(
+                reply="The pending inventory-location choice was cancelled.",
+                usage=aggregate_usage,
+                provider_identifier=result.provider_identifier,
+                model_identifier=result.model_identifier,
+            ), aggregate_usage
         return None
-    resolver_candidates, candidate_by_reference = _pending_resolver_candidates(
-        pending, tuple(executor.location_candidates(user, business_id))
+    query = result.location_reference or (result.tool_arguments or {}).get(
+        "location_reference"
     )
-    if not resolver_candidates:
-        _finish_pending_preference(pending, "invalidated")
-        session.commit()
-        return None
-    literal_matches = _preference_location_matches(
-        owner_message.content, tuple(candidate_by_reference.values())
-    )
-    if len(literal_matches) > 1:
-        return _clarify_literal_preference_matches(
-            session,
-            user,
-            business_id,
-            source.id,
-            owner_message,
-            literal_matches,
-            aggregate_usage,
-            result,
-        ), aggregate_usage
-    if result.semantic_operation in {"conversation", "knowledge", "product_price"}:
-        if (
-            _deterministic_preference_location(
-                owner_message.content, tuple(candidate_by_reference.values())
-            )
-            is None
-        ):
-            _finish_pending_preference(pending, "superseded")
-            session.commit()
-            return None
-    resolver_request = _build_preference_resolution_request(
-        request, resolver_candidates
-    )
-    try:
-        resolver_result = _validated_generation(provider, resolver_request)
-    except OwnerChatProviderError as exc:
-        return None, _add_usage(
-            aggregate_usage, _provider_failure_usage(provider, resolver_request, exc)
+    location = (
+        _source_candidate_selection(
+            owner_message.content, query, tuple(candidate_by_reference.values())
         )
-    aggregate_usage = _add_usage(
-        aggregate_usage, _usage_for_result(provider, resolver_request, resolver_result)
+        if result.pending_reply == "selection"
+        else None
     )
-    if (
-        resolver_result.preference_resolution_status != "matched"
-        or resolver_result.preference_resolution_key != pending.preference_key
-        or len(resolver_result.preference_location_candidate_references) != 1
-    ):
-        _finish_pending_preference(pending, "superseded")
+    if location is None:
+        # Advance the completed clarification boundary without renewing its expiry.
+        pending.originating_message_id = owner_message.id
+        pending.version += 1
         session.commit()
-        return None, aggregate_usage
-    location = candidate_by_reference.get(
-        resolver_result.preference_location_candidate_references[0]
-    )
+        return OwnerChatResult(
+            reply=_preference_resolution_reply(
+                "ambiguous" if len(resolver_candidates) > 1 else "no_match",
+                tuple(item.reference for item in resolver_candidates),
+                resolver_candidates,
+            ),
+            usage=aggregate_usage,
+            provider_identifier=result.provider_identifier,
+            model_identifier=result.model_identifier,
+        ), aggregate_usage
     command = _validated_preference_command(
         _InterpretedPreferenceIntent(
             action="set_preference",
@@ -3323,6 +3526,157 @@ def _pending_product_clarification(
     return pending
 
 
+def _operational_pending_context(
+    session: Session,
+    executor: OperationalToolExecutor,
+    user: User,
+    business_id: uuid.UUID,
+    owner: OwnerChatMessage,
+) -> dict[str, object] | None:
+    """Expose only an immediate, scoped clarification, never arbitrary history."""
+    preference = _validated_pending_preference(
+        session, executor, user, business_id, owner
+    )
+    if preference is not None:
+        pending, candidates, _ = preference
+        origin = session.get(OwnerChatMessage, pending.originating_message_id)
+        question = session.scalar(
+            select(OwnerChatMessage.content).where(
+                OwnerChatMessage.reply_to_message_id == pending.originating_message_id,
+                OwnerChatMessage.conversation_id == owner.conversation_id,
+                OwnerChatMessage.role == ChatMessageRole.ASSISTANT,
+            )
+        )
+        return {
+            "operation": "preference",
+            "expected_reply": "selection",
+            "preference_key": pending.preference_key,
+            "owner_request": origin.content,
+            "question": question,
+            "candidates": [
+                {"label": item.label, "location_type": item.location_type}
+                for item in candidates
+            ],
+        }
+    pending = _pending_product_clarification(
+        session, executor, user, business_id, owner.id
+    )
+    previous_owner = session.scalar(
+        select(OwnerChatMessage).where(
+            OwnerChatMessage.conversation_id == owner.conversation_id,
+            OwnerChatMessage.sequence_number == owner.sequence_number - 2,
+            OwnerChatMessage.role == ChatMessageRole.OWNER,
+            OwnerChatMessage.generation_state == ChatGenerationState.COMPLETED,
+        )
+    )
+    previous_reply = session.scalar(
+        select(OwnerChatMessage).where(
+            OwnerChatMessage.conversation_id == owner.conversation_id,
+            OwnerChatMessage.sequence_number == owner.sequence_number - 1,
+            OwnerChatMessage.role == ChatMessageRole.ASSISTANT,
+            OwnerChatMessage.reply_to_message_id == previous_owner.id
+            if previous_owner
+            else False,
+        )
+    )
+    if previous_owner is None or previous_reply is None:
+        return None
+    if pending is not None:
+        candidates = (
+            pending.candidates
+            or pending.category_candidates
+            or pending.location_candidates
+        )
+        operation = (
+            "inventory_product"
+            if pending.candidates
+            else "inventory_category"
+            if pending.category_candidates
+            else "inventory_list"
+        )
+        return {
+            "operation": operation,
+            "expected_reply": "selection",
+            "owner_request": pending.owner_request or previous_owner.content,
+            "question": previous_reply.content,
+            "candidates": [
+                {
+                    "label": getattr(
+                        candidate, "name", getattr(candidate, "label", "")
+                    ),
+                    "sku": getattr(candidate, "sku", None),
+                }
+                for candidate in candidates
+            ],
+        }
+    source = executor._active_source(business_id)
+    if _pending_sales_clarification(
+        session, owner.id, utc_now(), source.updated_at if source else None
+    ):
+        return {
+            "operation": "sales_summary",
+            "expected_reply": "details",
+            "owner_request": previous_owner.content,
+            "question": previous_reply.content,
+        }
+    return None
+
+
+def _source_candidate_selection(
+    message: str, query: object, candidates: tuple[object, ...]
+) -> object | None:
+    """Validate a source reference in the current reply, not a model guess."""
+    normalized = _normalized_classifier_text(message).strip(" ?.!,،")
+    phrase = (
+        _normalized_classifier_text(query).strip(" ?.!,،")
+        if isinstance(query, str)
+        else ""
+    )
+    if not phrase:
+        phrase = normalized
+    grounded_phrase = bool(phrase and f" {phrase} " in f" {normalized} ")
+    matches = []
+    for candidate in candidates:
+        values = tuple(
+            _normalized_classifier_text(value)
+            for field in (
+                "external_product_id",
+                "sku",
+                "barcode",
+                "name",
+                "external_category_id",
+                "external_location_id",
+                "label",
+            )
+            if isinstance(value := getattr(candidate, field, None), str)
+        )
+        if any(f" {value} " in f" {normalized} " for value in values) or (
+            grounded_phrase and any(f" {phrase} " in f" {value} " for value in values)
+        ):
+            matches.append(candidate)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _pending_inventory_reply(pending: PendingInventoryClarification) -> str:
+    if pending.candidates:
+        labels = [
+            f"{item.name} ({item.sku})" if item.sku else item.name
+            for item in pending.candidates
+        ]
+        kind = "product"
+    else:
+        labels = [
+            item.label
+            for item in (pending.category_candidates or pending.location_candidates)
+        ]
+        kind = "category" if pending.category_candidates else "location"
+    return (
+        f"Which {kind} do you mean: "
+        + "; ".join(_safe_operational_label(label, kind) for label in labels)
+        + "?"
+    )
+
+
 def _inventory_literal_references(message: str) -> tuple[str | None, str | None]:
     """Remove only inventory request syntax, preserving the product reference."""
     text = " ".join(message.split()).strip(" ?.!")
@@ -3403,8 +3757,40 @@ def _store_product_clarification(
         expires_at=utc_now() + PREFERENCE_PENDING_TTL,
         arguments=InventoryQuery.model_validate(arguments),
         candidates=output.resolution.candidates,
+        owner_request=owner_message.content,
     )
     owner_message.operational_clarification = pending.model_dump(mode="json")
+
+
+def _store_inventory_choice(
+    session: Session,
+    executor: OperationalToolExecutor,
+    user: User,
+    business_id: uuid.UUID,
+    owner_message_id: uuid.UUID,
+    arguments: dict[str, object],
+    *,
+    category_candidates: tuple[CategoryCandidate, ...] = (),
+    location_candidates: tuple[LocationCandidate, ...] = (),
+) -> None:
+    source = executor._active_source(business_id)
+    owner = session.get(OwnerChatMessage, owner_message_id)
+    if source is None or owner is None:
+        return
+    proposal = dict(arguments)
+    location_reference = proposal.pop("location_reference", None)
+    pending = PendingInventoryClarification(
+        user_id=user.id,
+        source_id=source.id,
+        source_updated_at=source.updated_at,
+        expires_at=utc_now() + PREFERENCE_PENDING_TTL,
+        arguments=InventoryQuery.model_validate(proposal),
+        category_candidates=category_candidates[:5],
+        location_candidates=location_candidates[:5],
+        location_reference=location_reference,
+        owner_request=owner.content,
+    )
+    owner.operational_clarification = pending.model_dump(mode="json")
 
 
 def _run_operational_loop(
@@ -3419,6 +3805,7 @@ def _run_operational_loop(
     category_candidates: tuple[ProviderCategoryCandidate, ...] = (),
     location_candidates: tuple[ProviderLocationCandidate, ...] = (),
     selected_sources: list[ProviderSource] | None = None,
+    budget: _OperationalUsageBudget | None = None,
 ) -> tuple[OwnerChatResult, TokenUsage]:
     tool_results: list[ProviderToolResult] = []
     aggregate_usage: TokenUsage | None = None
@@ -3445,7 +3832,7 @@ def _run_operational_loop(
             ProviderProductCandidate(label=candidate.name, sku=candidate.sku)
             for candidate in pending_product.candidates
         )
-        if pending_product is not None
+        if pending_product is not None and pending_product.candidates
         else ()
     )
 
@@ -3461,6 +3848,8 @@ def _run_operational_loop(
             category_candidates=category_candidates,
             location_candidates=location_candidates,
             pending_product_candidates=pending_product_candidates,
+            user=user,
+            executor=executor,
         )
         request = prepared.request
         request = replace(
@@ -3469,12 +3858,65 @@ def _run_operational_loop(
             pending_sales_clarification=pending_sales,
         )
         try:
-            result = _validated_generation(provider, request)
+            result = _validated_generation(provider, request, budget)
         except OwnerChatProviderError as exc:
             _logger.info(
                 "owner_chat_operational_plan validation=rejected reason=%s",
                 exc.reason,
             )
+            if (
+                isinstance(exc, OwnerChatProviderInvalidResponse)
+                and exc.usage is not None
+                and exc.usage.authoritative
+                and (request.pending_clarification or {}).get("operation")
+                == "preference"
+            ):
+                # Discard the rejected plan; preserve a source-validated question.
+                # Unknown usage still follows the existing failed-turn charge path.
+                recovered_usage = _add_usage(aggregate_usage, exc.usage)
+                recovery = _complete_pending_preference_if_selected(
+                    session,
+                    business_id,
+                    claim,
+                    user,
+                    provider,
+                    request,
+                    OwnerChatResult(
+                        pending_reply="unresolved",
+                        provider_identifier=exc.provider_identifier,
+                        model_identifier=exc.model_identifier,
+                    ),
+                    recovered_usage,
+                    executor,
+                )
+                if recovery is not None and recovery[0] is not None:
+                    return recovery
+            if (
+                isinstance(exc, OwnerChatProviderInvalidResponse)
+                and exc.reason
+                in {
+                    "schema_validation_failed",
+                    "output_truncated",
+                    "planner_missing_pending_reply",
+                }
+                and exc.usage is not None
+                and exc.usage.authoritative
+                and pending_product is not None
+            ):
+                # The rejected plan cannot execute. Known returned usage is still
+                # charged, while the source-backed question remains answerable.
+                aggregate_usage = _add_usage(aggregate_usage, exc.usage)
+                owner = session.get(OwnerChatMessage, claim.message_id)
+                owner.operational_clarification = pending_product.model_dump(
+                    mode="json"
+                )
+                session.commit()
+                return OwnerChatResult(
+                    reply=_pending_inventory_reply(pending_product),
+                    usage=aggregate_usage,
+                    provider_identifier=exc.provider_identifier,
+                    model_identifier=exc.model_identifier,
+                ), aggregate_usage
             if aggregate_usage is not None and not exc.usage_uncertain:
                 exc.usage = (
                     _add_usage(aggregate_usage, exc.usage)
@@ -3483,9 +3925,47 @@ def _run_operational_loop(
                 )
             raise
         original_action = result.decision
-        selected_product = _selected_pending_product(
-            request.messages[-1].content, pending_product
+        selected_product = (
+            _selected_pending_product(request.messages[-1].content, pending_product)
+            if result.pending_reply != "unrelated"
+            else None
         )
+        pending_candidates = (
+            pending_product.candidates
+            or pending_product.category_candidates
+            or pending_product.location_candidates
+            if pending_product is not None
+            else ()
+        )
+        selection_query = (
+            result.entity_query
+            if pending_product is not None and not pending_product.location_candidates
+            else (result.tool_arguments or {}).get("location_reference")
+        )
+        selected_choice = (
+            _source_candidate_selection(
+                request.messages[-1].content, selection_query, pending_candidates
+            )
+            if pending_candidates and result.pending_reply != "unrelated"
+            else None
+        )
+        if isinstance(selected_choice, ProductResolutionCandidate):
+            selected_product = selected_choice
+        if selected_choice is not None and (
+            (result.tool_name is not None and result.tool_name not in executor.registry)
+            or (
+                result.tool_arguments is not None
+                and _contains_control_payload(result.tool_arguments)
+            )
+        ):
+            raise OwnerChatProviderInvalidResponse(
+                reason="prohibited_provider_arguments",
+                usage=_add_usage(
+                    aggregate_usage, _usage_for_result(provider, request, result)
+                ),
+                provider_identifier=result.provider_identifier,
+                model_identifier=result.model_identifier,
+            )
         if selected_product is not None:
             if (
                 result.tool_name is not None
@@ -3537,15 +4017,81 @@ def _run_operational_loop(
             "accepted" if command is not None else "rejected",
         )
         call_usage = _usage_for_result(provider, request, result)
+        aggregate_usage = _add_usage(aggregate_usage, call_usage)
+        if budget is not None:
+            budget.usage = aggregate_usage
         if call_usage.output_tokens > request.max_output_tokens:
             raise OwnerChatProviderInvalidResponse(
-                usage=_add_usage(aggregate_usage, call_usage),
+                usage=aggregate_usage,
                 provider_identifier=result.provider_identifier,
                 model_identifier=result.model_identifier,
             )
-        aggregate_usage = _add_usage(aggregate_usage, call_usage)
+        if (
+            pending_product is not None
+            and selected_product is None
+            and (
+                selected_choice is not None
+                or result.pending_reply in {"selection", "confirmation", "unresolved"}
+                or (
+                    result.pending_reply is None
+                    and result.semantic_operation
+                    == (request.pending_clarification or {}).get("operation")
+                )
+            )
+        ):
+            if selected_choice is None:
+                owner = session.get(OwnerChatMessage, claim.message_id)
+                owner.operational_clarification = pending_product.model_dump(
+                    mode="json"
+                )
+                session.commit()
+                return OwnerChatResult(
+                    reply=_pending_inventory_reply(pending_product),
+                    usage=aggregate_usage,
+                    provider_identifier=result.provider_identifier,
+                    model_identifier=result.model_identifier,
+                ), aggregate_usage
+            arguments = pending_product.arguments.model_dump(exclude_none=True)
+            if pending_product.location_reference is not None:
+                arguments["location_reference"] = pending_product.location_reference
+            if pending_product.category_candidates:
+                arguments["category_filter"] = selected_choice.label
+                result = replace(
+                    result,
+                    decision="tool",
+                    semantic_operation="inventory_category",
+                    entity_kind="category",
+                    entity_query=selected_choice.label,
+                    tool_name=CURRENT_INVENTORY_TOOL,
+                    tool_arguments=arguments,
+                    reply="",
+                    preference_key=None,
+                    location_reference=None,
+                )
+            else:
+                arguments.pop("branch_external_id", None)
+                arguments.pop("warehouse_external_id", None)
+                arguments["location_reference"] = selected_choice.external_location_id
+                result = replace(
+                    result,
+                    decision="tool",
+                    semantic_operation="inventory_list",
+                    entity_kind=None,
+                    entity_query=None,
+                    tool_name=CURRENT_INVENTORY_TOOL,
+                    tool_arguments=arguments,
+                    reply="",
+                    preference_key=None,
+                    location_reference=None,
+                )
+            result, command = _consistent_operational_plan(
+                result, executor, request.category_candidates, request
+            )
 
-        if result.semantic_operation == "sales_summary" and command is None:
+        if (
+            result.semantic_operation in {"sales_summary", "best_selling_products"}
+            and command is None
+        ):
             _logger.info(
                 "owner_chat_operational_dispatch outcome=clarification "
                 "tool_derivation=semantic_registry effective_tool=%s "
@@ -3596,7 +4142,9 @@ def _run_operational_loop(
                     request, result.entity_query
                 )
                 try:
-                    category_result = _validated_generation(provider, category_request)
+                    category_result = _validated_generation(
+                        provider, category_request, budget
+                    )
                 except OwnerChatProviderError as exc:
                     failure_usage = exc.usage
                     if failure_usage is None and exc.usage_uncertain:
@@ -3659,6 +4207,26 @@ def _run_operational_loop(
                                 ),
                             )
                         elif category_result.category_resolution_status == "ambiguous":
+                            references = set(
+                                category_result.category_candidate_references
+                            )
+                            _store_inventory_choice(
+                                session,
+                                executor,
+                                user,
+                                business_id,
+                                claim.message_id,
+                                result.tool_arguments or {},
+                                category_candidates=tuple(
+                                    CategoryCandidate(
+                                        external_category_id=item.external_category_id,
+                                        label=item.label,
+                                    )
+                                    for item in request.category_candidates
+                                    if item.external_category_id in references
+                                ),
+                            )
+                            session.commit()
                             reply = _bounded_category_resolution_reply(
                                 category_result.category_candidate_references,
                                 request.category_candidates,
@@ -3786,7 +4354,9 @@ def _run_operational_loop(
                 routed_result = OwnerChatResult(reply=reply)
             else:
                 try:
-                    routed_result = _validated_generation(provider, routed.request)
+                    routed_result = _validated_generation(
+                        provider, routed.request, budget
+                    )
                 except OwnerChatProviderError as exc:
                     exc.usage = _add_usage(
                         aggregate_usage,
@@ -3870,6 +4440,7 @@ def _run_operational_loop(
                 result,
                 aggregate_usage,
                 executor,
+                budget,
             )
             intent = _interpret_preference_intent(result)
             source_candidates = tuple(executor.location_candidates(user, business_id))
@@ -3902,7 +4473,9 @@ def _run_operational_loop(
                     request, resolver_candidates
                 )
                 try:
-                    resolver_result = _validated_generation(provider, resolver_request)
+                    resolver_result = _validated_generation(
+                        provider, resolver_request, budget
+                    )
                 except OwnerChatProviderInvalidResponse as exc:
                     failure_usage = exc.usage
                     if failure_usage is None and exc.usage_uncertain:
@@ -4091,7 +4664,7 @@ def _run_operational_loop(
             )
             synthesis_request = synthesis_prepared.request
             try:
-                synthesis = _validated_generation(provider, synthesis_request)
+                synthesis = _validated_generation(provider, synthesis_request, budget)
                 synthesis_usage = _usage_for_result(
                     provider, synthesis_request, synthesis
                 )
@@ -4225,7 +4798,12 @@ def _run_operational_loop(
             )
             try:
                 location_preparation = _prepare_inventory_location_arguments(
-                    session, executor, user, business_id, arguments
+                    session,
+                    executor,
+                    user,
+                    business_id,
+                    arguments,
+                    owner_message=request.messages[-1].content,
                 )
             except ToolExecutionError:
                 _logger.info(
@@ -4252,6 +4830,25 @@ def _run_operational_loop(
             preference_applied = location_preparation.preference_applied
             location_resolution = location_preparation.location_resolution
             if location_preparation.result is not None:
+                output = location_preparation.result.output
+                if isinstance(output, dict) and output.get("status") == "ambiguous":
+                    offered = {
+                        (item["label"], item["location_type"])
+                        for item in output["candidates"]
+                    }
+                    _store_inventory_choice(
+                        session,
+                        executor,
+                        user,
+                        business_id,
+                        claim.message_id,
+                        location_preparation.arguments,
+                        location_candidates=tuple(
+                            item
+                            for item in executor.location_candidates(user, business_id)
+                            if (item.label, item.location_type) in offered
+                        ),
+                    )
                 synthesis_prepared = _build_operational_synthesis_request(
                     session,
                     business_id,
@@ -4262,7 +4859,9 @@ def _run_operational_loop(
                 )
                 synthesis_request = synthesis_prepared.request
                 try:
-                    synthesis = _validated_generation(provider, synthesis_request)
+                    synthesis = _validated_generation(
+                        provider, synthesis_request, budget
+                    )
                     synthesis_usage = _usage_for_result(
                         provider, synthesis_request, synthesis
                     )
@@ -4275,7 +4874,11 @@ def _run_operational_loop(
                         _operational_result_with_usage(synthesis, aggregate_usage),
                         aggregate_usage,
                     )
-                except OwnerChatProviderError:
+                except OwnerChatProviderError as exc:
+                    aggregate_usage = _add_usage(
+                        aggregate_usage,
+                        _provider_failure_usage(provider, synthesis_request, exc),
+                    )
                     return (
                         _operational_synthesis_fallback(
                             location_preparation.result.output,
@@ -4363,6 +4966,20 @@ def _run_operational_loop(
                 arguments,
                 executed.output,
             )
+            if (
+                isinstance(executed.output, InventoryResult)
+                and executed.output.category_resolution is not None
+                and executed.output.category_resolution.status == "ambiguous"
+            ):
+                _store_inventory_choice(
+                    session,
+                    executor,
+                    user,
+                    business_id,
+                    claim.message_id,
+                    arguments,
+                    category_candidates=executed.output.category_resolution.candidates,
+                )
         resolution_reply = _product_resolution_reply(
             [tool_result],
             request.messages[-1].content,
@@ -4396,7 +5013,7 @@ def _run_operational_loop(
         )
         synthesis_request = synthesis_prepared.request
         try:
-            synthesis = _validated_generation(provider, synthesis_request)
+            synthesis = _validated_generation(provider, synthesis_request, budget)
         except OwnerChatProviderError as exc:
             failure_usage = exc.usage
             if failure_usage is None and exc.usage_uncertain:
@@ -4453,10 +5070,66 @@ def _run_operational_loop(
     raise RuntimeError("Operational provider planner exited unexpectedly.")
 
 
+def _validate_pending_preference_reply(
+    result: OwnerChatResult, request: OwnerChatRequest
+) -> None:
+    """Require AI-classified, current-message evidence before abandoning a choice."""
+    if (request.pending_clarification or {}).get("operation") != "preference":
+        if result.pending_reply in {"cancel", "replace"} or result.pending_request:
+            raise OwnerChatProviderInvalidResponse(reason="invalid_pending_transition")
+        return
+    if result.pending_reply not in {
+        "selection",
+        "confirmation",
+        "unresolved",
+        "unrelated",
+        "cancel",
+        "replace",
+    }:
+        raise OwnerChatProviderInvalidResponse(reason="invalid_pending_transition")
+    if result.pending_reply in {"cancel", "replace", "unrelated"}:
+        quote = result.pending_request
+        message = " ".join(request.messages[-1].content.split())
+        if (
+            not isinstance(quote, str)
+            or not 1 <= len(quote.strip()) <= 255
+            or " ".join(quote.split()) not in message
+            or (
+                result.pending_reply == "replace"
+                and result.decision not in {"set_preference", "clear_preference"}
+            )
+            or (
+                result.pending_reply == "cancel"
+                and (
+                    result.decision != "final"
+                    or result.semantic_operation != "conversation"
+                )
+            )
+            or (
+                result.pending_reply == "unrelated"
+                and result.decision in {"set_preference", "clear_preference"}
+            )
+        ):
+            raise OwnerChatProviderInvalidResponse(reason="invalid_pending_transition")
+    elif result.pending_request is not None or result.decision == "clear_preference":
+        raise OwnerChatProviderInvalidResponse(reason="invalid_pending_transition")
+
+
 def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResult:
     if not isinstance(result, OwnerChatResult):
         raise OwnerChatProviderInvalidResponse
     if request.mode == "operational":
+        if result.pending_reply not in {
+            None,
+            "selection",
+            "confirmation",
+            "unresolved",
+            "unrelated",
+            "cancel",
+            "replace",
+        }:
+            raise OwnerChatProviderInvalidResponse(reason="invalid_pending_reply")
+        _validate_pending_preference_reply(result, request)
         result = normalize_legacy_operational_preference(result)
         if result.semantic_operation not in {
             "inventory_product",
@@ -4464,6 +5137,7 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
             "inventory_list",
             "restocking",
             "sales_summary",
+            "best_selling_products",
             "preference",
             "knowledge",
             "conversation",
@@ -4540,9 +5214,15 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
                 )
             _interpret_preference_intent(result)
         elif result.decision in {"final", "unavailable"}:
+            delegated = result.decision == "final" and result.semantic_operation in {
+                "conversation",
+                "knowledge",
+                "product_price",
+            }
             if (
                 not isinstance(result.reply, str)
-                or not 1 <= len(result.reply.strip()) <= 14_000
+                or (not delegated and not result.reply.strip())
+                or len(result.reply.strip()) > 14_000
                 or result.tool_name is not None
                 or result.tool_arguments is not None
             ):
@@ -4572,6 +5252,57 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
             )
         if _is_unsafe_reply(result.reply):
             raise OwnerChatProviderInvalidResponse(reason="unsafe_output")
+        if (
+            request.validated_result_status == "data"
+            and any(
+                tool.tool_name == CURRENT_INVENTORY_TOOL
+                and (
+                    bool(tool.output.items)
+                    if isinstance(tool.output, InventoryResult)
+                    else isinstance(tool.output, dict)
+                    and bool(tool.output.get("items"))
+                )
+                for tool in request.tool_results
+            )
+            and not any(character.isdecimal() for character in result.reply)
+        ):
+            # A quantity-free inventory acknowledgement is not a usable answer.
+            # Existing synthesis failure handling renders the validated source data.
+            raise OwnerChatProviderInvalidResponse(
+                reason="missing_inventory_quantities"
+            )
+        for tool in request.tool_results:
+            if (
+                tool.tool_name == CURRENT_INVENTORY_TOOL
+                and request.validated_result_status == "data"
+            ):
+                output = (
+                    tool.output
+                    if isinstance(tool.output, InventoryResult)
+                    else InventoryResult.model_validate(tool.output)
+                )
+                # Free prose cannot establish row coverage or stock-unit conversions.
+                # Render the bounded list from the same validated source result used
+                # by failure fallback; retain the actual generation usage.
+                return replace(
+                    result,
+                    reply=_operational_synthesis_fallback(
+                        output,
+                        result.usage or TokenUsage(0, 0, 0, authoritative=False),
+                        result.provider_identifier,
+                        result.model_identifier,
+                    ).reply,
+                )
+            if tool.tool_name == "inventory_location":
+                return replace(
+                    result,
+                    reply=_operational_synthesis_fallback(
+                        tool.output,
+                        result.usage or TokenUsage(0, 0, 0, authoritative=False),
+                        result.provider_identifier,
+                        result.model_identifier,
+                    ).reply,
+                )
     elif request.mode == "category_resolution":
         candidate_references = {
             candidate.external_category_id for candidate in request.category_candidates
@@ -4786,6 +5517,7 @@ def _generate_claimed_turn(
 ) -> bool:
     reservation: AIUsageReservationClaim | None = None
     aggregate_usage: TokenUsage | None = None
+    budget: _OperationalUsageBudget | None = None
     try:
         owner_message = session.get(OwnerChatMessage, claim.message_id)
         business = session.get(Business, business_id)
@@ -4796,9 +5528,24 @@ def _generate_claimed_turn(
         # turns; source-backed non-casual turns also receive the planner so a
         # product or category reference is not lost before tool selection.
         is_live_operational = _is_live_operational_request(owner_message.content)
+        has_pending_preference = (
+            session.scalar(
+                select(PendingOwnerOperationalPreference.id)
+                .where(
+                    PendingOwnerOperationalPreference.user_id == user.id,
+                    PendingOwnerOperationalPreference.business_id == business_id,
+                    PendingOwnerOperationalPreference.conversation_id
+                    == owner_message.conversation_id,
+                    PendingOwnerOperationalPreference.state == "pending",
+                )
+                .limit(1)
+            )
+            is not None
+        )
         has_active_operational_source = False
-        if profiles is not None and not _is_general_conversation_request(
-            owner_message.content
+        if profiles is not None and (
+            has_pending_preference
+            or not _is_general_conversation_request(owner_message.content)
         ):
             probe_executor = OperationalToolExecutor(session, profiles, settings)
             has_active_operational_source = (
@@ -4845,41 +5592,7 @@ def _generate_claimed_turn(
                 )
                 for candidate in executor.location_candidates(user, business_id)
             )
-            initial = _build_operational_request(
-                session,
-                business_id,
-                claim.message_id,
-                settings,
-                provider_definitions,
-                category_candidates=category_candidates,
-                location_candidates=location_candidates,
-            )
-            generation_attempt = _admit_provider_generation(
-                session, business_id, claim, settings
-            )
-            try:
-                reservation = reserve_owner_chat_usage(
-                    session,
-                    business=initial.business,
-                    user=user,
-                    owner_message_id=claim.message_id,
-                    generation_attempt=generation_attempt,
-                    estimated_input_tokens=(
-                        provider.estimate_input_tokens(initial.request)
-                        * MAX_OPERATIONAL_PROVIDER_CALLS
-                    ),
-                    max_output_tokens=(
-                        initial.request.max_output_tokens
-                        * MAX_OPERATIONAL_PROVIDER_CALLS
-                    ),
-                    lease_seconds=settings.owner_chat_generation_lease_seconds,
-                )
-            except Exception:
-                session.rollback()
-                _undo_pre_provider_admission(
-                    session, business_id, claim, generation_attempt
-                )
-                raise
+            budget = _OperationalUsageBudget(session, business, user, claim, settings)
             if executor is None:  # pragma: no cover - guarded above
                 raise RuntimeError("Operational executor is unavailable.")
             selected_sources: list[ProviderSource] = []
@@ -4895,13 +5608,14 @@ def _generate_claimed_turn(
                 category_candidates,
                 location_candidates,
                 selected_sources=selected_sources,
+                budget=budget,
             )
             _persist_result(
                 session,
                 business_id,
                 claim,
                 result,
-                reservation,
+                budget.reservation,
                 aggregate_usage,
                 tuple(selected_sources),
             )
@@ -4954,41 +5668,9 @@ def _generate_claimed_turn(
                         user, business_id
                     )
                 )
-                initial = _build_operational_request(
-                    session,
-                    business_id,
-                    claim.message_id,
-                    settings,
-                    provider_definitions,
-                    category_candidates=category_candidates,
-                    location_candidates=location_candidates,
+                budget = _OperationalUsageBudget(
+                    session, business, user, claim, settings
                 )
-                generation_attempt = _admit_provider_generation(
-                    session, business_id, claim, settings
-                )
-                try:
-                    reservation = reserve_owner_chat_usage(
-                        session,
-                        business=initial.business,
-                        user=user,
-                        owner_message_id=claim.message_id,
-                        generation_attempt=generation_attempt,
-                        estimated_input_tokens=(
-                            provider.estimate_input_tokens(initial.request)
-                            * MAX_OPERATIONAL_PROVIDER_CALLS
-                        ),
-                        max_output_tokens=(
-                            initial.request.max_output_tokens
-                            * MAX_OPERATIONAL_PROVIDER_CALLS
-                        ),
-                        lease_seconds=settings.owner_chat_generation_lease_seconds,
-                    )
-                except Exception:
-                    session.rollback()
-                    _undo_pre_provider_admission(
-                        session, business_id, claim, generation_attempt
-                    )
-                    raise
                 selected_sources = []
                 result, aggregate_usage = _run_operational_loop(
                     session,
@@ -5002,13 +5684,14 @@ def _generate_claimed_turn(
                     category_candidates,
                     location_candidates,
                     selected_sources=selected_sources,
+                    budget=budget,
                 )
                 _persist_result(
                     session,
                     business_id,
                     claim,
                     result,
-                    reservation,
+                    budget.reservation,
                     aggregate_usage,
                     tuple(selected_sources),
                 )
@@ -5088,6 +5771,9 @@ def _generate_claimed_turn(
                 model_identifier=result.model_identifier,
             )
     except OwnerChatProviderError as exc:
+        if budget is not None:
+            reservation = budget.reservation
+            aggregate_usage = budget.usage
         _logger.error(
             "owner-chat provider error: %s reason=%s usage_uncertain=%s",
             type(exc).__name__,
@@ -5108,26 +5794,41 @@ def _generate_claimed_turn(
             if not exc.usage_uncertain or rate_limited
             else "uncertain"
         )
+        if budget is not None and budget.calls > 1 and aggregate_usage is not None:
+            outcome = "reported_failure"
         _mark_failed(
             session,
             claim,
             reservation=reservation,
-            usage=exc.usage,
+            usage=aggregate_usage if budget is not None else exc.usage,
             outcome=outcome if reservation is not None else None,
             provider_identifier=exc.provider_identifier,
             model_identifier=exc.model_identifier,
         )
         raise _safe_provider_failure(exc) from None
     except ApplicationError:
+        if budget is not None:
+            reservation = budget.reservation
+            aggregate_usage = budget.usage
         session.rollback()
         _mark_failed(
             session,
             claim,
             reservation=reservation,
-            outcome="release" if reservation is not None else None,
+            usage=aggregate_usage,
+            outcome=(
+                "reported_failure"
+                if aggregate_usage is not None
+                else "release"
+                if reservation is not None
+                else None
+            ),
         )
         raise
     except ToolExecutionError:
+        if budget is not None:
+            reservation = budget.reservation
+            aggregate_usage = budget.usage
         session.rollback()
         _mark_failed(
             session,
@@ -5144,6 +5845,9 @@ def _generate_claimed_turn(
         )
         raise _provider_unavailable() from None
     except Exception as exc:
+        if budget is not None:
+            reservation = budget.reservation
+            aggregate_usage = budget.usage
         _logger.info(
             "owner_chat_operational_dispatch outcome=unexpected_error type=%s",
             type(exc).__name__,

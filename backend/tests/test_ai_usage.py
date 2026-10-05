@@ -1,8 +1,11 @@
 """Per-business AI allowance, reservation, ACL, and summary tests."""
 
+import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from threading import Barrier
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -32,6 +35,62 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from tests.test_business_api import headers
 from tests.test_owner_chat import CapturingProvider, active_business, submit
+
+
+@pytest.mark.parametrize(
+    "outcome,usage,source,basis",
+    [
+        (
+            "completed",
+            TokenUsage(20, 4, 24, True),
+            "provider_reported",
+            "reconciled_usage",
+        ),
+        (
+            "completed",
+            TokenUsage(20, 514, 534, False),
+            "estimate_or_mixed",
+            "reconciled_usage",
+        ),
+        ("uncertain", None, "unknown", "full_reservation"),
+        ("release", None, "known_pre_use_rejection", "reconciled_usage"),
+    ],
+)
+def test_reconciliation_logs_usage_source_without_reclassifying_estimates(
+    caplog, monkeypatch, outcome, usage, source, basis
+):
+    # Integration migrations configure Alembic logging in this pytest process.
+    monkeypatch.setattr(logging.getLogger("app.services.ai_usage"), "disabled", False)
+
+    class FinalizationSession:
+        parameters = None
+        reconciled = True
+
+        def execute(self, query, parameters):
+            self.parameters = parameters
+            return SimpleNamespace(
+                one=lambda: SimpleNamespace(reconciled=self.reconciled)
+            )
+
+        def commit(self):
+            pass
+
+    session = FinalizationSession()
+    with caplog.at_level(logging.INFO, logger="app.services.ai_usage"):
+        assert reconcile_ai_usage(session, uuid.uuid4(), usage=usage, outcome=outcome)
+        session.reconciled = False
+        assert not reconcile_ai_usage(
+            session, uuid.uuid4(), usage=usage, outcome=outcome
+        )
+    assert len(caplog.records) == 1
+    assert f"usage_source={source}" in caplog.text
+    assert f"charge_basis={basis}" in caplog.text
+    assert session.parameters["authoritative"] is (
+        usage is not None and usage.authoritative
+    )
+    if usage is None:
+        assert session.parameters["input_tokens"] is None
+        assert "input_tokens=unknown" in caplog.text
 
 
 def ollama_accounting_provider(
@@ -572,8 +631,11 @@ def test_budget_function_owners_search_paths_and_execution_acls(
     admin_signature = (
         "public.sou2ai_change_business_ai_allowance(uuid,integer,integer,text,text)"
     )
+    resize_signature = (
+        "public.sou2ai_resize_owner_chat_usage(uuid,uuid,integer,integer)"
+    )
     with migration_engine.connect() as connection:
-        for signature in (reserve_signature, admin_signature):
+        for signature in (reserve_signature, admin_signature, resize_signature):
             function = connection.execute(
                 text(
                     "SELECT p.prosecdef,p.proconfig,pg_get_userbyid(p.proowner) owner "
@@ -592,6 +654,17 @@ def test_budget_function_owners_search_paths_and_execution_acls(
                     {"signature": signature},
                 )
                 is False
+            )
+        for role, allowed in (
+            ("sou2ai_runtime", True),
+            ("sou2ai_lifecycle_operator", False),
+        ):
+            assert (
+                connection.scalar(
+                    text("SELECT has_function_privilege(:role,:signature,'EXECUTE')"),
+                    {"role": role, "signature": resize_signature},
+                )
+                is allowed
             )
         assert (
             connection.scalar(
@@ -691,6 +764,242 @@ def test_business_local_windows_preserve_midnight_across_dst() -> None:
         assert local_start.date() == moment.astimezone(timezone).date()
         assert local_end.date() == local_start.date() + timedelta(days=1)
         assert 23 * 3600 <= (end - start).total_seconds() <= 25 * 3600
+
+
+@pytest.fixture
+def resizable_owner_reservation(api_client, db_session):
+    from app.services.ai_usage import reserve_owner_chat_usage
+
+    user, payload = active_business(api_client, db_session)
+    business = db_session.get(Business, uuid.UUID(str(payload["id"])))
+    conversation = db_session.scalar(
+        select(OwnerConversation).where(OwnerConversation.business_id == business.id)
+    )
+    message = OwnerChatMessage(
+        conversation_id=conversation.id,
+        sequence_number=1001,
+        role=ChatMessageRole.OWNER,
+        content="reservation resize fixture",
+        idempotency_key="resize-fixture",
+        generation_state=ChatGenerationState.PROCESSING,
+        generation_claim_token=uuid.uuid4(),
+        generation_claim_expires_at=datetime.now(UTC) + timedelta(seconds=150),
+        generation_attempts=1,
+    )
+    db_session.add(message)
+    db_session.commit()
+    reservation = reserve_owner_chat_usage(
+        db_session,
+        business=business,
+        user=user,
+        owner_message_id=message.id,
+        generation_attempt=1,
+        estimated_input_tokens=50,
+        max_output_tokens=50,
+        lease_seconds=150,
+    )
+    return business, user, message, reservation
+
+
+@pytest.mark.parametrize("channel", ["owner", "customer"])
+def test_reservation_resize_serializes_with_other_channels(
+    resizable_owner_reservation, database_engine, migration_engine, channel
+):
+    business, user, message, reservation = resizable_owner_reservation
+    business_id, user_id, token = business.id, user.id, message.generation_claim_token
+    barrier = Barrier(2)
+
+    def compete(resize):
+        with database_engine.connect() as connection:
+            barrier.wait(timeout=5)
+            try:
+                if resize:
+                    connection.execute(
+                        text(
+                            "SELECT public.sou2ai_resize_owner_chat_usage("
+                            ":id,:token,11900,100)"
+                        ),
+                        {"id": reservation.id, "token": token},
+                    )
+                else:
+                    connection.execute(
+                        text(
+                            "SELECT * FROM public.sou2ai_reserve_ai_usage("
+                            ":business,:user,NULL,1,:channel,'test',11900,100,150)"
+                        ),
+                        {"business": business_id, "user": user_id, "channel": channel},
+                    )
+                connection.commit()
+                return "admitted"
+            except DBAPIError as exc:
+                connection.rollback()
+                assert "daily_ai_token_limit_reached" in str(exc.orig)
+                return "blocked"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(compete, (True, False))) == ["admitted", "blocked"]
+    with migration_engine.connect() as connection:
+        held = connection.scalar(
+            text("SELECT sum(reserved_tokens) FROM ai_usage_reservations")
+        )
+        assert held in (12000, 12100)
+        assert (
+            connection.scalar(
+                text("SELECT tokens_reserved FROM business_ai_usage_daily")
+            )
+            == held
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "token",
+        "expired",
+        "claim_expired",
+        "day_ended",
+        "reconciled",
+        "attempt",
+        "state",
+        "channel",
+        "negative",
+        "null",
+    ],
+)
+def test_reservation_resize_rejects_invalid_or_stale_claims(
+    resizable_owner_reservation, database_engine, migration_engine, invalid
+):
+    business, user, message, reservation = resizable_owner_reservation
+    token = uuid.uuid4() if invalid == "token" else message.generation_claim_token
+    with migration_engine.begin() as connection:
+        if invalid == "expired":
+            connection.execute(
+                text(
+                    "UPDATE ai_usage_reservations "
+                    "SET created_at=now()-interval '2 minutes', "
+                    "lease_expires_at=now()-interval '1 minute'"
+                )
+            )
+        elif invalid == "claim_expired":
+            connection.execute(
+                text(
+                    "UPDATE owner_chat_messages "
+                    "SET generation_claim_expires_at=now()-interval '1 second' "
+                    "WHERE id=:id"
+                ),
+                {"id": message.id},
+            )
+        elif invalid == "day_ended":
+            connection.execute(
+                text(
+                    "UPDATE ai_usage_reservations "
+                    "SET window_start=now()-interval '2 days',"
+                    "window_end=now()-interval '1 day'"
+                )
+            )
+        elif invalid == "reconciled":
+            connection.execute(
+                text(
+                    "SELECT * FROM public.sou2ai_reconcile_ai_usage("
+                    ":id,10,2,true,'test','test','completed')"
+                ),
+                {"id": reservation.id},
+            )
+        elif invalid == "attempt":
+            connection.execute(
+                text(
+                    "UPDATE owner_chat_messages SET generation_attempts=2 WHERE id=:id"
+                ),
+                {"id": message.id},
+            )
+        elif invalid == "state":
+            connection.execute(
+                text(
+                    "UPDATE owner_chat_messages SET generation_state='failed', "
+                    "generation_claim_token=NULL, generation_claim_expires_at=NULL "
+                    "WHERE id=:id"
+                ),
+                {"id": message.id},
+            )
+        elif invalid == "channel":
+            connection.execute(
+                text("UPDATE ai_usage_reservations SET channel='customer'")
+            )
+        before = connection.execute(
+            text(
+                "SELECT total_tokens_used,tokens_reserved FROM business_ai_usage_daily"
+            )
+        ).one()
+    with database_engine.connect() as connection, pytest.raises(DBAPIError):
+        connection.execute(
+            text("SELECT public.sou2ai_resize_owner_chat_usage(:id,:token,:input,100)"),
+            {
+                "id": reservation.id,
+                "token": token,
+                "input": -1
+                if invalid == "negative"
+                else None
+                if invalid == "null"
+                else 500,
+            },
+        )
+    with migration_engine.connect() as connection:
+        assert (
+            connection.execute(
+                text(
+                    "SELECT total_tokens_used,tokens_reserved "
+                    "FROM business_ai_usage_daily"
+                )
+            ).one()
+            == before
+        )
+
+
+def test_reservation_resize_is_idempotent_and_expiry_charges_latest_hold(
+    resizable_owner_reservation, db_session, migration_engine
+):
+    from app.services.ai_usage import resize_owner_chat_usage
+
+    _, _, message, reservation = resizable_owner_reservation
+    for _ in range(2):
+        resize_owner_chat_usage(
+            db_session,
+            reservation=reservation,
+            claim_token=message.generation_claim_token,
+            estimated_input_tokens=350,
+            max_output_tokens=64,
+        )
+    with migration_engine.begin() as connection:
+        assert (
+            connection.scalar(
+                text("SELECT tokens_reserved FROM business_ai_usage_daily")
+            )
+            == 414
+        )
+        connection.execute(
+            text(
+                "UPDATE ai_usage_reservations "
+                "SET created_at=now()-interval '2 minutes',"
+                "lease_expires_at=now()-interval '1 minute'"
+            )
+        )
+        connection.execute(
+            text(
+                "SELECT public.sou2ai_charge_expired_ai_reservations("
+                "business_id,window_start) FROM ai_usage_reservations"
+            )
+        )
+        assert connection.execute(
+            text(
+                "SELECT total_tokens_used,tokens_reserved FROM business_ai_usage_daily"
+            )
+        ).one() == (414, 0)
+    assert not reconcile_ai_usage(
+        db_session,
+        reservation.id,
+        usage=TokenUsage(10, 2, 12, True),
+        outcome="completed",
+    )
 
 
 def test_concurrent_reservations_cannot_exceed_allowance(

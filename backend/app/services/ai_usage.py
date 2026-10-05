@@ -1,5 +1,6 @@
 """Per-business local-day AI reservation and accounting services."""
 
+import logging
 import math
 import uuid
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from app.database.models import (
 )
 from app.schemas.ai_usage import CurrentAIUsageResponse
 from app.services.businesses import load_full_access_business
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -89,6 +92,36 @@ def reserve_owner_chat_usage(
             raise _daily_limit_error(window_end) from None
         raise
     return AIUsageReservationClaim(id=row.reservation_id, reset_at=row.reset_at)
+
+
+def resize_owner_chat_usage(
+    session: Session,
+    *,
+    reservation: AIUsageReservationClaim,
+    claim_token: uuid.UUID,
+    estimated_input_tokens: int,
+    max_output_tokens: int,
+) -> None:
+    """Hold prior consumption plus the next call, under the same daily lock."""
+    try:
+        session.execute(
+            text(
+                "SELECT public.sou2ai_resize_owner_chat_usage("
+                ":reservation_id, :claim_token, :estimated_input, :max_output)"
+            ),
+            {
+                "reservation_id": reservation.id,
+                "claim_token": claim_token,
+                "estimated_input": estimated_input_tokens,
+                "max_output": max_output_tokens,
+            },
+        ).one()
+        session.commit()
+    except DBAPIError as exc:
+        session.rollback()
+        if "daily_ai_token_limit_reached" in str(exc.orig):
+            raise _daily_limit_error(reservation.reset_at) from None
+        raise
 
 
 def reserve_conversation_summary_usage(
@@ -191,7 +224,31 @@ def reconcile_ai_usage(
     ).one()
     if commit:
         session.commit()
-    return bool(row.reconciled)
+    reconciled = bool(row.reconciled)
+    if reconciled:
+        usage_source = (
+            "unknown"
+            if outcome == "uncertain"
+            else "known_pre_use_rejection"
+            if outcome == "release"
+            else "provider_reported"
+            if usage is not None and usage.authoritative
+            else "estimate_or_mixed"
+        )
+        logger.info(
+            "ai_budget_reconciliation reservation_id=%s outcome=%s usage_source=%s "
+            "charge_basis=%s input_tokens=%s output_tokens=%s total_tokens=%s "
+            "transaction_state=%s",
+            reservation_id,
+            outcome,
+            usage_source,
+            "full_reservation" if outcome == "uncertain" else "reconciled_usage",
+            usage.input_tokens if usage is not None else "unknown",
+            usage.output_tokens if usage is not None else "unknown",
+            usage.total_tokens if usage is not None else "unknown",
+            "committed" if commit else "pending",
+        )
+    return reconciled
 
 
 def _usage_status(percentage: float) -> str:
