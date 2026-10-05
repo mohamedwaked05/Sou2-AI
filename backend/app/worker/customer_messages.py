@@ -72,7 +72,7 @@ SOURCE_LABEL_PATTERN = re.compile(r"\s*\[S[1-9][0-9]*\]")
 BUSINESS_QUESTION_PATTERN = re.compile(
     r"(?i)\b(?:deliver(?:y|ies)?|shipping|price|cost|how much|tomorrow|when do you|"
     r"open|hours|address|location|return|refund|warranty|menu|products?)\b|"
-    r"ØªÙˆØµÙŠÙ„|Ø§Ù„Ø³Ø¹Ø±|Ù‚Ø¯ÙŠØ´|Ø¨ÙƒØ±Ø§|Ø§Ù„Ø¹Ù†ÙˆØ§Ù†"
+    r"توصيل|السعر|قديش|بكرا|العنوان"
 )
 
 
@@ -261,9 +261,7 @@ def _static_reply(content: str, kind: str) -> str:
         )
     if kind == "missing":
         if arabic:
-            return (
-                "Ø¹Ø°Ø±Ø§Ù‹ØŒ Ù‡ÙŠØ¯Ø§ Ø§Ù„Ù…Ø¹Ù„ÙˆÙ…Ø© Ù…Ø´ Ù…ØªÙˆÙØ±Ø© Ø­Ø§Ù„ÙŠÙ‹Ø§."
-            )
+            return "عذراً، هيدا المعلومة مش متوفرة حالياً."
         if franco:
             return "Sorry, hal ma3loume mish mawjoude 3anna halla2."
         return "Sorry, that business information is not available right now."

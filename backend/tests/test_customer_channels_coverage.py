@@ -315,6 +315,61 @@ def test_prompt_injection_gets_static_reply_no_ai_usage(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("question", ["توصيل", "السعر", "قديش", "بكرا", "العنوان"])
+def test_existing_arabic_business_question_literals_match(question: str) -> None:
+    assert customer_messages.BUSINESS_QUESTION_PATTERN.search(question)
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("missing", "عذراً، هيدا المعلومة مش متوفرة حالياً."),
+        ("handoff", "أكيد، تم تحويل المحادثة لفريق العمل. سيردّ عليك شخص قريباً."),
+        ("private", "عذراً، ما فيني شارك معلومات تشغيلية أو خاصة عبر محادثة العملاء."),
+        ("injection", "عذراً، ما فيني اتبع هالطلب أو اكشف تعليمات داخلية."),
+    ],
+)
+def test_arabic_static_replies_are_readable(kind: str, expected: str) -> None:
+    assert customer_messages._static_reply("مرحبا", kind) == expected
+
+
+def test_arabic_delivery_without_evidence_returns_fallback_without_generation(
+    api_client: TestClient,
+    db_session: Session,
+    migration_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = channel_settings()
+    app.dependency_overrides[get_settings] = lambda: settings
+    business = _active_channel(api_client, db_session)
+    monkeypatch.setattr(customer_messaging, "_queue_inbound", lambda *_: None)
+    monkeypatch.setattr(
+        customer_messages, "enqueue_outbound_message", lambda *_a, **_kw: None
+    )
+
+    class NoGenerationProvider(DeterministicMockOwnerChatProvider):
+        def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
+            pytest.fail("Missing delivery evidence must not reach generation")
+
+    message = _process(
+        db_session,
+        api_client,
+        business,
+        message_id_str="wamid.arabic-missing-delivery",
+        text_content="توصيل",
+        provider=NoGenerationProvider(),
+    )
+    assert message is not None
+    assert message.status == CustomerMessageStatus.COMPLETED
+    reply = db_session.scalar(
+        select(CustomerMessage).where(CustomerMessage.reply_to_message_id == message.id)
+    )
+    assert reply is not None
+    assert reply.content == "عذراً، هيدا المعلومة مش متوفرة حالياً."
+    with Session(migration_engine) as audit:
+        assert audit.scalar(select(AIUsageReservation.id)) is None
+
+
 @pytest.mark.parametrize(
     "greeting",
     [
