@@ -9,10 +9,11 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import date
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -37,9 +38,15 @@ from app.integrations.profiles import ConnectionProfileRegistry, MappingProfileE
 from app.schemas.operational import (
     BestSellersQuery,
     BestSellingProductsResult,
+    CategoryCandidate,
     InventoryQuery,
     InventoryReadQuery,
     InventoryResult,
+    LocationCandidate,
+    LocationResolution,
+    LocationResolutionQuery,
+    MetricCapabilityResult,
+    OperationalMetric,
     ProductResolution,
     ProductResolutionQuery,
     RestockingQuery,
@@ -61,6 +68,7 @@ UNKNOWN_TOOL_AUDIT_NAME = "unknown_tool"
 
 MAX_TOOL_RESULT_ROWS = 50
 MAX_BEST_SELLER_RESULTS = 20
+MAX_CATEGORY_CANDIDATES = 50
 
 SAFE_TOOL_ERROR_CODES = frozenset(
     {
@@ -91,8 +99,41 @@ class CurrentInventoryToolInput(InventoryQuery):
     limit: int = Field(default=50, ge=1, le=MAX_TOOL_RESULT_ROWS)
 
 
+class CurrentInventoryPlannerInput(BaseModel):
+    """Untrusted planner input; source identifiers remain a backend concern."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    product_filter: str | None = Field(default=None, min_length=1, max_length=80)
+    category_filter: str | None = Field(default=None, min_length=1, max_length=128)
+    location_reference: str | None = Field(default=None, min_length=1, max_length=255)
+    limit: int = Field(default=50, ge=1, le=MAX_TOOL_RESULT_ROWS)
+
+    @field_validator("product_filter", "category_filter", "location_reference")
+    @classmethod
+    def strip_filter(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Operational filters cannot be blank.")
+        return normalized
+
+
 class BestSellingProductsToolInput(BestSellersQuery):
     limit: int = Field(default=10, ge=1, le=MAX_BEST_SELLER_RESULTS)
+
+
+class SalesSummaryPlannerInput(BaseModel):
+    """Interpretation only: the backend supplies and validates reporting bounds."""
+
+    model_config = ConfigDict(extra="forbid")
+    start_date: date | None = None
+    end_date: date | None = None
+    metric: OperationalMetric | None = None
+    date_range: Literal["previous_completed_month"] | None = None
+    use_pending_clarification: bool = False
+    branch_external_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class RestockingRecommendationsToolInput(RestockingQuery):
@@ -119,17 +160,20 @@ class OperationalToolDefinition:
     name: str
     description: str
     input_schema: type[BaseModel]
-    output_schema: type[BaseModel]
+    output_schema: type[BaseModel] | tuple[type[BaseModel], ...]
     capability: str
     result_limit: int
     timeout_seconds: int
     executor: ToolExecutor
+    provider_input_schema: type[BaseModel] | None = None
 
     def provider_schema(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "description": self.description,
-            "input_schema": self.input_schema.model_json_schema(),
+            "input_schema": (
+                self.provider_input_schema or self.input_schema
+            ).model_json_schema(),
         }
 
 
@@ -147,10 +191,24 @@ def _inventory(source: OperationalDataSource, query: BaseModel) -> BaseModel:
         return InventoryResult(
             items=(), metadata=resolution.metadata, resolution=resolution
         )
+    category_resolution = _resolve_category_filter(source, query.category_filter)
+    if category_resolution is not None and category_resolution.status != "resolved":
+        return InventoryResult(
+            items=(),
+            metadata=category_resolution.metadata,
+            resolution=resolution,
+            category_resolution=category_resolution,
+        )
     read_query = InventoryReadQuery(
         external_product_id=(
             resolution.product.external_product_id
             if resolution is not None and resolution.product is not None
+            else None
+        ),
+        category_filter=(
+            category_resolution.category.label
+            if category_resolution is not None
+            and category_resolution.category is not None
             else None
         ),
         branch_external_id=query.branch_external_id,
@@ -158,12 +216,46 @@ def _inventory(source: OperationalDataSource, query: BaseModel) -> BaseModel:
         limit=query.limit,
     )
     result = source.get_current_inventory(read_query)
-    return result.model_copy(update={"resolution": resolution})
+    return result.model_copy(
+        update={"resolution": resolution, "category_resolution": category_resolution}
+    )
 
 
 def _sales_summary(source: OperationalDataSource, query: BaseModel) -> BaseModel:
     assert isinstance(query, SalesQuery)
     return source.get_sales_summary(query)
+
+
+def _unsupported_metric_result(
+    query: SalesQuery, supported_metrics: tuple[str, ...], source_timezone: str
+) -> MetricCapabilityResult:
+    if query.metric == "gross_profit":
+        missing: tuple[Literal["cost_cogs", "expenses", "valuation_basis"], ...] = (
+            "cost_cogs",
+        )
+    elif query.metric == "net_profit":
+        missing = ("cost_cogs", "expenses")
+    else:
+        missing = ("valuation_basis",)
+    return MetricCapabilityResult(
+        requested_metric=query.metric,
+        status="unsupported",
+        missing_inputs=missing,
+        supported_metrics=tuple(
+            metric
+            for metric in supported_metrics
+            if metric
+            in {
+                "revenue",
+                "gross_profit",
+                "net_profit",
+                "sales_count",
+                "inventory_value",
+            }
+        ),
+        period=query.period(source_timezone),
+        branch_external_id=query.branch_external_id,
+    )
 
 
 def _best_sellers(source: OperationalDataSource, query: BaseModel) -> BaseModel:
@@ -178,10 +270,24 @@ def _restocking(source: OperationalDataSource, query: BaseModel) -> BaseModel:
         return RestockingRecommendationsResult(
             items=(), metadata=resolution.metadata, resolution=resolution
         )
+    category_resolution = _resolve_category_filter(source, query.category_filter)
+    if category_resolution is not None and category_resolution.status != "resolved":
+        return RestockingRecommendationsResult(
+            items=(),
+            metadata=category_resolution.metadata,
+            resolution=resolution,
+            category_resolution=category_resolution,
+        )
     read_query = RestockingReadQuery(
         external_product_id=(
             resolution.product.external_product_id
             if resolution is not None and resolution.product is not None
+            else None
+        ),
+        category_filter=(
+            category_resolution.category.label
+            if category_resolution is not None
+            and category_resolution.category is not None
             else None
         ),
         branch_external_id=query.branch_external_id,
@@ -189,7 +295,12 @@ def _restocking(source: OperationalDataSource, query: BaseModel) -> BaseModel:
         limit=query.limit,
     )
     result = source.get_restocking_recommendations(read_query)
-    return result.model_copy(update={"resolution": resolution})
+    return result.model_copy(
+        update={
+            "resolution": resolution,
+            "category_resolution": category_resolution,
+        }
+    )
 
 
 def _resolve_product_filter(
@@ -198,6 +309,14 @@ def _resolve_product_filter(
     if product_filter is None:
         return None
     return source.resolve_product(ProductResolutionQuery(reference=product_filter))
+
+
+def _resolve_category_filter(
+    source: OperationalDataSource, category_filter: str | None
+):
+    if category_filter is None:
+        return None
+    return source.resolve_category(ProductResolutionQuery(reference=category_filter))
 
 
 def build_operational_tool_registry(
@@ -210,10 +329,10 @@ def build_operational_tool_registry(
         OperationalToolDefinition(
             name=CURRENT_INVENTORY_TOOL,
             description=(
-                "Retrieve current product inventory, quantities, reservations, and "
-                "availability for an optional exact ID, SKU, barcode, product name, "
-                "or approved alias and one branch or warehouse. Product resolution "
-                "can explicitly be resolved, ambiguous, or not found."
+                "Current inventory, quantities, reservations and availability; "
+                "filter by "
+                "ID, SKU, barcode, name, alias, source-resolved category and branch/"
+                "warehouse. Product resolution: resolved, ambiguous or not_found."
             ),
             input_schema=CurrentInventoryToolInput,
             output_schema=InventoryResult,
@@ -221,15 +340,19 @@ def build_operational_tool_registry(
             result_limit=MAX_TOOL_RESULT_ROWS,
             timeout_seconds=timeout_seconds,
             executor=_inventory,
+            provider_input_schema=CurrentInventoryPlannerInput,
         ),
         OperationalToolDefinition(
             name=SALES_SUMMARY_TOOL,
             description=(
-                "Summarize completed sales and finalized returns/refunds for a "
-                "bounded source-local date range and optional branch."
+                "Completed sales and finalized returns/refunds for bounded "
+                "source-local "
+                "dates and optional branch. All financial metrics use this tool; "
+                "backend validates support and reports missing inputs."
             ),
             input_schema=SalesQuery,
-            output_schema=SalesSummary,
+            provider_input_schema=SalesSummaryPlannerInput,
+            output_schema=(SalesSummary, MetricCapabilityResult),
             capability="sales_summaries",
             result_limit=1,
             timeout_seconds=timeout_seconds,
@@ -238,8 +361,8 @@ def build_operational_tool_registry(
         OperationalToolDefinition(
             name=BEST_SELLING_PRODUCTS_TOOL,
             description=(
-                "Rank best-selling products by net quantity for a bounded "
-                "source-local date range and optional branch."
+                "Best sellers by net quantity for bounded source-local dates and "
+                "optional branch."
             ),
             input_schema=BestSellingProductsToolInput,
             output_schema=BestSellingProductsResult,
@@ -251,10 +374,10 @@ def build_operational_tool_registry(
         OperationalToolDefinition(
             name=RESTOCKING_RECOMMENDATIONS_TOOL,
             description=(
-                "Calculate deterministic replenishment quantities from available "
-                "stock, reorder points, and target stock for an optional exact ID, "
-                "SKU, barcode, product name, or approved alias. Product resolution "
-                "can explicitly be resolved, ambiguous, or not found."
+                "Deterministic replenishment from available stock, reorder points and "
+                "target stock; filter by ID, SKU, barcode, name, alias or "
+                "source-resolved category. Product resolution: resolved, ambiguous "
+                "or not_found."
             ),
             input_schema=RestockingRecommendationsToolInput,
             output_schema=RestockingRecommendationsResult,
@@ -315,6 +438,7 @@ class OperationalToolExecutor:
         secret = self._settings.tool_call_audit_hmac_secret
         if secret is None or not secret.get_secret_value().strip():
             return ()
+
         try:
             business = load_full_access_business(self._session, user, business_id)
             if business.status is not BusinessStatus.ACTIVE:
@@ -349,6 +473,171 @@ class OperationalToolExecutor:
             )
             self._session.rollback()
             return ()
+
+    def category_candidates(
+        self, user: User, business_id: uuid.UUID
+    ) -> tuple[CategoryCandidate, ...]:
+        """Expose only bounded source categories to the operational planner."""
+        secret = self._settings.tool_call_audit_hmac_secret
+        if secret is None or not secret.get_secret_value().strip():
+            return ()
+        try:
+            business = load_full_access_business(self._session, user, business_id)
+            if business.status is not BusinessStatus.ACTIVE:
+                self._session.rollback()
+                return ()
+            source = self._active_source(business_id)
+            if source is None or "inventory" not in self._source_capabilities(source):
+                self._session.rollback()
+                return ()
+            adapter = self._profiles.resolve(source.connection_profile_key)
+            mapping = self._profiles.get_mapping(
+                source.mapping_profile_key, source.mapping_profile_version
+            )
+            if mapping is None or not self._adapter_timeout_is_acceptable(adapter):
+                self._session.rollback()
+                return ()
+            self._session.commit()
+            health = adapter.check_health()
+            mapping.validate_health(health)
+            return adapter.list_categories(limit=MAX_CATEGORY_CANDIDATES)
+        except Exception as exc:
+            _logger.warning(
+                "category_candidates returning empty: %s", type(exc).__name__
+            )
+            self._session.rollback()
+            return ()
+
+    def location_candidates(
+        self, user: User, business_id: uuid.UUID
+    ) -> tuple[LocationCandidate, ...]:
+        """Expose only bounded, healthy inventory locations to the planner."""
+
+        secret = self._settings.tool_call_audit_hmac_secret
+        if secret is None or not secret.get_secret_value().strip():
+            return ()
+        try:
+            business = load_full_access_business(self._session, user, business_id)
+            if business.status is not BusinessStatus.ACTIVE:
+                self._session.rollback()
+                return ()
+            source = self._active_source(business_id)
+            if source is None or "inventory" not in self._source_capabilities(source):
+                self._session.rollback()
+                return ()
+            adapter = self._profiles.resolve(source.connection_profile_key)
+            mapping = self._profiles.get_mapping(
+                source.mapping_profile_key, source.mapping_profile_version
+            )
+            if mapping is None or not self._adapter_timeout_is_acceptable(adapter):
+                self._session.rollback()
+                return ()
+            self._session.commit()
+            health = adapter.check_health()
+            mapping.validate_health(health)
+            return adapter.list_locations(limit=20)
+        except Exception as exc:
+            _logger.warning(
+                "location_candidates returning empty: %s", type(exc).__name__
+            )
+            self._session.rollback()
+            return ()
+
+    def resolve_location(
+        self, user: User, business_id: uuid.UUID, reference: str
+    ) -> LocationResolution:
+        secret = self._settings.tool_call_audit_hmac_secret
+        if secret is None or not secret.get_secret_value().strip():
+            raise ToolExecutionError("audit_unavailable")
+        try:
+            business = load_full_access_business(self._session, user, business_id)
+            if business.status is not BusinessStatus.ACTIVE:
+                raise ToolExecutionError("inactive_business")
+            source = self._active_source(business_id)
+            if source is None or "inventory" not in self._source_capabilities(source):
+                raise ToolExecutionError("integration_unavailable")
+            adapter = self._profiles.resolve(source.connection_profile_key)
+            mapping = self._profiles.get_mapping(
+                source.mapping_profile_key, source.mapping_profile_version
+            )
+            if mapping is None or not self._adapter_timeout_is_acceptable(adapter):
+                raise ToolExecutionError("integration_unavailable")
+            self._session.commit()
+            health = adapter.check_health()
+            mapping.validate_health(health)
+            return adapter.resolve_location(
+                LocationResolutionQuery(reference=reference)
+            )
+        except ToolExecutionError:
+            self._session.rollback()
+            raise
+        except ApplicationError:
+            self._session.rollback()
+            raise ToolExecutionError("authorization_denied") from None
+        except OperationalQueryTimeout:
+            self._session.rollback()
+            raise ToolExecutionError("timeout") from None
+        except (
+            MappingProfileError,
+            OperationalDataInvalid,
+            OperationalIntegrationError,
+            OperationalSourceUnavailable,
+            ValueError,
+        ):
+            self._session.rollback()
+            raise ToolExecutionError("integration_unavailable") from None
+        except Exception as exc:
+            _logger.warning("resolve_location failed: %s", type(exc).__name__)
+            self._session.rollback()
+            raise ToolExecutionError("adapter_failure") from None
+
+    def resolve_product(
+        self, user: User, business_id: uuid.UUID, reference: str
+    ) -> ProductResolution:
+        """Resolve a bounded source product reference without recording a tool call."""
+
+        secret = self._settings.tool_call_audit_hmac_secret
+        if secret is None or not secret.get_secret_value().strip():
+            raise ToolExecutionError("audit_unavailable")
+        try:
+            business = load_full_access_business(self._session, user, business_id)
+            if business.status is not BusinessStatus.ACTIVE:
+                raise ToolExecutionError("inactive_business")
+            source = self._active_source(business_id)
+            if source is None or "inventory" not in self._source_capabilities(source):
+                raise ToolExecutionError("integration_unavailable")
+            adapter = self._profiles.resolve(source.connection_profile_key)
+            mapping = self._profiles.get_mapping(
+                source.mapping_profile_key, source.mapping_profile_version
+            )
+            if mapping is None or not self._adapter_timeout_is_acceptable(adapter):
+                raise ToolExecutionError("integration_unavailable")
+            self._session.commit()
+            health = adapter.check_health()
+            mapping.validate_health(health)
+            return adapter.resolve_product(ProductResolutionQuery(reference=reference))
+        except ToolExecutionError:
+            self._session.rollback()
+            raise
+        except ApplicationError:
+            self._session.rollback()
+            raise ToolExecutionError("authorization_denied") from None
+        except OperationalQueryTimeout:
+            self._session.rollback()
+            raise ToolExecutionError("timeout") from None
+        except (
+            MappingProfileError,
+            OperationalDataInvalid,
+            OperationalIntegrationError,
+            OperationalSourceUnavailable,
+            ValueError,
+        ):
+            self._session.rollback()
+            raise ToolExecutionError("integration_unavailable") from None
+        except Exception as exc:
+            _logger.warning("resolve_product failed: %s", type(exc).__name__)
+            self._session.rollback()
+            raise ToolExecutionError("adapter_failure") from None
 
     def execute(
         self,
@@ -431,7 +720,15 @@ class OperationalToolExecutor:
             self._session.commit()
             health = adapter.check_health()
             mapping.validate_health(health)
-            result = definition.executor(adapter, query)
+            if (
+                definition.name == SALES_SUMMARY_TOOL
+                and getattr(query, "metric", "revenue") not in mapping.supported_metrics
+            ):
+                result = _unsupported_metric_result(
+                    query, mapping.supported_metrics, health.source_timezone or "UTC"
+                )
+            else:
+                result = definition.executor(adapter, query)
             elapsed = time.monotonic() - started
             if elapsed > definition.timeout_seconds:
                 raise ToolExecutionError("timeout")
@@ -605,3 +902,19 @@ class OperationalToolExecutor:
             and not isinstance(enforced, bool)
             and 1 <= enforced <= maximum
         )
+
+    def sales_reporting_context(
+        self, user: User, business_id: uuid.UUID
+    ) -> tuple[str, tuple[str, ...]]:
+        """Read allowlisted mapping semantics in the authorized source scope."""
+        load_full_access_business(self._session, user, business_id)
+        source = self._active_source(business_id)
+        if source is None:
+            raise ToolExecutionError("integration_unavailable")
+        self._source_capabilities(source)
+        mapping = self._profiles.get_mapping(
+            source.mapping_profile_key, source.mapping_profile_version
+        )
+        if mapping is None:
+            raise ToolExecutionError("integration_unavailable")
+        return mapping.source_timezone, mapping.supported_metrics

@@ -428,7 +428,7 @@ allowance. Current operational results, profile data, authorized RAG evidence, a
 the current owner message always outrank recent conversation and untrusted summary
 memory. No customer or external-channel conversation work is included.
 
-### Milestone 19: Complete — WhatsApp customer messaging
+### Milestone 19: In Progress — WhatsApp customer messaging
 
 * Add channels such as WhatsApp only after the core assistant is reliable.
 * Verify webhooks and map each channel connection and conversation to one business.
@@ -449,8 +449,9 @@ The Meta Cloud API webhook is verified (constant-time HMAC-SHA-256 on the raw
 body) and admitted through content-type, body-size, and signature gates before
 any parsing occurs. Each business's WhatsApp connection references an allowlisted
 deployment profile; raw credentials are never stored or returned. Customer phone
-numbers are stored only as an HMAC lookup identifier plus an AES-256-GCM
-encrypted reversible identifier; the only form ever exposed in API responses or
+numbers are stored only as an HMAC lookup identifier plus a versioned AES-256-GCM
+encrypted reversible identifier; legacy version-1 envelopes remain decryptable and
+new identities use version 2. The only form ever exposed in API responses or
 logs is a masked label (`WhatsApp ••••NNNN`). The inbound worker enforces handoff,
 private-operational, and prompt-injection pattern guards before any AI call;
 per-conversation and per-business hourly admission gates block further customer
@@ -465,6 +466,13 @@ are excluded by default and must be explicitly marked `customer_visible`.
 Eleven management routes cover connection lifecycle, conversation listing, manual
 reply with explicit confirmation, human handoff, and AI resume. The React
 workspace UI and API client are complete.
+
+Milestone 19 hardening adds customer-only grounding with a localized deterministic
+missing-evidence response, a maximum twelve-message same-conversation context,
+and bounded processing/sending leases. Expired processing claims release their
+reservation once; expired sending claims become delivery-uncertain and are not
+blindly resent. `WHATSAPP_PROFILES_JSON` is a deployment-managed allowlist of
+profile keys and server-side values; clients submit only an allowlisted key.
 
 ### Milestone 20: Production readiness and cloud deployment
 

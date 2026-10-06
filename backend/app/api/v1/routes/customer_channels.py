@@ -69,22 +69,30 @@ def verify_webhook(
             status_code=403,
             error_code="webhook_verification_failed",
         )
-    try:
-        adapter = MetaWhatsAppAdapter(
-            _registry(settings).resolve("meta_whatsapp_cloud", require_outbound=False)
-        )
-    except ChannelProfileUnavailable:
+    adapter = None
+    configured_adapter = False
+    registry = _registry(settings)
+    for key in registry.keys:
+        try:
+            candidate = MetaWhatsAppAdapter(
+                registry.resolve(key, require_outbound=False)
+            )
+        except ChannelProfileUnavailable:
+            continue
+        configured_adapter = True
+        if candidate.verify_challenge_token(token):
+            adapter = candidate
+            break
+    if adapter is None:
         raise ApplicationError(
-            "Webhook verification is unavailable.",
-            status_code=503,
-            error_code="webhook_unavailable",
+            "Webhook verification failed."
+            if configured_adapter
+            else "Webhook verification is unavailable.",
+            status_code=403 if configured_adapter else 503,
+            error_code="webhook_verification_failed"
+            if configured_adapter
+            else "webhook_unavailable",
         ) from None
-    if not adapter.verify_challenge_token(token):
-        raise ApplicationError(
-            "Webhook verification failed.",
-            status_code=403,
-            error_code="webhook_verification_failed",
-        )
     return Response(challenge, media_type="text/plain")
 
 
@@ -120,22 +128,34 @@ async def receive_webhook(
             status_code=413,
             error_code="webhook_too_large",
         )
-    try:
-        adapter = MetaWhatsAppAdapter(
-            _registry(settings).resolve("meta_whatsapp_cloud", require_outbound=False)
-        )
-    except ChannelProfileUnavailable:
+    adapter = None
+    configured_adapter = False
+    registry = _registry(settings)
+    for key in registry.keys:
+        try:
+            candidate = MetaWhatsAppAdapter(
+                registry.resolve(key, require_outbound=False)
+            )
+        except ChannelProfileUnavailable:
+            continue
+        configured_adapter = True
+        if candidate.verify_webhook_signature(
+            raw_body, request.headers.get("x-hub-signature-256")
+        ):
+            adapter = candidate
+            break
+    if adapter is None:
         raise ApplicationError(
-            "Webhook is unavailable.", status_code=503, error_code="webhook_unavailable"
+            "Webhook signature is invalid."
+            if configured_adapter
+            else "Webhook is unavailable.",
+            status_code=401 if configured_adapter else 503,
+            error_code=(
+                "webhook_signature_invalid"
+                if configured_adapter
+                else "webhook_unavailable"
+            ),
         ) from None
-    if not adapter.verify_webhook_signature(
-        raw_body, request.headers.get("x-hub-signature-256")
-    ):
-        raise ApplicationError(
-            "Webhook signature is invalid.",
-            status_code=401,
-            error_code="webhook_signature_invalid",
-        )
     try:
         events = adapter.parse_verified_events(raw_body)
     except ChannelError as exc:

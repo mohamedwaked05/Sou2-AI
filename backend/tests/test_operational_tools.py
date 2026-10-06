@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from threading import Event
 from typing import Any, cast
@@ -24,9 +25,11 @@ from app.database.models import (
     OperationalDataSourceConfig,
     OperationalDataSourceStatus,
     OwnerChatCitation,
+    PendingOwnerOperationalPreference,
     ToolCallLog,
     ToolCallStatus,
     User,
+    UserOperationalPreference,
 )
 from app.integrations.operational import OperationalQueryTimeout
 from app.integrations.profiles import (
@@ -39,9 +42,14 @@ from app.main import app
 from app.schemas.operational import (
     BestSellingProduct,
     BestSellingProductsResult,
+    CategoryCandidate,
+    CategoryResolution,
     IntegrationHealth,
     InventoryItem,
     InventoryResult,
+    LocationCandidate,
+    LocationResolution,
+    MetricCapabilityResult,
     OperationalResultMetadata,
     Product,
     ProductResolution,
@@ -114,15 +122,43 @@ class StubSource:
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.resolution_references: list[str] = []
+        self.category_references: list[str] = []
         self.last_inventory_query: Any | None = None
         self.last_restocking_query: Any | None = None
         self.error: Exception | None = None
         self.health_error: Exception | None = None
+        self.categories = (
+            CategoryCandidate(external_category_id="category-1", label="Pantry"),
+        )
+        self.locations = (
+            LocationCandidate(
+                external_location_id="BR-JBEIL",
+                label="Jbeil Branch",
+                location_type="branch",
+            ),
+            LocationCandidate(
+                external_location_id="BR-OTHER",
+                label="Other Branch",
+                location_type="branch",
+            ),
+            LocationCandidate(
+                external_location_id="WH-OTHER",
+                label="Other Warehouse",
+                location_type="warehouse",
+            ),
+        )
         self.timeout_seconds = 2
         self.resolution = ProductResolution(
             status="resolved",
             matched_by="alias",
             product=inventory_item().product,
+            metadata=metadata(),
+        )
+        self.category_resolution = CategoryResolution(
+            status="resolved",
+            category=CategoryCandidate(
+                external_category_id="category-1", label="Pantry"
+            ),
             metadata=metadata(),
         )
 
@@ -133,6 +169,36 @@ class StubSource:
     def resolve_product(self, query: object) -> ProductResolution:
         self.resolution_references.append(cast(Any, query).reference)
         return self.resolution
+
+    def resolve_category(self, query: object) -> CategoryResolution:
+        self.category_references.append(cast(Any, query).reference)
+        return self.category_resolution
+
+    def list_categories(self, *, limit: int) -> tuple[CategoryCandidate, ...]:
+        return self.categories[:limit]
+
+    def resolve_location(self, query: object) -> LocationResolution:
+        reference = cast(Any, query).reference.casefold()
+        matches = tuple(
+            candidate
+            for candidate in self.locations
+            if reference in candidate.label.casefold()
+            or reference == candidate.external_location_id.casefold()
+        )
+        if not matches:
+            return LocationResolution(status="not_found", metadata=metadata(rows=0))
+        if len(matches) > 1:
+            return LocationResolution(
+                status="ambiguous",
+                candidates=matches,
+                metadata=metadata(rows=len(matches)),
+            )
+        return LocationResolution(
+            status="resolved", location=matches[0], metadata=metadata()
+        )
+
+    def list_locations(self, *, limit: int) -> tuple[LocationCandidate, ...]:
+        return self.locations[:limit]
 
     def check_health(self) -> IntegrationHealth:
         if self.health_error is not None:
@@ -293,6 +359,12 @@ def test_registry_contains_exactly_four_provider_neutral_tools() -> None:
     assert "postgres" not in serialized
     assert "sql" not in serialized
     assert "password" not in serialized
+    inventory_properties = registry[CURRENT_INVENTORY_TOOL].provider_schema()[
+        "input_schema"
+    ]["properties"]
+    assert "location_reference" in inventory_properties
+    assert "branch_external_id" not in inventory_properties
+    assert "warehouse_external_id" not in inventory_properties
 
 
 @pytest.mark.parametrize(
@@ -440,6 +512,1567 @@ def test_product_scoped_tools_resolve_then_query_the_stable_external_id(
 
 
 @pytest.mark.parametrize(
+    "tool_name", [CURRENT_INVENTORY_TOOL, RESTOCKING_RECOMMENDATIONS_TOOL]
+)
+def test_category_scoped_tools_resolve_before_read_query(
+    api_client: TestClient, db_session: Session, tool_name: str
+) -> None:
+    user, business, registry, executor = executor_setup(api_client, db_session)
+
+    result = executor.execute(
+        user=user,
+        business_id=business.id,
+        tool_name=tool_name,
+        arguments={"category_filter": "pan", "limit": 5},
+    )
+
+    assert cast(Any, result.output).category_resolution.status == "resolved"
+    read_query = (
+        registry.source.last_inventory_query
+        if tool_name == CURRENT_INVENTORY_TOOL
+        else registry.source.last_restocking_query
+    )
+    assert read_query.category_filter == "Pantry"
+    assert registry.source.category_references == ["pan"]
+    assert registry.source.resolution_references == []
+
+
+@pytest.mark.parametrize(
+    "tool_name", [CURRENT_INVENTORY_TOOL, RESTOCKING_RECOMMENDATIONS_TOOL]
+)
+def test_unknown_category_short_circuits_category_scoped_tools(
+    api_client: TestClient, db_session: Session, tool_name: str
+) -> None:
+    user, business, registry, executor = executor_setup(api_client, db_session)
+    registry.source.category_resolution = CategoryResolution(
+        status="not_found", metadata=metadata(rows=0)
+    )
+
+    result = executor.execute(
+        user=user,
+        business_id=business.id,
+        tool_name=tool_name,
+        arguments={"category_filter": "unmatched category", "limit": 5},
+    )
+
+    assert cast(Any, result.output).category_resolution.status == "not_found"
+    assert registry.source.category_references == ["unmatched category"]
+    assert registry.source.calls == []
+
+
+def test_unknown_category_reaches_inventory_resolution_without_source_fallback(
+    api_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"unknown-category-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.category_resolution = CategoryResolution(
+        status="not_found", metadata=metadata(rows=0)
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"category_filter": "Electronics", "limit": 5},
+            ),
+            usage_result(reply="I could not find a matching live catalogue category."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+    diagnostic_messages: list[str] = []
+    monkeypatch.setattr(
+        owner_chat._logger,
+        "info",
+        lambda message, *args: diagnostic_messages.append(message % args),
+    )
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "what electronics do we have?",
+        f"unknown-category-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert (
+        "matching live catalogue category"
+        in response.json()["assistant_message"]["content"]
+    )
+    assert (
+        "can't access live operational data"
+        not in response.json()["assistant_message"]["content"]
+    )
+    assert source.category_references == ["Electronics"]
+    assert source.calls == []
+    assert len(provider.requests) == 2
+    assert provider.requests[1].mode == "operational_synthesis"
+    supplied = provider.requests[1].tool_results[0].output
+    assert supplied["category_resolution"]["status"] == "not_found"
+    assert provider.requests[1].validated_result_status == "not_found"
+    assert any(
+        "category_input_kind=query" in message for message in diagnostic_messages
+    )
+    assert any(
+        "category_resolution=zero" in message and "tool_result=not_found" in message
+        for message in diagnostic_messages
+    )
+    assert all(
+        "electronics" not in message.casefold() for message in diagnostic_messages
+    )
+
+
+def test_inventory_category_semantics_normalize_a_provider_final_to_inventory(
+    api_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"semantic-category-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.category_resolution = CategoryResolution(
+        status="not_found", metadata=metadata(rows=0)
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                reply="No lookup is needed.",
+                semantic_operation="inventory_category",
+                entity_kind="category",
+                entity_query="unresolved future category",
+            ),
+            usage_result(category_resolution_status="no_match"),
+            usage_result(reply="No matching category was found."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+    diagnostic_messages: list[str] = []
+    monkeypatch.setattr(
+        owner_chat._logger,
+        "info",
+        lambda message, *args: diagnostic_messages.append(message % args),
+    )
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "an arbitrary category request",
+        f"semantic-category-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.category_references == ["unresolved future category"]
+    assert source.calls == []
+    assert len(provider.requests) == 3
+    assert provider.requests[0].mode == "operational"
+    assert provider.requests[1].mode == "category_resolution"
+    assert provider.requests[2].mode == "operational_synthesis"
+    assert any(
+        "semantic_operation=inventory_category" in message
+        and "entity_kind=category" in message
+        and "original_action=final" in message
+        and "effective_action=tool" in message
+        and "consistency_outcome=normalized" in message
+        and "effective_tool=current_inventory" in message
+        for message in diagnostic_messages
+    )
+    assert all(
+        "unresolved future category" not in message for message in diagnostic_messages
+    )
+
+
+def test_category_reference_is_resolved_and_never_trusted_as_a_source_identifier(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business, registry, executor = executor_setup(api_client, db_session)
+    registry.source.category_resolution = CategoryResolution(
+        status="not_found", metadata=metadata(rows=0)
+    )
+
+    result = executor.execute(
+        user=user,
+        business_id=business.id,
+        tool_name=CURRENT_INVENTORY_TOOL,
+        arguments={"category_filter": "category-1", "limit": 5},
+    )
+
+    assert isinstance(result.output, InventoryResult)
+    assert result.output.category_resolution is not None
+    assert result.output.category_resolution.status == "not_found"
+    assert registry.source.category_references == ["category-1"]
+    assert registry.source.last_inventory_query is None
+    assert registry.source.calls == []
+
+
+def test_multiple_categories_return_source_derived_clarification(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"ambiguous-category-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.category_resolution = CategoryResolution(
+        status="ambiguous",
+        candidates=(
+            CategoryCandidate(external_category_id="category-2", label="Group One"),
+            CategoryCandidate(external_category_id="category-3", label="Group Two"),
+        ),
+        metadata=metadata(rows=2),
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"category_filter": "group", "limit": 5},
+            )
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "show me this group",
+        f"ambiguous-category-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    content = response.json()["assistant_message"]["content"]
+    assert "Group One" in content
+    assert "Group Two" in content
+    assert source.calls == []
+    assert len(provider.requests) == 1
+
+
+def test_bounded_category_candidates_do_not_block_unresolved_source_lookup(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"bounded-category-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.categories = tuple(
+        CategoryCandidate(
+            external_category_id=f"category-{index}", label=f"Group {index}"
+        )
+        for index in range(60)
+    )
+    source.category_resolution = CategoryResolution(
+        status="not_found", metadata=metadata(rows=0)
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={
+                    "category_filter": "outside candidate page",
+                    "limit": 5,
+                },
+            ),
+            usage_result(reply="No matching category was found."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "show an unavailable category",
+        f"bounded-category-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(provider.requests[0].category_candidates) == 50
+    assert source.category_references == ["outside candidate page"]
+    assert provider.requests[1].validated_result_status == "not_found"
+
+
+def test_final_without_tool_keeps_active_source_fallback_truthful(
+    api_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"planner-final-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    provider = SequenceProvider([usage_result(reply="No tool is needed.")])
+    configure_operational_chat(db_session, business["id"], source, provider)
+    diagnostic_messages: list[str] = []
+    monkeypatch.setattr(
+        owner_chat._logger,
+        "info",
+        lambda message, *args: diagnostic_messages.append(message % args),
+    )
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Please provide a live operational answer.",
+        f"planner-final-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    content = response.json()["assistant_message"]["content"]
+    assert "live operational source is available" in content
+    assert "can't access live operational data" not in content
+    assert source.calls == []
+    assert any(
+        "fallback_reason=provider_final_without_tool_active_source" in message
+        for message in diagnostic_messages
+    )
+
+
+def test_operational_planner_receives_bounded_source_categories(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"category-plan-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.categories = (
+        CategoryCandidate(external_category_id="category-7", label="Beverages"),
+        CategoryCandidate(external_category_id="category-8", label="Pantry"),
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"category_filter": "Beverages", "limit": 5},
+            ),
+            usage_result(reply="There are products in that category."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "what drinks do we have?",
+        f"category-plan-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert [
+        candidate.label for candidate in provider.requests[0].category_candidates
+    ] == [
+        "Beverages",
+        "Pantry",
+    ]
+    assert provider.requests[0].rolling_summary is None
+
+
+def test_category_semantic_match_redispatches_inventory_with_source_label(
+    api_client: TestClient, db_session: Session, migration_engine: Engine
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"semantic-drinks-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.categories = (
+        CategoryCandidate(external_category_id="category-7", label="Beverages"),
+        CategoryCandidate(external_category_id="category-8", label="Pantry"),
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                reply="Planning category inventory.",
+                semantic_operation="inventory_category",
+                entity_kind="category",
+                entity_query="drinks",
+            ),
+            usage_result(
+                category_resolution_status="matched",
+                category_candidate_references=("category-7",),
+            ),
+            usage_result(reply="The current beverages inventory is available."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "what drinks do we have?",
+        f"semantic-drinks-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.category_references == ["Beverages"]
+    assert source.calls == [CURRENT_INVENTORY_TOOL]
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "category_resolution",
+        "operational_synthesis",
+    ]
+    assert provider.requests[1].messages[-1].content == "drinks"
+    assert provider.requests[1].max_output_tokens == 64
+    assert provider.requests[1].tools == ()
+    with migration_engine.connect() as connection:
+        reservation = connection.execute(
+            text(
+                "SELECT input_tokens, output_tokens, total_tokens "
+                "FROM ai_usage_reservations"
+            )
+        ).one()
+    assert tuple(reservation) == (30, 6, 36)
+    with migration_engine.connect() as connection:
+        daily_usage = connection.execute(
+            text(
+                "SELECT input_tokens_used, output_tokens_used, total_tokens_used "
+                "FROM business_ai_usage_daily"
+            )
+        ).one()
+    assert tuple(daily_usage) == (30, 6, 36)
+
+
+def test_exact_category_label_bypasses_semantic_resolver_and_releases_reserve(
+    api_client: TestClient, db_session: Session, migration_engine: Engine
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"exact-category-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.categories = (
+        CategoryCandidate(external_category_id="category-7", label="Beverages"),
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                reply="Planning category inventory.",
+                semantic_operation="inventory_category",
+                entity_kind="category",
+                entity_query="beverages",
+            ),
+            usage_result(reply="The current beverages inventory is available."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "show beverages",
+        f"exact-category-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.category_references == ["Beverages"]
+    assert source.calls == [CURRENT_INVENTORY_TOOL]
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "operational_synthesis",
+    ]
+    with migration_engine.connect() as connection:
+        reservation = connection.execute(
+            text(
+                "SELECT reserved_tokens, input_tokens, output_tokens, total_tokens "
+                "FROM ai_usage_reservations"
+            )
+        ).one()
+        daily_usage = connection.execute(
+            text("SELECT total_tokens_used FROM business_ai_usage_daily")
+        ).one()
+    assert tuple(reservation) == (534, 20, 4, 24)
+    assert reservation.total_tokens < reservation.reserved_tokens
+    assert tuple(daily_usage) == (24,)
+
+
+def test_category_resolver_timeout_charges_uncertain_usage_once_and_falls_back(
+    api_client: TestClient, db_session: Session, migration_engine: Engine
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"category-resolver-timeout-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    source.category_resolution = CategoryResolution(
+        status="not_found", metadata=metadata(rows=0)
+    )
+    provider = FailingCategoryResolverProvider(
+        [
+            usage_result(
+                reply="Planning category inventory.",
+                semantic_operation="inventory_category",
+                entity_kind="category",
+                entity_query="drinks",
+            ),
+            usage_result(),
+            usage_result(reply="No matching category was found."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "show drinks",
+        f"category-resolver-timeout-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.category_references == ["drinks"]
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "category_resolution",
+        "operational_synthesis",
+    ]
+    with migration_engine.connect() as connection:
+        reservation = connection.execute(
+            text(
+                "SELECT input_tokens, output_tokens, total_tokens "
+                "FROM ai_usage_reservations"
+            )
+        ).one()
+        daily_usage = connection.execute(
+            text(
+                "SELECT input_tokens_used, output_tokens_used, total_tokens_used "
+                "FROM business_ai_usage_daily"
+            )
+        ).one()
+    assert tuple(reservation) == (30, 68, 98)
+    assert tuple(daily_usage) == (30, 68, 98)
+
+
+def test_ambiguous_bounded_category_returns_clarification_without_source_lookup(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"ambiguous-semantic-category-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    source.categories = (
+        CategoryCandidate(external_category_id="category-2", label="Cold Drinks"),
+        CategoryCandidate(external_category_id="category-3", label="Hot Drinks"),
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                reply="Planning category inventory.",
+                semantic_operation="inventory_category",
+                entity_kind="category",
+                entity_query="drinks",
+            ),
+            usage_result(
+                category_resolution_status="ambiguous",
+                category_candidate_references=("category-2", "category-3"),
+            ),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "show drinks",
+        f"ambiguous-semantic-category-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert "Cold Drinks" in response.json()["assistant_message"]["content"]
+    assert "Hot Drinks" in response.json()["assistant_message"]["content"]
+    assert source.category_references == []
+    assert source.calls == []
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "category_resolution",
+    ]
+
+
+def test_unrecognized_category_resolution_reference_falls_back_to_source_lookup(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"invalid-semantic-category-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    source.category_resolution = CategoryResolution(
+        status="not_found", metadata=metadata(rows=0)
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                reply="Planning category inventory.",
+                semantic_operation="inventory_category",
+                entity_kind="category",
+                entity_query="drinks",
+            ),
+            usage_result(
+                category_resolution_status="matched",
+                category_candidate_references=("not-a-source-category",),
+            ),
+            usage_result(reply="No matching category was found."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "show drinks",
+        f"invalid-semantic-category-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.category_references == ["drinks"]
+    assert source.calls == []
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "category_resolution",
+        "operational_synthesis",
+    ]
+
+
+def test_profit_metric_returns_missing_capability_and_revenue_alternative(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business, _registry, executor = executor_setup(api_client, db_session)
+
+    result = executor.execute(
+        user=user,
+        business_id=business.id,
+        tool_name=SALES_SUMMARY_TOOL,
+        arguments={
+            "start_date": "2026-08-20",
+            "end_date": "2026-08-23",
+            "metric": "gross_profit",
+        },
+    )
+
+    assert isinstance(result.output, MetricCapabilityResult)
+    assert result.output.status == "unsupported"
+    assert result.output.requested_metric == "gross_profit"
+    assert result.output.missing_inputs == ("cost_cogs",)
+    assert result.output.supported_metrics == ("revenue", "sales_count")
+    assert result.output.period.start_date.isoformat() == "2026-08-20"
+
+
+def test_owner_receives_unsupported_profit_facts_and_preserves_franco_style(
+    api_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"profit-capability-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=SALES_SUMMARY_TOOL,
+                tool_arguments={
+                    "start_date": "2026-08-20",
+                    "end_date": "2026-08-23",
+                    "metric": "gross_profit",
+                },
+            ),
+            usage_result(
+                reply=(
+                    "Ma fina n7seb l profit accurately la2an cost/COGS mish "
+                    "connected. Fina n3tik revenue iza بدك."
+                )
+            ),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+    diagnostic_messages: list[str] = []
+    monkeypatch.setattr(
+        owner_chat._logger,
+        "info",
+        lambda message, *args: diagnostic_messages.append(message % args),
+    )
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "badi a3ref adde 3melna rebe7 e5er fatra",
+        f"profit-capability-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert "COGS" in response.json()["assistant_message"]["content"]
+    assert "unavailable" not in response.json()["assistant_message"]["content"]
+    assert SALES_SUMMARY_TOOL in {tool.name for tool in provider.requests[0].tools}
+    assert provider.requests[1].mode == "operational_synthesis"
+    assert provider.requests[1].tools == ()
+    supplied = provider.requests[1].tool_results[0].output
+    assert supplied["requested_metric"] == "gross_profit"
+    assert supplied["supported_metrics"] == ["revenue", "sales_count"]
+    assert "minimarket" not in str(supplied)
+    assert any("metric=gross_profit" in message for message in diagnostic_messages)
+    assert any(
+        "capability_outcome=unsupported" in message for message in diagnostic_messages
+    )
+    assert any(
+        "owner_chat_operational_synthesis outcome=final schema=response_only" in message
+        for message in diagnostic_messages
+    )
+    assert all("rebe7" not in message for message in diagnostic_messages)
+    assert all("Ma fina" not in message for message in diagnostic_messages)
+
+
+def test_location_preference_is_saved_without_an_inventory_read_and_applied_later(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"location-preference-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    preference_provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key="default_inventory_location",
+                location_reference="Jbeil",
+            ),
+            usage_result(
+                reply="I will use that location for future inventory questions."
+            ),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, preference_provider)
+
+    preference = submit(
+        api_client,
+        user,
+        business["id"],
+        "Please use this branch for my later inventory questions.",
+        f"location-preference-{uuid.uuid4()}",
+    )
+
+    assert preference.status_code == 200, preference.text
+    assert "BR-JBEIL" not in str(preference_provider.requests[0])
+    assert [request.mode for request in preference_provider.requests] == ["operational"]
+    assert source.calls == []
+    saved = db_session.scalar(select(UserOperationalPreference))
+    assert saved is not None
+    assert saved.location_external_id == "BR-JBEIL"
+
+    inventory_provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"product_filter": "generic-item", "limit": 5},
+            ),
+            usage_result(reply="The validated inventory result is ready."),
+        ]
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: inventory_provider
+    inventory = submit(
+        api_client,
+        user,
+        business["id"],
+        "How many generic items do we have?",
+        f"location-preference-inventory-{uuid.uuid4()}",
+    )
+
+    assert inventory.status_code == 200, inventory.text
+    assert source.last_inventory_query.branch_external_id == "BR-JBEIL"
+
+
+def test_incomplete_preference_intent_resolves_once_before_scoped_persistence(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"incomplete-preference-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key=None,
+                location_reference=None,
+            ),
+            usage_result(
+                preference_resolution_status="matched",
+                preference_resolution_key="default_inventory_location",
+                preference_location_candidate_references=("location_1",),
+            ),
+            usage_result(reply="The default inventory location was saved."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "from now on just answer from جبيل",
+        f"incomplete-preference-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "preference_resolution",
+    ]
+    resolver_request = provider.requests[1]
+    assert len(resolver_request.messages) == 1
+    assert resolver_request.tools == ()
+    assert resolver_request.knowledge == ()
+    assert resolver_request.sources == ()
+    assert resolver_request.preference_location_candidates[0].reference == "location_1"
+    saved = db_session.scalar(select(UserOperationalPreference))
+    assert saved is not None
+    assert saved.user_id == user.id
+    assert saved.location_external_id == "BR-JBEIL"
+    assert source.calls == []
+
+
+@pytest.mark.parametrize(
+    ("status", "references"),
+    [
+        ("ambiguous", ("location_1", "location_2")),
+        ("no_match", ()),
+        ("matched", ("unknown_location",)),
+    ],
+)
+def test_incomplete_preference_resolution_never_persists_without_a_bounded_match(
+    api_client: TestClient,
+    db_session: Session,
+    status: str,
+    references: tuple[str, ...],
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"preference-no-write-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key=None,
+                location_reference=None,
+            ),
+            usage_result(
+                preference_resolution_status=cast(Any, status),
+                preference_resolution_key=(
+                    "default_inventory_location" if status == "matched" else None
+                ),
+                preference_location_candidate_references=references,
+            ),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Use this branch by default.",
+        f"preference-no-write-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert db_session.scalar(select(UserOperationalPreference)) is None
+    pending = db_session.scalar(select(PendingOwnerOperationalPreference))
+    assert pending is not None
+    assert pending.state == "pending"
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "preference_resolution",
+    ]
+    assert source.calls == []
+
+
+def test_incomplete_preference_provider_failure_never_acknowledges_or_persists(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"preference-failure-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    provider = FailingPreferenceResolverProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key=None,
+                location_reference=None,
+            )
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Use this branch by default.",
+        f"preference-failure-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert "saved" not in response.json()["assistant_message"]["content"].casefold()
+    assert db_session.scalar(select(UserOperationalPreference)) is None
+    assert db_session.scalar(select(PendingOwnerOperationalPreference)) is not None
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "preference_resolution",
+    ]
+
+
+def test_pending_preference_location_only_reply_completes_after_reconstruction(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"pending-preference-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key=None,
+                location_reference=None,
+            ),
+            usage_result(
+                preference_resolution_status="ambiguous",
+                preference_location_candidate_references=("location_1", "location_2"),
+            ),
+            usage_result(reply="Jbeil", pending_reply="selection"),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    initial = submit(
+        api_client,
+        user,
+        business["id"],
+        "Use a branch for future inventory questions.",
+        f"pending-preference-initial-{uuid.uuid4()}",
+    )
+    completed = submit(
+        api_client,
+        user,
+        business["id"],
+        "Jbeil",
+        f"pending-preference-selection-{uuid.uuid4()}",
+    )
+
+    assert initial.status_code == 200, initial.text
+    assert completed.status_code == 200, completed.text
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "preference_resolution",
+        "operational",
+    ]
+    saved = db_session.scalar(select(UserOperationalPreference))
+    pending = db_session.scalar(select(PendingOwnerOperationalPreference))
+    assert saved is not None
+    assert saved.location_external_id == "BR-JBEIL"
+    assert pending is not None
+    assert pending.state == "completed"
+
+
+def test_expired_pending_preference_cannot_complete(
+    api_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"expired-preference-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key=None,
+                location_reference=None,
+            ),
+            usage_result(
+                preference_resolution_status="ambiguous",
+                preference_location_candidate_references=("location_1", "location_2"),
+            ),
+            usage_result(reply="Jbeil"),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+    initial = submit(
+        api_client,
+        user,
+        business["id"],
+        "Use a branch for future inventory questions.",
+        f"expired-preference-initial-{uuid.uuid4()}",
+    )
+    assert initial.status_code == 200, initial.text
+    pending = db_session.scalar(select(PendingOwnerOperationalPreference))
+    assert pending is not None
+    monkeypatch.setattr(
+        owner_chat, "utc_now", lambda: pending.expires_at + timedelta(seconds=1)
+    )
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Jbeil",
+        f"expired-preference-selection-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert db_session.scalar(select(UserOperationalPreference)) is None
+    assert pending.state == "expired"
+
+
+def test_explicit_inventory_location_overrides_saved_preference(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"location-override-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    configure_operational_chat(db_session, business["id"], source, SequenceProvider([]))
+    active = db_session.scalar(select(OperationalDataSourceConfig))
+    assert active is not None
+    db_session.add(
+        UserOperationalPreference(
+            user_id=user.id,
+            business_id=uuid.UUID(str(business["id"])),
+            source_id=active.id,
+            preference_key="default_inventory_location",
+            location_type="branch",
+            location_external_id="BR-JBEIL",
+        )
+    )
+    db_session.commit()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={
+                    "product_filter": "generic-item",
+                    "location_reference": "Other Branch",
+                    "limit": 5,
+                },
+            ),
+            usage_result(reply="The validated inventory result is ready."),
+        ]
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "How many generic items are at Other Branch?",
+        f"location-override-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.last_inventory_query.branch_external_id == "BR-OTHER"
+    assert (
+        db_session.scalar(select(UserOperationalPreference)).location_external_id
+        == "BR-JBEIL"
+    )
+
+
+def test_inventory_planning_ignores_history_and_applies_saved_location(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"current-turn-location-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key="default_inventory_location",
+                location_reference="Jbeil Branch",
+            ),
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"product_filter": "generic-item", "limit": 5},
+            ),
+            usage_result(reply="The validated inventory result is ready."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    preference = submit(
+        api_client,
+        user,
+        business["id"],
+        "Use Jbeil Branch for future inventory questions.",
+        f"history-location-preference-{uuid.uuid4()}",
+    )
+    inventory = submit(
+        api_client,
+        user,
+        business["id"],
+        "How many generic items do we have?",
+        f"history-location-inventory-{uuid.uuid4()}",
+    )
+
+    assert preference.status_code == 200, preference.text
+    assert inventory.status_code == 200, inventory.text
+    planning_request = provider.requests[1]
+    assert planning_request.mode == "operational"
+    assert len(planning_request.messages) == 1
+    assert planning_request.messages[0].content == "How many generic items do we have?"
+    assert source.last_inventory_query.branch_external_id == "BR-JBEIL"
+    saved = db_session.scalar(select(UserOperationalPreference))
+    assert saved is not None
+    assert saved.location_external_id == "BR-JBEIL"
+
+
+def test_replacing_location_preference_updates_only_its_scope(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"location-replace-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    configure_operational_chat(db_session, business["id"], source, SequenceProvider([]))
+    active = db_session.scalar(
+        select(OperationalDataSourceConfig).where(
+            OperationalDataSourceConfig.business_id == uuid.UUID(str(business["id"]))
+        )
+    )
+    assert active is not None
+    db_session.add(
+        UserOperationalPreference(
+            user_id=user.id,
+            business_id=uuid.UUID(str(business["id"])),
+            source_id=active.id,
+            preference_key="default_inventory_location",
+            location_type="branch",
+            location_external_id="BR-OTHER",
+        )
+    )
+    db_session.commit()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key="default_inventory_location",
+                location_reference="Jbeil Branch",
+            ),
+            usage_result(reply="The default inventory location was updated."),
+        ]
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Use Jbeil Branch for future inventory questions.",
+        f"location-replace-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    saved = db_session.scalar(select(UserOperationalPreference))
+    assert saved is not None
+    assert saved.user_id == user.id
+    assert saved.business_id == uuid.UUID(str(business["id"]))
+    assert saved.source_id == active.id
+    assert saved.location_external_id == "BR-JBEIL"
+
+
+def test_location_preference_clear_is_idempotent_and_never_reads_inventory(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"location-clear-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    configure_operational_chat(db_session, business["id"], source, SequenceProvider([]))
+    active = db_session.scalar(
+        select(OperationalDataSourceConfig).where(
+            OperationalDataSourceConfig.business_id == uuid.UUID(str(business["id"]))
+        )
+    )
+    assert active is not None
+    db_session.add(
+        UserOperationalPreference(
+            user_id=user.id,
+            business_id=uuid.UUID(str(business["id"])),
+            source_id=active.id,
+            preference_key="default_inventory_location",
+            location_type="branch",
+            location_external_id="BR-JBEIL",
+        )
+    )
+    db_session.commit()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="clear_preference",
+                preference_key=None,
+            ),
+            usage_result(reply="The default inventory location is cleared."),
+            usage_result(
+                decision="clear_preference",
+                preference_key="default_inventory_location",
+            ),
+            usage_result(reply="The default inventory location is cleared."),
+        ]
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Do not use my inventory location default anymore.",
+        f"location-clear-{uuid.uuid4()}",
+    )
+    repeated = submit(
+        api_client,
+        user,
+        business["id"],
+        "Do not use my inventory location default anymore.",
+        f"location-clear-repeat-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert repeated.status_code == 200, repeated.text
+    assert [request.mode for request in provider.requests] == [
+        "operational",
+        "operational",
+    ]
+    assert source.calls == []
+    assert (
+        db_session.scalar(
+            select(UserOperationalPreference).where(
+                UserOperationalPreference.user_id == user.id,
+                UserOperationalPreference.business_id == uuid.UUID(str(business["id"])),
+            )
+        )
+        is None
+    )
+
+
+def test_targeted_clear_never_claims_a_different_saved_location_was_removed(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"targeted-clear-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    configure_operational_chat(db_session, business["id"], source, SequenceProvider([]))
+    active = db_session.scalar(
+        select(OperationalDataSourceConfig).where(
+            OperationalDataSourceConfig.business_id == uuid.UUID(str(business["id"]))
+        )
+    )
+    assert active is not None
+    db_session.add(
+        UserOperationalPreference(
+            user_id=user.id,
+            business_id=uuid.UUID(str(business["id"])),
+            source_id=active.id,
+            preference_key="default_inventory_location",
+            location_type="branch",
+            location_external_id="BR-BEIRUT",
+        )
+    )
+    db_session.commit()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="clear_preference",
+                preference_key="default_inventory_location",
+                location_reference="Jbeil",
+            )
+        ]
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Remove Jbeil from my preference.",
+        f"targeted-clear-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert "no matching" in response.json()["assistant_message"]["content"].casefold()
+    saved = db_session.scalar(select(UserOperationalPreference))
+    assert saved is not None
+    assert saved.location_external_id == "BR-BEIRUT"
+
+
+def test_ambiguous_location_preference_is_not_saved_or_exposes_source_ids(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"location-ambiguous-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    source.locations = (
+        LocationCandidate(
+            external_location_id="BR-ONE", label="North Branch", location_type="branch"
+        ),
+        LocationCandidate(
+            external_location_id="BR-TWO", label="South Branch", location_type="branch"
+        ),
+    )
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key="default_inventory_location",
+                location_reference="Branch",
+            ),
+            usage_result(reply="Which location do you mean?"),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Use this location for future inventory questions.",
+        f"location-ambiguous-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert db_session.scalar(select(UserOperationalPreference)) is None
+    pending = db_session.scalar(select(PendingOwnerOperationalPreference))
+    assert pending is not None
+    assert "North Branch" not in str(pending.candidate_references)
+    assert "South Branch" not in str(pending.candidate_references)
+    assert source.calls == []
+
+
+def test_hallucinated_location_reference_is_not_saved(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"location-unknown-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key="default_inventory_location",
+                location_reference="BR-JBEIL",
+            ),
+            usage_result(reply="Please choose one of the available locations."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Use that location by default.",
+        f"location-unknown-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert db_session.scalar(select(UserOperationalPreference)) is None
+    assert db_session.scalar(select(PendingOwnerOperationalPreference)) is not None
+    assert source.calls == []
+
+
+def test_conflicting_preference_plan_never_acknowledges_or_saves(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"location-conflict-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="set_preference",
+                preference_key="default_inventory_location",
+                location_reference="Jbeil Branch",
+                semantic_operation="inventory_list",
+            )
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Use Jbeil Branch by default.",
+        f"location-conflict-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "assistant_invalid_response"
+    assert db_session.scalar(select(UserOperationalPreference)) is None
+    assert source.calls == []
+
+
+@pytest.mark.parametrize("failure", [None, "reported", "unknown", "pre_use"])
+def test_stale_location_preference_is_removed_without_an_inventory_query(
+    api_client: TestClient, db_session: Session, migration_engine: Engine, failure
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"location-stale-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    configure_operational_chat(db_session, business["id"], source, SequenceProvider([]))
+    active = db_session.scalar(
+        select(OperationalDataSourceConfig).where(
+            OperationalDataSourceConfig.business_id == uuid.UUID(str(business["id"]))
+        )
+    )
+    assert active is not None
+    db_session.add(
+        UserOperationalPreference(
+            user_id=user.id,
+            business_id=uuid.UUID(str(business["id"])),
+            source_id=active.id,
+            preference_key="default_inventory_location",
+            location_type="branch",
+            location_external_id="BR-REMOVED",
+        )
+    )
+    db_session.commit()
+
+    class LocationSynthesisProvider(SequenceProvider):
+        def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
+            if failure and request.mode == "operational_synthesis":
+                self.requests.append(request)
+                raise OwnerChatProviderTimeout(
+                    usage=TokenUsage(17, 4, 21, True)
+                    if failure == "reported"
+                    else None,
+                    usage_uncertain=failure != "pre_use",
+                )
+            return super().generate(request)
+
+    provider = LocationSynthesisProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"product_filter": "generic-item", "limit": 5},
+            ),
+            usage_result(reply="Your saved inventory location is no longer available."),
+        ]
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+
+    key = f"location-stale-{uuid.uuid4()}"
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "How many generic items do we have?",
+        key,
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.calls == []
+    assert provider.requests[1].mode == "operational_synthesis"
+    assert provider.requests[1].tool_results[0].output["action"] == "invalidated"
+    assert db_session.scalar(select(UserOperationalPreference)) is None
+    replay = submit(
+        api_client, user, business["id"], "How many generic items do we have?", key
+    )
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    assert len(provider.requests) == 2
+    with migration_engine.connect() as connection:
+        usage = connection.execute(
+            text(
+                "SELECT input_tokens, output_tokens, total_tokens, "
+                "counts_authoritative, status FROM ai_usage_reservations"
+            )
+        ).one()
+    failed_input = 17 if failure == "reported" else 10 if failure == "unknown" else 0
+    failed_output = (
+        4
+        if failure == "reported"
+        else provider.requests[1].max_output_tokens
+        if failure == "unknown"
+        else 0
+    )
+    if failure is None:
+        failed_input, failed_output = 10, 2
+    assert usage.input_tokens == 10 + failed_input
+    assert usage.output_tokens == 2 + failed_output
+    assert usage.total_tokens == usage.input_tokens + usage.output_tokens
+    assert usage.counts_authoritative is (failure in {None, "reported"})
+    assert usage.status == "completed"
+
+
+def test_unsupported_profit_uses_capability_fallback_when_synthesis_is_invalid(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email=f"profit-fallback-{uuid.uuid4()}@example.com"
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=SALES_SUMMARY_TOOL,
+                tool_arguments={
+                    "start_date": "2026-08-20",
+                    "end_date": "2026-08-23",
+                    "metric": "gross_profit",
+                },
+            ),
+            usage_result(
+                decision="tool",
+                tool_name=SALES_SUMMARY_TOOL,
+                tool_arguments={"metric": "gross_profit"},
+            ),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "badi a3ref adde 3melna rebe7 e5er fatra",
+        f"profit-fallback-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    content = response.json()["assistant_message"]["content"]
+    assert "cost/COGS" in content
+    assert "revenue" in content
+    assert "sales count" in content
+    assert "live operational data" not in content.lower()
+    assert len(provider.requests) == 2
+    assert provider.requests[1].mode == "operational_synthesis"
+    assert source.calls == []
+
+
+@pytest.mark.parametrize(
     ("status", "candidate_count"),
     [("ambiguous", 2), ("not_found", 0)],
 )
@@ -565,12 +2198,50 @@ class SequenceProvider:
 
     def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
         self.requests.append(request)
-        return self.results[len(self.requests) - 1]
+        result = self.results[len(self.requests) - 1]
+        if request.mode in {"category_resolution", "preference_resolution"}:
+            return replace(
+                result,
+                reply="",
+                decision="final",
+                tool_name=None,
+                tool_arguments=None,
+                preference_key=None,
+                location_reference=None,
+                semantic_operation=None,
+                entity_kind=None,
+                entity_query=None,
+                category_candidate_reference=None,
+            )
+        if (
+            request.mode == "operational_synthesis"
+            and result.validated_result_status is None
+        ):
+            return replace(
+                result, validated_result_status=request.validated_result_status
+            )
+        return result
 
 
 class FailingSecondProvider(SequenceProvider):
     def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
         if self.requests:
+            self.requests.append(request)
+            raise OwnerChatProviderTimeout(usage_uncertain=True)
+        return super().generate(request)
+
+
+class FailingCategoryResolverProvider(SequenceProvider):
+    def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
+        if request.mode == "category_resolution":
+            self.requests.append(request)
+            raise OwnerChatProviderTimeout(usage_uncertain=True)
+        return super().generate(request)
+
+
+class FailingPreferenceResolverProvider(SequenceProvider):
+    def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
+        if request.mode == "preference_resolution":
             self.requests.append(request)
             raise OwnerChatProviderTimeout(usage_uncertain=True)
         return super().generate(request)
@@ -590,6 +2261,14 @@ class BlockingOperationalProvider(SequenceProvider):
 
 
 def usage_result(**values: object) -> OwnerChatResult:
+    values.setdefault(
+        "semantic_operation",
+        (
+            "preference"
+            if values.get("decision") in {"set_preference", "clear_preference"}
+            else "unsupported"
+        ),
+    )
     return OwnerChatResult(
         usage=TokenUsage(
             input_tokens=10,
@@ -620,7 +2299,10 @@ def configure_operational_chat(
 
 
 def test_owner_loop_executes_live_tool_aggregates_usage_and_replays_without_work(
-    api_client: TestClient, db_session: Session, migration_engine: Engine
+    api_client: TestClient,
+    db_session: Session,
+    migration_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     user, business = active_business(api_client, db_session)
     source = StubSource()
@@ -629,7 +2311,7 @@ def test_owner_loop_executes_live_tool_aggregates_usage_and_replays_without_work
             usage_result(
                 decision="tool",
                 tool_name=CURRENT_INVENTORY_TOOL,
-                tool_arguments={"branch_external_id": "BR-BEY", "limit": 5},
+                tool_arguments={"location_reference": "Jbeil Branch", "limit": 5},
             ),
             usage_result(
                 reply="Beirut has 8 available units as of the source timestamp."
@@ -637,6 +2319,12 @@ def test_owner_loop_executes_live_tool_aggregates_usage_and_replays_without_work
         ]
     )
     configure_operational_chat(db_session, business["id"], source, provider)
+    enqueued: list[uuid.UUID] = []
+    monkeypatch.setattr(
+        owner_chat,
+        "_enqueue_summary_safely",
+        lambda conversation_id, _settings: enqueued.append(conversation_id),
+    )
 
     first = submit(
         api_client,
@@ -657,15 +2345,14 @@ def test_owner_loop_executes_live_tool_aggregates_usage_and_replays_without_work
     assert replay.status_code == 200
     assert replay.json()["replayed"] is True
     assert len(provider.requests) == 2
-    assert [tool.name for tool in provider.requests[0].tools] == [
-        CURRENT_INVENTORY_TOOL
-    ]
+    assert CURRENT_INVENTORY_TOOL in {tool.name for tool in provider.requests[0].tools}
     assert provider.requests[0].tool_results == ()
     supplied = provider.requests[1].tool_results[0]
     assert supplied.tool_name == CURRENT_INVENTORY_TOOL
     assert supplied.output["items"][0]["available_quantity"] == "8"
     assert "connection_profile" not in str(supplied.output)
     assert source.calls == [CURRENT_INVENTORY_TOOL]
+    assert enqueued == []
     assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
     assert db_session.scalar(select(func.count()).select_from(OwnerChatCitation)) == 0
     with migration_engine.connect() as connection:
@@ -680,10 +2367,228 @@ def test_owner_loop_executes_live_tool_aggregates_usage_and_replays_without_work
     assert reservation.total_tokens == 24
 
 
+def test_semantic_product_intent_without_a_tool_proposal_derives_inventory_once(
+    api_client: TestClient,
+    db_session: Session,
+    migration_engine: Engine,
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"derived-product-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                semantic_operation="inventory_product",
+                entity_kind="product",
+                entity_query="PEPSI-1500",
+                tool_name=None,
+                tool_arguments=None,
+            ),
+            usage_result(reply="The validated inventory result is ready."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Inventory request.",
+        f"derived-product-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(provider.requests) == 2
+    assert provider.requests[1].mode == "operational_synthesis"
+    assert source.resolution_references == ["PEPSI-1500"]
+    assert source.calls == [CURRENT_INVENTORY_TOOL]
+    assert source.last_inventory_query.external_product_id == "P1001"
+    assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
+    with migration_engine.connect() as connection:
+        reservation = connection.execute(
+            text("SELECT status, total_tokens FROM ai_usage_reservations")
+        ).one()
+    assert reservation.status == "completed"
+    assert reservation.total_tokens == 24
+
+
+def test_backend_derived_inventory_passes_every_validated_row_to_synthesis(
+    api_client: TestClient,
+    db_session: Session,
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"derived-rows-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+
+    def three_rows(query: object) -> InventoryResult:
+        source._raise_or_record(CURRENT_INVENTORY_TOOL)
+        source.last_inventory_query = query
+        return InventoryResult(
+            items=(inventory_item(), inventory_item(), inventory_item()),
+            metadata=metadata(limit=cast(Any, query).limit, rows=3),
+        )
+
+    source.get_current_inventory = three_rows  # type: ignore[method-assign]
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                semantic_operation="inventory_product",
+                entity_kind="product",
+                entity_query="PEPSI-1500",
+            ),
+            usage_result(reply="The validated inventory result is ready."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Inventory request.",
+        f"derived-rows-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.calls == [CURRENT_INVENTORY_TOOL]
+    assert len(provider.requests[1].tool_results[0].output["items"]) == 3
+
+
+def test_prohibited_provider_tool_is_rejected_before_any_adapter_call(
+    api_client: TestClient,
+    db_session: Session,
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"prohibited-tool-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                semantic_operation="inventory_product",
+                entity_kind="product",
+                entity_query="PEPSI-1500",
+                tool_name="unapproved_provider_tool",
+                tool_arguments={},
+            )
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Inventory request.",
+        f"prohibited-tool-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 503
+    assert source.calls == []
+
+
+def test_conflicting_provider_tool_cannot_change_semantic_inventory_capability(
+    api_client: TestClient,
+    db_session: Session,
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"conflicting-tool-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                semantic_operation="inventory_product",
+                entity_kind="product",
+                entity_query="PEPSI-1500",
+                tool_name=SALES_SUMMARY_TOOL,
+                tool_arguments={
+                    "start_date": "2026-08-20",
+                    "end_date": "2026-08-23",
+                    "metric": "revenue",
+                },
+            ),
+            usage_result(reply="The validated inventory result is ready."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Inventory request.",
+        f"conflicting-tool-{uuid.uuid4()}",
+    )
+
+    assert response.status_code == 200, response.text
+    assert source.calls == [CURRENT_INVENTORY_TOOL]
+    assert SALES_SUMMARY_TOOL not in source.calls
+
+
+@pytest.mark.parametrize(
+    ("semantic_operation", "entity_kind", "entity_query", "arguments", "tool_name"),
+    [
+        ("inventory_list", None, None, None, CURRENT_INVENTORY_TOOL),
+        ("restocking", None, None, None, RESTOCKING_RECOMMENDATIONS_TOOL),
+        (
+            "sales_summary",
+            None,
+            None,
+            {
+                "start_date": "2026-08-20",
+                "end_date": "2026-08-23",
+                "metric": "revenue",
+            },
+            SALES_SUMMARY_TOOL,
+        ),
+    ],
+)
+def test_backend_command_derivation_uses_only_approved_semantic_capabilities(
+    api_client: TestClient,
+    db_session: Session,
+    semantic_operation: str,
+    entity_kind: str | None,
+    entity_query: str | None,
+    arguments: dict[str, object] | None,
+    tool_name: str,
+) -> None:
+    user, business, _registry, executor = executor_setup(api_client, db_session)
+    command = owner_chat._backend_operational_command(
+        OwnerChatResult(
+            decision="tool",
+            semantic_operation=cast(Any, semantic_operation),
+            entity_kind=cast(Any, entity_kind),
+            entity_query=entity_query,
+            tool_arguments=arguments,
+        ),
+        executor,
+        (),
+    )
+
+    assert command is not None
+    assert command.tool_name == tool_name
+
+
 @pytest.mark.parametrize(
     ("message", "reference"),
     [
         ("How many Pepsi do we have left?", "Pepsi"),
+        ("How many Pepsi we have left?", "how many pepsi we have left"),
         ("قديش عنا بيبسي", "بيبسي"),
         ("كم آيباد باقي", "آيباد"),
         ("adde 3anna Pepsi?", "Pepsi"),
@@ -724,9 +2629,7 @@ def test_multilingual_quantity_turn_reaches_inventory_with_product_reference(
     )
 
     assert response.status_code == 200, response.text
-    assert [tool.name for tool in provider.requests[0].tools] == [
-        CURRENT_INVENTORY_TOOL
-    ]
+    assert CURRENT_INVENTORY_TOOL in {tool.name for tool in provider.requests[0].tools}
     assert source.resolution_references == [reference]
     assert source.calls == [CURRENT_INVENTORY_TOOL]
 
@@ -804,7 +2707,93 @@ def test_unresolved_product_turn_returns_safe_answer_without_rag_or_guessing(
     assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
 
 
-def test_active_source_without_matching_capability_keeps_safe_unavailable_bypass(
+def test_product_follow_up_uses_bounded_pending_candidates_without_history(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email=f"pending-product-{uuid.uuid4()}@example.com",
+    )
+    source = StubSource()
+    ambiguous = ProductResolution(
+        status="ambiguous",
+        matched_by="partial_name",
+        candidates=(
+            ProductResolutionCandidate(
+                external_product_id="fixture-product-a",
+                sku="fixture-a",
+                name="Fixture Product A",
+            ),
+            ProductResolutionCandidate(
+                external_product_id="fixture-product-b",
+                sku="fixture-b",
+                name="Fixture Product B",
+            ),
+        ),
+        metadata=metadata(rows=2),
+    )
+    resolved = source.resolution
+
+    def resolve_by_reference(query: object) -> ProductResolution:
+        reference = cast(Any, query).reference
+        source.resolution_references.append(reference)
+        return ambiguous if reference == "initial ambiguous request" else resolved
+
+    source.resolve_product = resolve_by_reference  # type: ignore[method-assign]
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={
+                    "product_filter": "initial ambiguous request",
+                    "limit": 5,
+                },
+            ),
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={
+                    "product_filter": "selected fixture variant",
+                    "limit": 5,
+                },
+            ),
+            usage_result(reply="The validated inventory result is ready."),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    initial = submit(
+        api_client,
+        user,
+        business["id"],
+        "initial ambiguous request",
+        f"pending-product-initial-{uuid.uuid4()}",
+    )
+    follow_up = submit(
+        api_client,
+        user,
+        business["id"],
+        "selected fixture variant",
+        f"pending-product-follow-up-{uuid.uuid4()}",
+    )
+
+    assert initial.status_code == 200, initial.text
+    assert follow_up.status_code == 200, follow_up.text
+    follow_up_request = provider.requests[1]
+    assert len(follow_up_request.messages) == 1
+    assert follow_up_request.messages[0].content == "selected fixture variant"
+    assert [
+        candidate.label for candidate in follow_up_request.pending_product_candidates
+    ] == [
+        "Fixture Product A",
+        "Fixture Product B",
+    ]
+    assert source.last_inventory_query is not None
+
+
+def test_active_source_without_matching_capability_uses_provider_unavailable(
     api_client: TestClient, db_session: Session, migration_engine: Engine
 ) -> None:
     user, business = active_business(
@@ -814,7 +2803,9 @@ def test_active_source_without_matching_capability_keeps_safe_unavailable_bypass
         name="Unsupported Live Store",
     )
     source = StubSource()
-    provider = SequenceProvider([])
+    provider = SequenceProvider(
+        [usage_result(decision="unavailable", reply="No supported tool is available.")]
+    )
     configure_operational_chat(db_session, business["id"], source, provider)
 
     response = submit(
@@ -826,13 +2817,13 @@ def test_active_source_without_matching_capability_keeps_safe_unavailable_bypass
     )
 
     assert response.status_code == 200, response.text
-    assert "live operational" in response.json()["assistant_message"]["content"].lower()
-    assert provider.requests == []
+    assert "supported tool" in response.json()["assistant_message"]["content"].lower()
+    assert len(provider.requests) == 1
     assert source.calls == []
     assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 0
     with migration_engine.connect() as connection:
         assert (
-            connection.scalar(text("SELECT count(*) FROM ai_usage_reservations")) == 0
+            connection.scalar(text("SELECT count(*) FROM ai_usage_reservations")) == 1
         )
 
 
@@ -870,7 +2861,7 @@ def test_unhealthy_source_keeps_safe_unavailable_bypass(
         )
 
 
-def test_repeated_tool_request_is_rejected_without_second_execution(
+def test_response_only_synthesis_rejects_a_tool_request_without_replanning(
     api_client: TestClient, db_session: Session
 ) -> None:
     user, business = active_business(
@@ -899,20 +2890,20 @@ def test_repeated_tool_request_is_rejected_without_second_execution(
     )
 
     assert response.status_code == 200, response.text
-    assert "live operational" in response.json()["assistant_message"]["content"].lower()
+    assert (
+        "current inventory" in response.json()["assistant_message"]["content"].lower()
+    )
     assert len(provider.requests) == 2
+    assert provider.requests[1].mode == "operational_synthesis"
+    assert provider.requests[1].tools == ()
     assert source.calls == [CURRENT_INVENTORY_TOOL]
     audits = db_session.scalars(
         select(ToolCallLog).order_by(ToolCallLog.created_at, ToolCallLog.id)
     ).all()
-    assert [audit.status for audit in audits] == [
-        ToolCallStatus.SUCCESS,
-        ToolCallStatus.DENIED,
-    ]
-    assert audits[1].error_code == "loop_limit"
+    assert [audit.status for audit in audits] == [ToolCallStatus.SUCCESS]
 
 
-def test_loop_allows_two_tools_and_requires_final_by_third_provider_call(
+def test_tool_result_uses_response_only_synthesis_without_a_second_plan(
     api_client: TestClient, db_session: Session
 ) -> None:
     user, business = active_business(
@@ -928,14 +2919,6 @@ def test_loop_allows_two_tools_and_requires_final_by_third_provider_call(
                 decision="tool",
                 tool_name=CURRENT_INVENTORY_TOOL,
                 tool_arguments={"limit": 5},
-            ),
-            usage_result(
-                decision="tool",
-                tool_name=SALES_SUMMARY_TOOL,
-                tool_arguments={
-                    "start_date": "2026-08-20",
-                    "end_date": "2026-08-23",
-                },
             ),
             usage_result(
                 reply=(
@@ -957,17 +2940,59 @@ def test_loop_allows_two_tools_and_requires_final_by_third_provider_call(
     )
 
     assert response.status_code == 200, response.text
-    assert len(provider.requests) == 3
-    assert source.calls == [CURRENT_INVENTORY_TOOL, SALES_SUMMARY_TOOL]
-    assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 2
-    final_context = provider.requests[2].tool_results
-    assert [item.tool_name for item in final_context] == [
-        CURRENT_INVENTORY_TOOL,
-        SALES_SUMMARY_TOOL,
+    assert len(provider.requests) == 2
+    assert source.calls == [CURRENT_INVENTORY_TOOL]
+    assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
+    assert provider.requests[1].mode == "operational_synthesis"
+    assert provider.requests[1].tools == ()
+    assert [item.tool_name for item in provider.requests[1].tool_results] == [
+        CURRENT_INVENTORY_TOOL
     ]
 
 
-def test_failed_loop_finalizes_reservation_and_terminal_replay_does_no_work(
+def test_inventory_synthesis_cannot_label_positive_validated_stock_as_empty(
+    api_client: TestClient, db_session: Session
+) -> None:
+    user, business = active_business(
+        api_client,
+        db_session,
+        email="synthesis-inventory-state@example.com",
+        name="Synthesis Inventory State Store",
+    )
+    source = StubSource()
+    provider = SequenceProvider(
+        [
+            usage_result(
+                decision="tool",
+                tool_name=CURRENT_INVENTORY_TOOL,
+                tool_arguments={"limit": 5},
+            ),
+            usage_result(
+                reply="No matching stock is available.",
+                validated_result_status="empty",
+            ),
+        ]
+    )
+    configure_operational_chat(db_session, business["id"], source, provider)
+
+    response = submit(
+        api_client,
+        user,
+        business["id"],
+        "Inventory quantity request.",
+        "synthesis-inventory-state",
+    )
+
+    assert response.status_code == 200, response.text
+    assert provider.requests[1].mode == "operational_synthesis"
+    assert provider.requests[1].validated_result_status == "data"
+    assert (
+        "current inventory" in response.json()["assistant_message"]["content"].lower()
+    )
+    assert source.calls == [CURRENT_INVENTORY_TOOL]
+
+
+def test_synthesis_failure_uses_safe_fallback_and_replay_does_no_work(
     api_client: TestClient, db_session: Session, migration_engine: Engine
 ) -> None:
     user, business = active_business(
@@ -1003,10 +3028,10 @@ def test_failed_loop_finalizes_reservation_and_terminal_replay_does_no_work(
         "failed-live-loop",
     )
 
-    assert first.status_code == 503
-    assert first.json()["error"]["code"] == "assistant_timeout"
-    assert replay.status_code == 409
-    assert replay.json()["error"]["code"] == "owner_turn_failed"
+    assert first.status_code == 200
+    assert "current inventory" in first.json()["assistant_message"]["content"].lower()
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
     assert len(provider.requests) == 2
     assert source.calls == [CURRENT_INVENTORY_TOOL]
     assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
@@ -1017,8 +3042,9 @@ def test_failed_loop_finalizes_reservation_and_terminal_replay_does_no_work(
                 "FROM ai_usage_reservations"
             )
         ).one()
-    assert reservation.status == "charged"
-    assert reservation.total_tokens == reservation.reserved_tokens
+    assert reservation.status == "completed"
+    # The final hold is prior usage plus this timed-out synthesis call's ceiling.
+    assert reservation.total_tokens == reservation.reserved_tokens == 534
 
 
 def test_concurrent_idempotent_operational_submissions_execute_once(

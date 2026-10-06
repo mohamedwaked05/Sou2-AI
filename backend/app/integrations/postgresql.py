@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from datetime import UTC, datetime, time
 from functools import lru_cache
@@ -23,10 +24,15 @@ from app.schemas.operational import (
     BestSellersQuery,
     BestSellingProduct,
     BestSellingProductsResult,
+    CategoryCandidate,
+    CategoryResolution,
     IntegrationHealth,
     InventoryItem,
     InventoryReadQuery,
     InventoryResult,
+    LocationCandidate,
+    LocationResolution,
+    LocationResolutionQuery,
     OperationalResultMetadata,
     Product,
     ProductResolution,
@@ -90,16 +96,22 @@ _INVENTORY_SQL = text(
               OR item.item_code = :external_product_id
           )
           AND (
+              CAST(:category_filter AS text) IS NULL
+              OR lower(category.label) = lower(:category_filter)
+          )
+          AND (
               CAST(:branch_code AS text) IS NULL
               OR (
-                  location.location_type = 'BRANCH'
+                  location.location_type = ANY(CAST(:branch_location_types AS text[]))
                   AND location.location_code = :branch_code
               )
           )
           AND (
               CAST(:warehouse_code AS text) IS NULL
               OR (
-                  location.location_type = 'WAREHOUSE'
+                  location.location_type = ANY(
+                      CAST(:warehouse_location_types AS text[])
+                  )
                   AND location.location_code = :warehouse_code
               )
           )
@@ -112,7 +124,10 @@ _INVENTORY_SQL = text(
            AND target_stock > available_quantity
        )
     ORDER BY
-        CASE location_type WHEN 'BRANCH' THEN 0 ELSE 1 END,
+        CASE
+            WHEN location_type = ANY(CAST(:branch_location_types AS text[])) THEN 0
+            ELSE 1
+        END,
         location_code,
         product_name,
         external_product_id
@@ -203,6 +218,107 @@ _PRODUCT_RESOLUTION_PARTIAL_SQL = text(
           )
       )
     ORDER BY product_name, external_product_id
+    LIMIT :row_limit
+    """
+)
+
+_PRODUCT_RESOLUTION_TOKEN_SQL = text(
+    r"""
+    WITH reference_terms AS (
+        SELECT DISTINCT lower(btrim(term)) AS term
+        FROM regexp_split_to_table(:reference, '\s+') AS split(term)
+        WHERE char_length(btrim(term)) >= 3
+    ), matches AS (
+        SELECT
+            item.item_id,
+            item.item_code AS external_product_id,
+            item.merchant_sku AS sku,
+            item.ean_barcode AS barcode,
+            item.display_label AS product_name,
+            category.label AS category,
+            COUNT(DISTINCT reference_terms.term) AS matched_terms
+        FROM minimarket.catalog_items AS item
+        LEFT JOIN minimarket.categories AS category
+            ON category.category_id = item.category_id
+        CROSS JOIN reference_terms
+        WHERE item.active = true
+          AND (
+              position(reference_terms.term IN lower(item.item_code)) > 0
+              OR position(reference_terms.term IN lower(item.merchant_sku)) > 0
+              OR position(reference_terms.term IN lower(item.ean_barcode)) > 0
+              OR position(
+                  reference_terms.term IN lower(
+                      regexp_replace(btrim(item.display_label), '\s+', ' ', 'g')
+                  )
+              ) > 0
+              OR EXISTS (
+                  SELECT 1
+                  FROM minimarket.catalog_item_aliases AS alias
+                  WHERE alias.item_id = item.item_id
+                    AND alias.approved = true
+                    AND position(reference_terms.term IN lower(
+                        regexp_replace(btrim(alias.alias), '\s+', ' ', 'g')
+                    )) > 0
+              )
+          )
+        GROUP BY
+            item.item_id,
+            item.item_code,
+            item.merchant_sku,
+            item.ean_barcode,
+            item.display_label,
+            category.label
+    )
+    SELECT *, 'partial_name' AS match_type
+    FROM matches
+    WHERE matched_terms = (SELECT max(matched_terms) FROM matches)
+      AND matched_terms > 0
+    ORDER BY matched_terms DESC, product_name, external_product_id
+    LIMIT :row_limit
+    """
+)
+
+_CATEGORY_RESOLUTION_SQL = text(
+    """
+    SELECT category_id::text AS external_category_id, label
+    FROM minimarket.categories
+    WHERE lower(regexp_replace(btrim(label), '\\s+', ' ', 'g'))
+        LIKE :reference ESCAPE '\\'
+    ORDER BY label, category_id
+    LIMIT :row_limit
+    """
+)
+
+_CATEGORY_CANDIDATES_SQL = text(
+    """
+    SELECT category_id::text AS external_category_id, label
+    FROM minimarket.categories
+    WHERE btrim(label) <> ''
+    ORDER BY lower(label), category_id
+    LIMIT :row_limit
+    """
+)
+
+_LOCATION_RESOLUTION_SQL = text(
+    """
+    SELECT location_code AS external_location_id, location_label AS label,
+           location_type AS source_location_type
+    FROM minimarket.stock_locations
+    WHERE lower(regexp_replace(btrim(location_label), '\\s+', ' ', 'g'))
+            LIKE :reference ESCAPE '\\'
+       OR lower(location_code) = :normalized_reference
+    ORDER BY lower(location_label), location_code
+    LIMIT :row_limit
+    """
+)
+
+_LOCATION_CANDIDATES_SQL = text(
+    """
+    SELECT location_code AS external_location_id, location_label AS label,
+           location_type AS source_location_type
+    FROM minimarket.stock_locations
+    WHERE btrim(location_label) <> ''
+    ORDER BY lower(location_label), location_code
     LIMIT :row_limit
     """
 )
@@ -394,6 +510,7 @@ class PostgreSQLOperationalAdapter:
         query_timeout_seconds: int = 2,
         max_reporting_days: int = 366,
         engine: Engine | None = None,
+        location_type_mapping: Mapping[str, tuple[str, ...]] | None = None,
     ) -> None:
         if query_timeout_seconds < 1 or query_timeout_seconds > 30:
             raise ValueError(
@@ -405,6 +522,19 @@ class PostgreSQLOperationalAdapter:
             )
         self.query_timeout_milliseconds = query_timeout_seconds * 1000
         self.max_reporting_days = max_reporting_days
+        self._source_location_types = self._validated_location_type_mapping(
+            location_type_mapping
+        )
+        self._branch_source_location_types = tuple(
+            source_type
+            for source_type, canonical_type in self._source_location_types.items()
+            if canonical_type == "branch"
+        )
+        self._warehouse_source_location_types = tuple(
+            source_type
+            for source_type, canonical_type in self._source_location_types.items()
+            if canonical_type == "warehouse"
+        )
         if engine is not None:
             self._engine = engine
             return
@@ -450,6 +580,22 @@ class PostgreSQLOperationalAdapter:
                     ).mappings()
                 )
                 if not rows:
+                    spaced_units = re.sub(
+                        r"(?<=\d)(ml|kg|g|l)\b", r" \1", normalized_reference
+                    )
+                    if spaced_units != normalized_reference:
+                        normalized_reference = spaced_units
+                        rows = list(
+                            connection.execute(
+                                _PRODUCT_RESOLUTION_EXACT_SQL,
+                                {
+                                    "reference": query.reference,
+                                    "normalized_reference": normalized_reference,
+                                    "row_limit": query.candidate_limit + 1,
+                                },
+                            ).mappings()
+                        )
+                if not rows:
                     rows = list(
                         connection.execute(
                             _PRODUCT_RESOLUTION_PARTIAL_SQL,
@@ -461,7 +607,160 @@ class PostgreSQLOperationalAdapter:
                             },
                         ).mappings()
                     )
+                if not rows:
+                    rows = list(
+                        connection.execute(
+                            _PRODUCT_RESOLUTION_TOKEN_SQL,
+                            {
+                                "reference": normalized_reference,
+                                "row_limit": query.candidate_limit + 1,
+                            },
+                        ).mappings()
+                    )
             return self._normalize_resolution(source, query, rows)
+        except (SQLAlchemyError, RuntimeError) as exc:
+            self._raise_safe_database_error(exc)
+        except ValidationError, KeyError, TypeError, ArithmeticError:
+            raise OperationalDataInvalid(
+                "Operational source data is invalid."
+            ) from None
+
+    def resolve_category(self, query: ProductResolutionQuery) -> CategoryResolution:
+        try:
+            with self._engine.connect() as connection:
+                self._prepare_read(connection)
+                source = self._source_configuration(connection)
+                rows = list(
+                    connection.execute(
+                        _CATEGORY_RESOLUTION_SQL,
+                        {
+                            "reference": self._escaped_search(
+                                self._normalized_reference(query.reference)
+                            ),
+                            "row_limit": query.candidate_limit + 1,
+                        },
+                    ).mappings()
+                )
+            limited = rows[: query.candidate_limit]
+            metadata = self._metadata(
+                source,
+                row_count=len(limited),
+                requested_limit=query.candidate_limit,
+                is_truncated=len(rows) > query.candidate_limit,
+            )
+            if not limited:
+                return CategoryResolution(status="not_found", metadata=metadata)
+            candidates = tuple(
+                CategoryCandidate(
+                    external_category_id=row["external_category_id"], label=row["label"]
+                )
+                for row in limited
+            )
+            if len(rows) == 1:
+                return CategoryResolution(
+                    status="resolved", category=candidates[0], metadata=metadata
+                )
+            return CategoryResolution(
+                status="ambiguous", candidates=candidates, metadata=metadata
+            )
+        except (SQLAlchemyError, RuntimeError) as exc:
+            self._raise_safe_database_error(exc)
+        except ValidationError, KeyError, TypeError, ArithmeticError:
+            raise OperationalDataInvalid(
+                "Operational source data is invalid."
+            ) from None
+
+    def list_categories(self, *, limit: int) -> tuple[CategoryCandidate, ...]:
+        """Return a bounded, deterministic category catalogue for planning."""
+        if not 1 <= limit <= 100:
+            raise ValueError("Category candidate limit is outside the safe bound.")
+        try:
+            with self._engine.connect() as connection:
+                self._prepare_read(connection)
+                rows = connection.execute(
+                    _CATEGORY_CANDIDATES_SQL, {"row_limit": limit}
+                ).mappings()
+                return tuple(
+                    CategoryCandidate(
+                        external_category_id=row["external_category_id"],
+                        label=row["label"],
+                    )
+                    for row in rows
+                )
+        except (SQLAlchemyError, RuntimeError) as exc:
+            self._raise_safe_database_error(exc)
+        except ValidationError, KeyError, TypeError, ArithmeticError:
+            raise OperationalDataInvalid(
+                "Operational source data is invalid."
+            ) from None
+
+    def resolve_location(self, query: LocationResolutionQuery) -> LocationResolution:
+        try:
+            with self._engine.connect() as connection:
+                self._prepare_read(connection)
+                source = self._source_configuration(connection)
+                normalized = self._normalized_reference(query.reference)
+                rows = list(
+                    connection.execute(
+                        _LOCATION_RESOLUTION_SQL,
+                        {
+                            "reference": self._escaped_search(normalized),
+                            "normalized_reference": normalized,
+                            "row_limit": query.candidate_limit + 1,
+                        },
+                    ).mappings()
+                )
+            candidates = tuple(
+                LocationCandidate(
+                    external_location_id=row["external_location_id"],
+                    label=row["label"],
+                    location_type=self._canonical_location_type(
+                        row["source_location_type"]
+                    ),
+                )
+                for row in rows[: query.candidate_limit]
+            )
+            metadata = self._metadata(
+                source,
+                row_count=len(candidates),
+                requested_limit=query.candidate_limit,
+                is_truncated=len(rows) > query.candidate_limit,
+            )
+            if not candidates:
+                return LocationResolution(status="not_found", metadata=metadata)
+            if len(rows) == 1:
+                return LocationResolution(
+                    status="resolved", location=candidates[0], metadata=metadata
+                )
+            return LocationResolution(
+                status="ambiguous", candidates=candidates, metadata=metadata
+            )
+        except (SQLAlchemyError, RuntimeError) as exc:
+            self._raise_safe_database_error(exc)
+        except ValidationError, KeyError, TypeError, ArithmeticError:
+            raise OperationalDataInvalid(
+                "Operational source data is invalid."
+            ) from None
+
+    def list_locations(self, *, limit: int) -> tuple[LocationCandidate, ...]:
+        if not 1 <= limit <= 100:
+            raise ValueError("Location candidate limit is outside the safe bound.")
+        try:
+            with self._engine.connect() as connection:
+                self._prepare_read(connection)
+                rows = connection.execute(
+                    _LOCATION_CANDIDATES_SQL, {"row_limit": limit}
+                ).mappings()
+                return tuple(
+                    LocationCandidate(
+                        external_location_id=row["external_location_id"],
+                        label=row["label"],
+                        location_type=self._canonical_location_type(
+                            row["source_location_type"]
+                        ),
+                    )
+                    for row in rows
+                )
         except (SQLAlchemyError, RuntimeError) as exc:
             self._raise_safe_database_error(exc)
         except ValidationError, KeyError, TypeError, ArithmeticError:
@@ -527,6 +826,7 @@ class PostgreSQLOperationalAdapter:
                 refund_amount=refund_amount,
                 net_revenue=gross_revenue - refund_amount,
                 currency=source["currency_code"],
+                metric=query.metric,
                 metadata=self._metadata(source, row_count=1),
             )
         except (SQLAlchemyError, RuntimeError) as exc:
@@ -667,8 +967,13 @@ class PostgreSQLOperationalAdapter:
                 _INVENTORY_SQL,
                 {
                     "external_product_id": query.external_product_id,
+                    "category_filter": query.category_filter,
                     "branch_code": query.branch_external_id,
                     "warehouse_code": query.warehouse_external_id,
+                    "branch_location_types": list(self._branch_source_location_types),
+                    "warehouse_location_types": list(
+                        self._warehouse_source_location_types
+                    ),
                     "restock_only": restock_only,
                     "row_limit": query.limit + 1,
                 },
@@ -740,11 +1045,10 @@ class PostgreSQLOperationalAdapter:
             metadata=metadata,
         )
 
-    @classmethod
-    def _normalize_inventory(cls, row: Mapping[str, Any]) -> InventoryItem:
-        is_branch = row["location_type"] == "BRANCH"
+    def _normalize_inventory(self, row: Mapping[str, Any]) -> InventoryItem:
+        is_branch = self._canonical_location_type(row["location_type"]) == "branch"
         return InventoryItem(
-            product=cls._normalize_product(row),
+            product=self._normalize_product(row),
             branch_external_id=row["location_code"] if is_branch else None,
             branch_name=row["location_label"] if is_branch else None,
             warehouse_external_id=row["location_code"] if not is_branch else None,
@@ -755,6 +1059,36 @@ class PostgreSQLOperationalAdapter:
             reorder_point=row["reorder_point"],
             target_stock=row["target_stock"],
         )
+
+    @staticmethod
+    def _validated_location_type_mapping(
+        mapping: Mapping[str, tuple[str, ...]] | None,
+    ) -> dict[str, str]:
+        if mapping is None:
+            from app.integrations.profiles import FAKE_STORE_MAPPING
+
+            mapping = FAKE_STORE_MAPPING.source_location_types
+        if set(mapping) != {"branch", "warehouse"}:
+            raise ValueError("Location type mapping is incomplete.")
+        normalized: dict[str, str] = {}
+        for canonical_type, source_types in mapping.items():
+            if not source_types:
+                raise ValueError("Location type mapping is incomplete.")
+            for source_type in source_types:
+                if not isinstance(source_type, str) or not source_type.strip():
+                    raise ValueError("Location type mapping is invalid.")
+                if source_type in normalized:
+                    raise ValueError("Location type mapping conflicts.")
+                normalized[source_type] = canonical_type
+        return normalized
+
+    def _canonical_location_type(self, source_type: object) -> str:
+        if not isinstance(source_type, str):
+            raise OperationalDataInvalid("Operational source data is invalid.")
+        canonical_type = self._source_location_types.get(source_type)
+        if canonical_type is None:
+            raise OperationalDataInvalid("Operational source data is invalid.")
+        return canonical_type
 
     @staticmethod
     def _escaped_search(value: str | None) -> str | None:
@@ -812,13 +1146,18 @@ class PostgreSQLOperationalAdapter:
         )
 
 
-def create_fake_store_adapter(settings: Settings) -> PostgreSQLOperationalAdapter:
+def create_fake_store_adapter(
+    settings: Settings,
+    *,
+    location_type_mapping: Mapping[str, tuple[str, ...]] | None = None,
+) -> PostgreSQLOperationalAdapter:
     """Build the configured adapter without exposing its secret connection URL."""
     return PostgreSQLOperationalAdapter(
         settings.fake_store_database_url,
         connect_timeout_seconds=settings.postgresql_connect_timeout_seconds,
         query_timeout_seconds=settings.operational_query_timeout_seconds,
         max_reporting_days=settings.operational_max_reporting_days,
+        location_type_mapping=location_type_mapping,
     )
 
 

@@ -134,6 +134,8 @@ class Settings(BaseSettings):
     trusted_https_termination: bool = False
     log_level: str = "INFO"
     owner_chat_provider: Literal["mock", "ollama", "gemini"] = "mock"
+    development_owner_chat_minute_limit: int | None = Field(default=None, ge=3, le=120)
+    development_owner_chat_hour_limit: int | None = Field(default=None, ge=20, le=2000)
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_chat_model: str = "qwen2.5:7b"
     gemini_chat_model: str = "gemini-3-flash-preview"
@@ -180,6 +182,8 @@ class Settings(BaseSettings):
     customer_business_hourly_limit: int = Field(default=120, ge=1, le=2000)
     whatsapp_outbound_max_attempts: int = Field(default=3, ge=1, le=3)
     whatsapp_request_timeout_seconds: int = Field(default=15, ge=1, le=30)
+    whatsapp_remote_validation_enabled: bool = False
+    whatsapp_profiles_json: str = "{}"
     auth_event_retention_hours: int = Field(
         default=24,
         ge=AUTH_EVENT_MINIMUM_RETENTION_HOURS,
@@ -295,6 +299,13 @@ class Settings(BaseSettings):
             or not self.gemini_api_key.get_secret_value().strip()
         ):
             raise ValueError("GEMINI_API_KEY is required when using Gemini.")
+        if (
+            self.development_owner_chat_minute_limit is not None
+            or self.development_owner_chat_hour_limit is not None
+        ) and self.environment.casefold() != "development":
+            raise ValueError(
+                "Owner-chat limit overrides require ENVIRONMENT=development."
+            )
         if self.environment.lower() != "production":
             if self.hsts_enabled:
                 raise ValueError("HSTS is enabled only in production.")
@@ -305,6 +316,18 @@ class Settings(BaseSettings):
             raise ValueError("ACCESS_TOKEN_SECRET must be changed in production.")
         if not self.refresh_cookie_secure:
             raise ValueError("REFRESH_COOKIE_SECURE must be true in production.")
+        if not self.whatsapp_remote_validation_enabled and any(
+            value is not None
+            for value in (
+                self.whatsapp_access_token,
+                self.meta_app_secret,
+                self.whatsapp_webhook_verify_token,
+                self.whatsapp_phone_number_id,
+            )
+        ):
+            raise ValueError(
+                "WHATSAPP_REMOTE_VALIDATION_ENABLED must be true in production."
+            )
         if (
             self.resend_api_key is None
             or not self.resend_api_key.get_secret_value()

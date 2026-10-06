@@ -53,6 +53,7 @@ class ChannelProfile:
     phone_number_id: str
     graph_api_version: str
     request_timeout_seconds: int
+    remote_validation_enabled: bool = False
 
 
 @dataclass(frozen=True)

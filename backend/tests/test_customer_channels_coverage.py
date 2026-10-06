@@ -6,11 +6,12 @@ import hashlib
 import json
 import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from app.agent.owner_chat_provider import (
     DeterministicMockOwnerChatProvider,
+    OwnerChatProviderError,
     OwnerChatRequest,
     OwnerChatResult,
     TokenUsage,
@@ -23,6 +24,7 @@ from app.channels.contracts import (
 from app.core.config import Settings, get_settings
 from app.database.models import (
     AIUsageReservation,
+    BusinessAIUsageDaily,
     BusinessKnowledge,
     CustomerConversation,
     CustomerMessage,
@@ -35,6 +37,7 @@ from app.services import customer_messaging
 from app.worker import customer_messages
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from tests.test_business_api import headers
@@ -313,6 +316,128 @@ def test_prompt_injection_gets_static_reply_no_ai_usage(
 # ---------------------------------------------------------------------------
 # 4. Multi-language casual greeting → AI processes (no static reply)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("question", ["توصيل", "السعر", "قديش", "بكرا", "العنوان"])
+def test_existing_arabic_business_question_literals_match(question: str) -> None:
+    assert customer_messages.BUSINESS_QUESTION_PATTERN.search(question)
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("missing", "عذراً، هيدا المعلومة مش متوفرة حالياً."),
+        ("handoff", "أكيد، تم تحويل المحادثة لفريق العمل. سيردّ عليك شخص قريباً."),
+        ("private", "عذراً، ما فيني شارك معلومات تشغيلية أو خاصة عبر محادثة العملاء."),
+        ("injection", "عذراً، ما فيني اتبع هالطلب أو اكشف تعليمات داخلية."),
+    ],
+)
+def test_arabic_static_replies_are_readable(kind: str, expected: str) -> None:
+    assert customer_messages._static_reply("مرحبا", kind) == expected
+
+
+@pytest.mark.parametrize(
+    ("reported_usage", "provider_error"),
+    [(True, False), (False, False), (True, True), (False, True)],
+)
+def test_rejected_customer_output_charges_consumption_once(
+    reported_usage: bool,
+    provider_error: bool,
+    api_client: TestClient,
+    db_session: Session,
+    migration_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app.dependency_overrides[get_settings] = channel_settings
+    business = _active_channel(api_client, db_session)
+    monkeypatch.setattr(customer_messaging, "_queue_inbound", lambda *_: None)
+    monkeypatch.setattr(customer_messages, "enqueue_outbound_message", lambda *_: None)
+
+    class InvalidOutputProvider(DeterministicMockOwnerChatProvider):
+        calls = 0
+
+        def estimate_input_tokens(self, request: OwnerChatRequest) -> int:
+            return 100
+
+        def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
+            self.calls += 1
+            if provider_error:
+                raise OwnerChatProviderError(
+                    usage=TokenUsage(100, 10, 110, True) if reported_usage else None
+                )
+            return OwnerChatResult(
+                reply="",
+                usage=TokenUsage(100, 10, 110, True) if reported_usage else None,
+            )
+
+    provider = InvalidOutputProvider()
+    message = _process(
+        db_session,
+        api_client,
+        business,
+        message_id_str="wamid.rejected-output",
+        text_content="Hello",
+        provider=provider,
+    )
+    assert message is not None
+    assert message.failure_code == (
+        "customer.provider_failure" if provider_error else "customer.generation_failed"
+    )
+    expected_charge = (
+        110
+        if reported_usage
+        else 100 + channel_settings().customer_chat_max_output_tokens
+    )
+    for _ in range(2):
+        customer_messages.process_inbound_message(
+            str(message.id), provider=provider, settings_override=channel_settings()
+        )
+        with Session(migration_engine) as audit:
+            reservation = audit.scalar(select(AIUsageReservation))
+            usage = audit.scalar(select(BusinessAIUsageDaily))
+            assert reservation is not None and usage is not None
+            assert reservation.status != "released"
+            assert reservation.total_tokens == expected_charge
+            assert usage.total_tokens_used == expected_charge
+            assert usage.tokens_reserved == 0
+    assert provider.calls == 1
+
+
+def test_arabic_delivery_without_evidence_returns_fallback_without_generation(
+    api_client: TestClient,
+    db_session: Session,
+    migration_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = channel_settings()
+    app.dependency_overrides[get_settings] = lambda: settings
+    business = _active_channel(api_client, db_session)
+    monkeypatch.setattr(customer_messaging, "_queue_inbound", lambda *_: None)
+    monkeypatch.setattr(
+        customer_messages, "enqueue_outbound_message", lambda *_a, **_kw: None
+    )
+
+    class NoGenerationProvider(DeterministicMockOwnerChatProvider):
+        def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
+            pytest.fail("Missing delivery evidence must not reach generation")
+
+    message = _process(
+        db_session,
+        api_client,
+        business,
+        message_id_str="wamid.arabic-missing-delivery",
+        text_content="توصيل",
+        provider=NoGenerationProvider(),
+    )
+    assert message is not None
+    assert message.status == CustomerMessageStatus.COMPLETED
+    reply = db_session.scalar(
+        select(CustomerMessage).where(CustomerMessage.reply_to_message_id == message.id)
+    )
+    assert reply is not None
+    assert reply.content == "عذراً، هيدا المعلومة مش متوفرة حالياً."
+    with Session(migration_engine) as audit:
+        assert audit.scalar(select(AIUsageReservation.id)) is None
 
 
 @pytest.mark.parametrize(
@@ -1040,3 +1165,76 @@ def test_management_validate_fails_with_blank_access_token() -> None:
     # management resolution (require_outbound=True) must fail
     with pytest.raises(ChannelProfileUnavailable):
         registry.resolve("meta_whatsapp_cloud")
+
+
+def test_expired_customer_generation_retains_unknown_consumption_once(
+    api_client: TestClient,
+    db_session: Session,
+    migration_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app.dependency_overrides[get_settings] = channel_settings
+    business = _active_channel(api_client, db_session)
+    monkeypatch.setattr(customer_messaging, "_queue_inbound", lambda *_: None)
+
+    class InterruptedProvider(DeterministicMockOwnerChatProvider):
+        def estimate_input_tokens(self, request: OwnerChatRequest) -> int:
+            return 100
+
+        def generate(self, request: OwnerChatRequest) -> OwnerChatResult:
+            raise SystemExit("Simulated worker interruption after dispatch")
+
+    with pytest.raises(SystemExit):
+        _process(
+            db_session,
+            api_client,
+            business,
+            message_id_str="wamid.interrupted",
+            text_content="Hello",
+            provider=InterruptedProvider(),
+        )
+    message = db_session.scalar(
+        select(CustomerMessage).where(
+            CustomerMessage.provider_message_id == "wamid.interrupted"
+        )
+    )
+    assert message is not None
+    with pytest.raises(DBAPIError, match="Customer claim is not expired"):
+        db_session.execute(
+            text("SELECT public.sou2ai_recover_customer_usage(:message_id)"),
+            {"message_id": message.id},
+        )
+    db_session.rollback()
+    message.claim_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    db_session.commit()
+    assert (
+        customer_messages.recover_expired_customer_message_claims(channel_settings())
+        == 1
+    )
+    assert (
+        customer_messages.recover_expired_customer_message_claims(channel_settings())
+        == 0
+    )
+    with Session(migration_engine) as audit:
+        function = audit.execute(
+            text(
+                "SELECT pg_get_userbyid(proowner), prosecdef, proconfig, "
+                "has_table_privilege('sou2ai_runtime', "
+                "'public.ai_usage_reservations', 'SELECT') "
+                "FROM pg_proc WHERE oid = "
+                "'public.sou2ai_recover_customer_usage(uuid)'::regprocedure"
+            )
+        ).one()
+        assert function[0] == "sou2ai_migrator"
+        assert function[1] is True
+        assert function[2] == ["search_path=pg_catalog"]
+        assert function[3] is False
+        reservation = audit.scalar(select(AIUsageReservation))
+        usage = audit.scalar(select(BusinessAIUsageDaily))
+        assert reservation is not None and usage is not None
+        assert reservation.status == "charged"
+        assert (
+            usage.total_tokens_used
+            == 100 + channel_settings().customer_chat_max_output_tokens
+        )
+        assert usage.tokens_reserved == 0

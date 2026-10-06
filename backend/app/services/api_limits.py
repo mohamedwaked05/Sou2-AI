@@ -7,6 +7,7 @@ from fastapi import status
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.core.config import Settings
 from app.core.exceptions import ApplicationError
 
 
@@ -56,17 +57,38 @@ def admit_owner_chat_generation(
     business_id: uuid.UUID,
     owner_message_id: uuid.UUID,
     generation_attempt: int,
+    settings: Settings | None = None,
 ) -> None:
     """Serialize owner-generation admission across replicas in PostgreSQL."""
+    development_override = (
+        settings is not None
+        and settings.environment.casefold() == "development"
+        and (
+            settings.development_owner_chat_minute_limit is not None
+            or settings.development_owner_chat_hour_limit is not None
+        )
+    )
+    function = (
+        "sou2ai_admit_development_owner_chat_generation"
+        if development_override
+        else "sou2ai_admit_owner_chat_generation"
+    )
+    limit_parameters = ", :minute_limit, :hour_limit" if development_override else ""
     row = session.execute(
         text(
-            "SELECT * FROM public.sou2ai_admit_owner_chat_generation("
-            ":business_id, :message_id, :generation_attempt)"
+            f"SELECT * FROM public.{function}("
+            f":business_id, :message_id, :generation_attempt{limit_parameters})"
         ),
         {
             "business_id": business_id,
             "message_id": owner_message_id,
             "generation_attempt": generation_attempt,
+            "minute_limit": (settings.development_owner_chat_minute_limit or 3)
+            if development_override
+            else 3,
+            "hour_limit": (settings.development_owner_chat_hour_limit or 20)
+            if development_override
+            else 20,
         },
     ).one()
     if not row.admitted:

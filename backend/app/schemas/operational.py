@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import date
 from decimal import Decimal
 from typing import Literal
@@ -20,6 +21,14 @@ MAX_OPERATIONAL_ROWS = 100
 MAX_BEST_SELLER_ROWS = 50
 MAX_REPORTING_DAYS = 366
 MAX_PRODUCT_RESOLUTION_CANDIDATES = 5
+
+OperationalMetric = Literal[
+    "revenue",
+    "gross_profit",
+    "net_profit",
+    "sales_count",
+    "inventory_value",
+]
 
 
 def _validate_source_timezone(value: str) -> str:
@@ -55,6 +64,7 @@ class Product(OperationalContract):
 
 
 ProductResolutionStatus = Literal["resolved", "ambiguous", "not_found"]
+LocationType = Literal["branch", "warehouse"]
 ProductMatchType = Literal[
     "internal_id",
     "external_id",
@@ -84,6 +94,31 @@ class ProductResolutionCandidate(OperationalContract):
         if not normalized:
             raise ValueError("Product candidate fields cannot be blank.")
         return normalized
+
+
+class LocationCandidate(OperationalContract):
+    external_location_id: str = Field(min_length=1, max_length=128)
+    label: str = Field(min_length=1, max_length=255)
+    location_type: LocationType
+
+
+class LocationResolution(OperationalContract):
+    status: ProductResolutionStatus
+    location: LocationCandidate | None = None
+    candidates: tuple[LocationCandidate, ...] = ()
+    metadata: OperationalResultMetadata
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> LocationResolution:
+        if self.status == "resolved":
+            if self.location is None or self.candidates:
+                raise ValueError("Resolved locations require exactly one location.")
+        elif self.status == "ambiguous":
+            if self.location is not None or not self.candidates:
+                raise ValueError("Ambiguous locations require candidates.")
+        elif self.location is not None or self.candidates:
+            raise ValueError("Not-found locations cannot include candidates.")
+        return self
 
 
 class InventoryItem(OperationalContract):
@@ -120,6 +155,19 @@ class InventoryItem(OperationalContract):
         if self.target_stock < self.reorder_point:
             raise ValueError("Target stock cannot be below the reorder point.")
         return self
+
+
+class LocationResolutionQuery(OperationalContract):
+    reference: str = Field(min_length=1, max_length=255)
+    candidate_limit: int = Field(default=5, ge=1, le=5)
+
+    @field_validator("reference")
+    @classmethod
+    def normalize_reference(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("Location reference cannot be blank.")
+        return normalized
 
 
 class ReportingPeriod(OperationalContract):
@@ -181,10 +229,37 @@ class ProductResolution(OperationalContract):
         return self
 
 
+class CategoryCandidate(OperationalContract):
+    external_category_id: str = Field(min_length=1, max_length=128)
+    label: str = Field(min_length=1, max_length=255)
+
+
+class CategoryResolution(OperationalContract):
+    status: ProductResolutionStatus
+    category: CategoryCandidate | None = None
+    candidates: tuple[CategoryCandidate, ...] = Field(default=(), max_length=5)
+    metadata: OperationalResultMetadata
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> CategoryResolution:
+        if self.status == "resolved" and (self.category is None or self.candidates):
+            raise ValueError("Resolved categories require exactly one category.")
+        if self.status == "ambiguous" and (
+            self.category is not None or len(self.candidates) < 2
+        ):
+            raise ValueError("Ambiguous categories require candidates.")
+        if self.status == "not_found" and (
+            self.category is not None or self.candidates
+        ):
+            raise ValueError("Not-found categories cannot contain matches.")
+        return self
+
+
 class InventoryResult(OperationalContract):
     items: tuple[InventoryItem, ...]
     metadata: OperationalResultMetadata
     resolution: ProductResolution | None = None
+    category_resolution: CategoryResolution | None = None
 
 
 class SalesSummary(OperationalContract):
@@ -200,6 +275,9 @@ class SalesSummary(OperationalContract):
     refund_amount: Decimal = Field(ge=0)
     net_revenue: Decimal
     currency: str = Field(pattern=r"^[A-Z]{3}$")
+    metric: OperationalMetric = "revenue"
+    gross_profit: Decimal | None = None
+    net_profit: Decimal | None = None
     metadata: OperationalResultMetadata
 
     @model_validator(mode="after")
@@ -208,7 +286,26 @@ class SalesSummary(OperationalContract):
             raise ValueError("Net quantity must equal sold quantity minus returns.")
         if self.net_revenue != self.gross_revenue - self.refund_amount:
             raise ValueError("Net revenue must equal gross revenue minus refunds.")
+        if self.metric == "gross_profit" and self.gross_profit is None:
+            raise ValueError("Gross-profit results require mapped cost data.")
+        if self.metric == "net_profit" and self.net_profit is None:
+            raise ValueError("Net-profit results require mapped expense data.")
         return self
+
+
+MetricCapabilityStatus = Literal["supported", "unsupported"]
+
+
+class MetricCapabilityResult(OperationalContract):
+    """Safe capability facts returned when a requested metric cannot run."""
+
+    capability: Literal["financial_metric"] = "financial_metric"
+    requested_metric: OperationalMetric
+    status: MetricCapabilityStatus
+    missing_inputs: tuple[Literal["cost_cogs", "expenses", "valuation_basis"], ...] = ()
+    supported_metrics: tuple[OperationalMetric, ...] = ()
+    period: ReportingPeriod
+    branch_external_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class BestSellingProduct(OperationalContract):
@@ -245,6 +342,7 @@ class RestockingRecommendationsResult(OperationalContract):
     items: tuple[RestockingRecommendation, ...]
     metadata: OperationalResultMetadata
     resolution: ProductResolution | None = None
+    category_resolution: CategoryResolution | None = None
 
 
 class IntegrationHealth(OperationalContract):
@@ -285,13 +383,27 @@ class InventoryQuery(OperationalContract):
             "product ID, SKU, barcode, name, or approved alias."
         ),
     )
+    category_filter: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description=(
+            "Category label resolved by the connected source. This is not an "
+            "application-maintained category or synonym list."
+        ),
+    )
     branch_external_id: str | None = Field(default=None, min_length=1, max_length=128)
     warehouse_external_id: str | None = Field(
         default=None, min_length=1, max_length=128
     )
     limit: int = Field(default=50, ge=1, le=MAX_OPERATIONAL_ROWS)
 
-    @field_validator("product_filter", "branch_external_id", "warehouse_external_id")
+    @field_validator(
+        "product_filter",
+        "category_filter",
+        "branch_external_id",
+        "warehouse_external_id",
+    )
     @classmethod
     def strip_filter(cls, value: str | None) -> str | None:
         if value is None:
@@ -305,6 +417,35 @@ class InventoryQuery(OperationalContract):
     def validate_location_filter(self) -> InventoryQuery:
         if self.branch_external_id and self.warehouse_external_id:
             raise ValueError("Filter by a branch or a warehouse, not both.")
+        return self
+
+
+class PendingInventoryClarification(OperationalContract):
+    """Backend-only context, never provider-created executable arguments."""
+
+    operation: Literal["current_inventory"] = "current_inventory"
+    user_id: uuid.UUID
+    source_id: uuid.UUID
+    source_updated_at: AwareDatetime
+    expires_at: AwareDatetime
+    arguments: InventoryQuery
+    candidates: tuple[ProductResolutionCandidate, ...] = Field(
+        default=(), max_length=MAX_PRODUCT_RESOLUTION_CANDIDATES
+    )
+    category_candidates: tuple[CategoryCandidate, ...] = Field(
+        default=(), max_length=MAX_PRODUCT_RESOLUTION_CANDIDATES
+    )
+    location_candidates: tuple[LocationCandidate, ...] = Field(default=(), max_length=5)
+    location_reference: str | None = Field(default=None, min_length=1, max_length=255)
+    owner_request: str | None = Field(default=None, min_length=1, max_length=14_000)
+
+    @model_validator(mode="after")
+    def validate_choice(self) -> PendingInventoryClarification:
+        groups = (self.candidates, self.category_candidates, self.location_candidates)
+        if sum(bool(group) for group in groups) != 1 or max(map(len, groups)) < 2:
+            raise ValueError(
+                "An inventory clarification requires one ambiguous candidate set."
+            )
         return self
 
 
@@ -329,6 +470,7 @@ class InventoryReadQuery(OperationalContract):
     """Trusted adapter query containing only an exact resolved product ID."""
 
     external_product_id: str | None = Field(default=None, min_length=1, max_length=128)
+    category_filter: str | None = Field(default=None, min_length=1, max_length=128)
     branch_external_id: str | None = Field(default=None, min_length=1, max_length=128)
     warehouse_external_id: str | None = Field(
         default=None, min_length=1, max_length=128
@@ -336,7 +478,10 @@ class InventoryReadQuery(OperationalContract):
     limit: int = Field(default=50, ge=1, le=MAX_OPERATIONAL_ROWS)
 
     @field_validator(
-        "external_product_id", "branch_external_id", "warehouse_external_id"
+        "external_product_id",
+        "category_filter",
+        "branch_external_id",
+        "warehouse_external_id",
     )
     @classmethod
     def strip_filter(cls, value: str | None) -> str | None:
@@ -358,6 +503,13 @@ class SalesQuery(OperationalContract):
     start_date: date
     end_date: date
     branch_external_id: str | None = Field(default=None, min_length=1, max_length=128)
+    metric: OperationalMetric = Field(
+        default="revenue",
+        description=(
+            "Requested financial measure. Profit measures require mapped cost "
+            "or expense data and must never be inferred from revenue."
+        ),
+    )
 
     @field_validator("branch_external_id")
     @classmethod

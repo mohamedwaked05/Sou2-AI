@@ -23,7 +23,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import ENUM, UUID
+from sqlalchemy.dialects.postgresql import ENUM, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.database.base import Base
@@ -1367,6 +1367,7 @@ class OwnerChatMessage(Base):
     conversation: Mapped[OwnerConversation] = relationship(
         back_populates="messages", foreign_keys=[conversation_id]
     )
+    operational_clarification: Mapped[dict[str, object] | None] = mapped_column(JSONB)
     reply_to_message: Mapped[OwnerChatMessage | None] = relationship(
         remote_side=[id], foreign_keys=[reply_to_message_id]
     )
@@ -1646,6 +1647,169 @@ class OperationalDataSourceConfig(Base):
         return " ".join(value.split())
 
 
+class UserOperationalPreference(Base):
+    """One validated user default for a capability on a connected source."""
+
+    __tablename__ = "user_operational_preferences"
+    __table_args__ = (
+        CheckConstraint(
+            "preference_key = 'default_inventory_location'",
+            name="ck_user_operational_preference_key",
+        ),
+        CheckConstraint(
+            "location_type IN ('branch', 'warehouse')",
+            name="ck_user_operational_preference_location_type",
+        ),
+        UniqueConstraint(
+            "user_id",
+            "business_id",
+            "source_id",
+            "preference_key",
+            name="uq_user_operational_preference_scope",
+        ),
+        ForeignKeyConstraint(
+            ["source_id", "business_id"],
+            ["operational_data_sources.id", "operational_data_sources.business_id"],
+            ondelete="CASCADE",
+            name="fk_user_operational_preference_source_scope",
+        ),
+        Index(
+            "ix_user_operational_preferences_lookup",
+            "user_id",
+            "business_id",
+            "preference_key",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    preference_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    location_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    location_external_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class PendingOwnerOperationalPreference(Base):
+    """One resumable, source-bounded preference clarification for an owner chat."""
+
+    __tablename__ = "pending_owner_operational_preferences"
+    __table_args__ = (
+        CheckConstraint(
+            "operation = 'set_preference'",
+            name="ck_pending_owner_preference_operation",
+        ),
+        CheckConstraint(
+            "preference_key = 'default_inventory_location'",
+            name="ck_pending_owner_preference_key",
+        ),
+        CheckConstraint(
+            "expected_field = 'location'",
+            name="ck_pending_owner_preference_expected_field",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'completed', 'superseded', 'expired', 'invalidated')",
+            name="ck_pending_owner_preference_state",
+        ),
+        CheckConstraint(
+            "version > 0",
+            name="ck_pending_owner_preference_version",
+        ),
+        CheckConstraint(
+            "expires_at > created_at",
+            name="ck_pending_owner_preference_expiry",
+        ),
+        ForeignKeyConstraint(
+            ["source_id", "business_id"],
+            ["operational_data_sources.id", "operational_data_sources.business_id"],
+            ondelete="CASCADE",
+            name="fk_pending_owner_preference_source_scope",
+        ),
+        ForeignKeyConstraint(
+            ["conversation_id", "business_id"],
+            ["owner_conversations.id", "owner_conversations.business_id"],
+            ondelete="CASCADE",
+            name="fk_pending_owner_preference_conversation_scope",
+        ),
+        ForeignKeyConstraint(
+            ["conversation_id", "originating_message_id"],
+            ["owner_chat_messages.conversation_id", "owner_chat_messages.id"],
+            ondelete="CASCADE",
+            name="fk_pending_owner_preference_originating_message",
+        ),
+        Index(
+            "uq_pending_owner_preference_active_scope",
+            "user_id",
+            "business_id",
+            "source_id",
+            "conversation_id",
+            "preference_key",
+            unique=True,
+            postgresql_where=text("state = 'pending'"),
+        ),
+        Index(
+            "ix_pending_owner_preference_lookup",
+            "user_id",
+            "business_id",
+            "conversation_id",
+            "state",
+            "expires_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False
+    )
+    source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False
+    )
+    originating_message_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False
+    )
+    operation: Mapped[str] = mapped_column(String(32), nullable=False)
+    preference_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    expected_field: Mapped[str] = mapped_column(String(32), nullable=False)
+    candidate_references: Mapped[list[dict[str, str]]] = mapped_column(
+        JSONB, nullable=False
+    )
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class MessagingChannelConnection(Base):
     """Tenant-owned, non-secret configuration for an external channel."""
 
@@ -1653,7 +1817,7 @@ class MessagingChannelConnection(Base):
     __table_args__ = (
         CheckConstraint("provider_type = 'meta_whatsapp'", name="ck_channel_provider"),
         CheckConstraint(
-            "connection_profile_key = 'meta_whatsapp_cloud'",
+            "connection_profile_key ~ '^[a-z][a-z0-9_]*$'",
             name="ck_channel_profile",
         ),
         CheckConstraint(
@@ -1668,6 +1832,18 @@ class MessagingChannelConnection(Base):
             "failure_code IS NULL OR (char_length(failure_code) BETWEEN 1 AND 100 "
             "AND failure_code ~ '^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)*$')",
             name="ck_channel_failure_code",
+        ),
+        CheckConstraint(
+            "(status = 'CONFIGURED' AND external_phone_number_id IS NULL "
+            "AND last_validated_at IS NULL AND last_successful_health_check_at IS NULL "
+            "AND failure_code IS NULL AND NOT auto_reply_enabled) OR "
+            "(status IN ('VALIDATED','ACTIVE') AND external_phone_number_id IS NOT NULL "
+            "AND last_validated_at IS NOT NULL AND last_successful_health_check_at IS NOT NULL "
+            "AND failure_code IS NULL) OR "
+            "(status = 'UNHEALTHY' AND last_validated_at IS NOT NULL "
+            "AND failure_code IS NOT NULL AND NOT auto_reply_enabled) OR "
+            "(status = 'DISABLED' AND failure_code IS NULL AND NOT auto_reply_enabled)",
+            name="ck_channel_lifecycle",
         ),
         UniqueConstraint("id", "business_id", name="uq_channel_id_business"),
         UniqueConstraint(
@@ -1831,13 +2007,38 @@ class CustomerMessage(Base):
             "send_attempts BETWEEN 0 AND 3", name="ck_customer_send_attempts"
         ),
         CheckConstraint(
+            "(direction = 'inbound' AND sender = 'customer' "
+            "AND provider_message_id IS NOT NULL AND status IN "
+            "('RECEIVED','PROCESSING','COMPLETED','FAILED')) OR "
+            "(direction = 'outbound' AND sender IN ('ai','owner') AND status IN "
+            "('PENDING_SEND','SENDING','SENT','DELIVERED','READ','FAILED'))",
+            name="ck_customer_message_semantics",
+        ),
+        CheckConstraint(
             "failure_code IS NULL OR failure_code ~ '^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)*$'",
             name="ck_customer_message_failure_code",
         ),
         UniqueConstraint("provider_message_id", name="uq_customer_provider_message"),
         UniqueConstraint("reply_to_message_id", name="uq_customer_reply_once"),
+        UniqueConstraint(
+            "id", "business_id", name="uq_customer_message_business_scope"
+        ),
+        UniqueConstraint(
+            "id", "conversation_id", "business_id", name="uq_customer_message_scope"
+        ),
+        ForeignKeyConstraint(
+            ["reply_to_message_id", "conversation_id", "business_id"],
+            [
+                "customer_messages.id",
+                "customer_messages.conversation_id",
+                "customer_messages.business_id",
+            ],
+            name="fk_customer_message_reply_scope",
+            ondelete="SET NULL",
+        ),
         Index("ix_customer_messages_history", "conversation_id", "created_at", "id"),
         Index("ix_customer_messages_outbox", "status", "next_attempt_at", "id"),
+        Index("ix_customer_messages_claims", "status", "claim_expires_at", "id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1861,6 +2062,7 @@ class CustomerMessage(Base):
         Integer, nullable=False, default=0, server_default=text("0")
     )
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failure_code: Mapped[str | None] = mapped_column(String(100))
     provider_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -1885,8 +2087,26 @@ class InboundWebhookDelivery(Base):
             "status IN ('QUEUED','PROCESSED','IGNORED','FAILED')",
             name="ck_webhook_delivery_status",
         ),
+        CheckConstraint(
+            "event_kind IN ('message','status')", name="ck_webhook_delivery_kind"
+        ),
         UniqueConstraint("provider_event_id", name="uq_webhook_provider_event"),
         Index("ix_webhook_connection_received", "connection_id", "received_at", "id"),
+        ForeignKeyConstraint(
+            ["connection_id", "business_id"],
+            [
+                "messaging_channel_connections.id",
+                "messaging_channel_connections.business_id",
+            ],
+            name="fk_webhook_connection_scope",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["customer_message_id", "business_id"],
+            ["customer_messages.id", "customer_messages.business_id"],
+            name="fk_webhook_message_scope",
+            ondelete="SET NULL",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1920,6 +2140,22 @@ class CustomerGenerationRateEvent(Base):
         UniqueConstraint("customer_message_id", name="uq_customer_rate_message"),
         Index("ix_customer_rate_business_created", "business_id", "created_at"),
         Index("ix_customer_rate_conversation_created", "conversation_id", "created_at"),
+        ForeignKeyConstraint(
+            ["conversation_id", "business_id"],
+            ["customer_conversations.id", "customer_conversations.business_id"],
+            name="fk_customer_rate_conversation_scope",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["customer_message_id", "conversation_id", "business_id"],
+            [
+                "customer_messages.id",
+                "customer_messages.conversation_id",
+                "customer_messages.business_id",
+            ],
+            name="fk_customer_rate_message_scope",
+            ondelete="CASCADE",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

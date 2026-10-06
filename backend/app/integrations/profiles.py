@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from app.core.config import Settings, get_settings
 from app.integrations.operational import OperationalDataSource
@@ -15,6 +16,7 @@ FAKE_STORE_CONNECTION_PROFILE = "fake_store_postgresql"
 FAKE_STORE_MAPPING_PROFILE = "fake_store_minimarket"
 FAKE_STORE_MAPPING_VERSION = 1
 POSTGRESQL_READONLY_ADAPTER = "postgresql_readonly"
+CanonicalLocationType = Literal["branch", "warehouse"]
 
 OPERATIONAL_CAPABILITIES = (
     "products",
@@ -46,6 +48,8 @@ class OperationalMappingProfile:
     currency: str
     source_timezone: str
     required_capabilities: tuple[str, ...]
+    source_location_types: Mapping[CanonicalLocationType, tuple[str, ...]]
+    supported_metrics: tuple[str, ...] = ("revenue", "sales_count")
 
     def validate_definition(self) -> None:
         required_text = (
@@ -72,8 +76,33 @@ class OperationalMappingProfile:
             raise MappingProfileError(
                 "Operational reservation semantics are incomplete."
             )
+        if not self.supported_metrics or not set(self.supported_metrics) <= {
+            "revenue",
+            "sales_count",
+            "gross_profit",
+            "net_profit",
+            "inventory_value",
+        }:
+            raise MappingProfileError("Operational metric semantics are incomplete.")
+        supported = set(self.supported_metrics)
+        if "gross_profit" in supported and "revenue" not in supported:
+            raise MappingProfileError("Gross profit requires revenue support.")
+        if "net_profit" in supported and "gross_profit" not in supported:
+            raise MappingProfileError("Net profit requires gross profit support.")
         if set(self.required_capabilities) != set(OPERATIONAL_CAPABILITIES):
             raise MappingProfileError("Operational capability mapping is incomplete.")
+        if set(self.source_location_types) != {"branch", "warehouse"} or any(
+            not values or any(not value.strip() for value in values)
+            for values in self.source_location_types.values()
+        ):
+            raise MappingProfileError(
+                "Operational location type mapping is incomplete."
+            )
+        mapped_values = tuple(
+            value for values in self.source_location_types.values() for value in values
+        )
+        if len({value.casefold() for value in mapped_values}) != len(mapped_values):
+            raise MappingProfileError("Operational location type mapping conflicts.")
 
     def validate_health(self, health: IntegrationHealth) -> None:
         self.validate_definition()
@@ -122,6 +151,10 @@ FAKE_STORE_MAPPING = OperationalMappingProfile(
     currency="LBP",
     source_timezone="Asia/Beirut",
     required_capabilities=OPERATIONAL_CAPABILITIES,
+    source_location_types={
+        "branch": ("BRANCH",),
+        "warehouse": ("WAREHOUSE",),
+    },
 )
 
 FAKE_STORE_PROFILE = ConnectionProfile(
@@ -156,7 +189,9 @@ class EnvironmentConnectionProfileRegistry:
 
     def __init__(self, settings: Settings) -> None:
         FAKE_STORE_MAPPING.validate_definition()
-        self._source = create_fake_store_adapter(settings)
+        self._source = create_fake_store_adapter(
+            settings, location_type_mapping=FAKE_STORE_MAPPING.source_location_types
+        )
 
     def available_profiles(self) -> tuple[ConnectionProfile, ...]:
         return (FAKE_STORE_PROFILE,)

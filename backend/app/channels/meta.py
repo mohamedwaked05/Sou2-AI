@@ -43,6 +43,42 @@ class MetaWhatsAppAdapter:
             )
         ):
             return ChannelHealthResult(False, "channel.profile_incomplete")
+        if not self.profile.remote_validation_enabled:
+            return ChannelHealthResult(True, "channel.remote_validation_disabled")
+        try:
+            with httpx.Client(
+                base_url="https://graph.facebook.com",
+                timeout=self.profile.request_timeout_seconds,
+                transport=self.transport,
+                headers={"Authorization": f"Bearer {self.profile.access_token}"},
+            ) as client:
+                response = client.get(
+                    f"/{self.profile.graph_api_version}/{self.profile.phone_number_id}",
+                    params={"fields": "id"},
+                )
+        except httpx.TimeoutException:
+            return ChannelHealthResult(False, "channel.meta_timeout")
+        except httpx.RequestError:
+            return ChannelHealthResult(False, "channel.meta_transport_failure")
+        if response.status_code in {401, 403}:
+            return ChannelHealthResult(False, "channel.meta_authentication_failed")
+        if response.status_code == 404:
+            return ChannelHealthResult(False, "channel.meta_phone_id_not_found")
+        if response.status_code == 429:
+            return ChannelHealthResult(False, "channel.meta_rate_limited")
+        if response.status_code >= 500:
+            return ChannelHealthResult(False, "channel.meta_server_failure")
+        if response.status_code >= 400:
+            return ChannelHealthResult(False, "channel.meta_request_rejected")
+        try:
+            body = response.json()
+            if (
+                not isinstance(body, dict)
+                or str(body.get("id", "")) != self.profile.phone_number_id
+            ):
+                return ChannelHealthResult(False, "channel.meta_malformed_response")
+        except ValueError, TypeError:
+            return ChannelHealthResult(False, "channel.meta_malformed_response")
         return ChannelHealthResult(True)
 
     def verify_challenge_token(self, supplied_token: str) -> bool:

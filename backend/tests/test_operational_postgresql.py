@@ -12,6 +12,7 @@ from app.integrations.postgresql import PostgreSQLOperationalAdapter
 from app.schemas.operational import (
     BestSellersQuery,
     InventoryReadQuery,
+    LocationResolutionQuery,
     ProductResolutionQuery,
     RestockingReadQuery,
     SalesQuery,
@@ -90,7 +91,7 @@ def test_product_resolution_exact_identifiers_names_and_aliases(
     assert resolution.candidates == ()
 
 
-def test_exact_resolution_precedes_partial_and_partial_codes_do_not_match(
+def test_exact_resolution_precedes_partial_and_partial_codes_match_source_fields(
     operational_adapter: PostgreSQLOperationalAdapter,
 ) -> None:
     exact = operational_adapter.resolve_product(
@@ -104,7 +105,9 @@ def test_exact_resolution_precedes_partial_and_partial_codes_do_not_match(
     assert exact.matched_by == "name"
     assert exact.product is not None
     assert exact.product.external_product_id == "P1007"
-    assert partial_code.status == "not_found"
+    assert partial_code.status == "ambiguous"
+    assert partial_code.matched_by == "partial_name"
+    assert partial_code.candidates
 
 
 def test_partial_product_name_is_ambiguous_with_bounded_safe_candidates(
@@ -125,6 +128,20 @@ def test_partial_product_name_is_ambiguous_with_bounded_safe_candidates(
         <= {"external_product_id", "sku", "barcode", "name"}
         for candidate in resolution.candidates
     )
+
+
+def test_natural_language_product_reference_is_resolved_by_source_tokens(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    resolution = operational_adapter.resolve_product(
+        ProductResolutionQuery(reference="how many pepsi we have left")
+    )
+
+    assert resolution.status == "ambiguous"
+    assert {candidate.name for candidate in resolution.candidates} == {
+        "Pepsi Can 330 ml",
+        "Pepsi Bottle 1.5 L",
+    }
 
 
 def test_unknown_product_is_explicitly_not_found(
@@ -214,6 +231,43 @@ def test_inventory_branch_warehouse_isolation_and_literal_filtering(
     assert {item.warehouse_external_id for item in warehouse.items} == {"WH-BEY"}
 
 
+def test_inventory_stable_branch_id_matches_uppercase_source_type(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    result = operational_adapter.get_current_inventory(
+        InventoryReadQuery(
+            external_product_id="P1004", branch_external_id="BR-JBEIL", limit=5
+        )
+    )
+
+    assert len(result.items) == 1
+    assert result.items[0].branch_external_id == "BR-JBEIL"
+    assert result.items[0].warehouse_external_id is None
+    assert result.items[0].available_quantity == Decimal("50")
+
+
+def test_saved_and_explicit_branch_references_return_identical_inventory(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    """A persisted canonical preference compiles like an explicit location filter."""
+
+    saved_preference_filter = InventoryReadQuery(
+        external_product_id="P1004", branch_external_id="BR-JBEIL", limit=5
+    )
+    explicit_filter = InventoryReadQuery(
+        external_product_id="P1004", branch_external_id="BR-JBEIL", limit=5
+    )
+
+    saved = operational_adapter.get_current_inventory(saved_preference_filter)
+    explicit = operational_adapter.get_current_inventory(explicit_filter)
+
+    assert saved.metadata.row_count == explicit.metadata.row_count == 1
+    assert [item.model_dump() for item in saved.items] == [
+        item.model_dump() for item in explicit.items
+    ]
+    assert saved.items[0].available_quantity == Decimal("50")
+
+
 def test_inventory_limit_is_enforced_and_reports_truncation(
     operational_adapter: PostgreSQLOperationalAdapter,
 ) -> None:
@@ -223,6 +277,92 @@ def test_inventory_limit_is_enforced_and_reports_truncation(
     assert result.metadata.requested_limit == 1
     assert result.metadata.row_count == 1
     assert result.metadata.is_truncated is True
+
+
+def test_category_resolution_and_inventory_filter_use_source_labels(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    resolution = operational_adapter.resolve_category(
+        ProductResolutionQuery(reference="Beverages")
+    )
+
+    assert resolution.status == "resolved"
+    assert resolution.category is not None
+    assert resolution.category.label == "Beverages"
+
+    result = operational_adapter.get_current_inventory(
+        InventoryReadQuery(category_filter=resolution.category.label, limit=100)
+    )
+
+    assert result.items
+    assert {item.product.category for item in result.items} == {"Beverages"}
+
+
+def test_category_candidates_are_bounded_and_source_defined(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    candidates = operational_adapter.list_categories(limit=2)
+
+    assert len(candidates) == 2
+    assert all(candidate.external_category_id for candidate in candidates)
+    assert [candidate.label for candidate in candidates] == sorted(
+        candidate.label for candidate in candidates
+    )
+
+
+def test_category_resolution_reports_ambiguous_source_matches(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    resolution = operational_adapter.resolve_category(
+        ProductResolutionQuery(reference="a")
+    )
+
+    assert resolution.status == "ambiguous"
+    assert len(resolution.candidates) >= 2
+
+
+def test_category_resolution_reports_not_found_for_an_unknown_source_concept(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    resolution = operational_adapter.resolve_category(
+        ProductResolutionQuery(reference="No matching catalogue category")
+    )
+
+    assert resolution.status == "not_found"
+    assert resolution.category is None
+    assert resolution.candidates == ()
+    assert resolution.metadata.row_count == 0
+
+
+def test_location_resolution_uses_bounded_source_labels_and_codes(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    by_label = operational_adapter.resolve_location(
+        LocationResolutionQuery(reference="jbeil")
+    )
+    by_code = operational_adapter.resolve_location(
+        LocationResolutionQuery(reference="BR-JBEIL")
+    )
+
+    assert by_label.status == by_code.status == "resolved"
+    assert by_label.location is not None
+    assert by_code.location is not None
+    assert (
+        by_label.location.external_location_id == by_code.location.external_location_id
+    )
+    assert by_label.location.label == by_code.location.label
+    assert by_label.location.location_type == "branch"
+
+
+def test_location_resolution_is_case_insensitive_and_literal(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    resolution = operational_adapter.resolve_location(
+        LocationResolutionQuery(reference="JB%_EIL")
+    )
+
+    assert resolution.status == "not_found"
+    assert resolution.candidates == ()
 
 
 def test_sales_totals_statuses_returns_currency_and_timezone(
@@ -407,3 +547,15 @@ def test_denied_operations_do_not_change_source_fixture(
             connection.scalar(text("SELECT count(*) FROM minimarket.catalog_items"))
             == 8
         )
+
+
+def test_live_catalogue_contract_does_not_supply_a_current_price(
+    operational_adapter: PostgreSQLOperationalAdapter,
+) -> None:
+    resolution = operational_adapter.resolve_product(
+        ProductResolutionQuery(reference="Pepsi Bottle 1.5 L")
+    )
+    assert resolution.status == "resolved" and resolution.product is not None
+    assert resolution.product.name == "Pepsi Bottle 1.5 L"
+    assert "price" not in resolution.product.model_dump()
+    assert "unit_price" not in resolution.product.model_dump()
