@@ -15,6 +15,7 @@ from app.agent.owner_chat_provider import (
     OwnerChatProvider,
     OwnerChatProviderError,
     OwnerChatRequest,
+    OwnerChatResult,
     ProviderBusinessProfile,
     ProviderKnowledge,
     ProviderMessage,
@@ -31,7 +32,6 @@ from app.core.config import Settings, get_settings
 from app.core.exceptions import ApplicationError
 from app.core.security import utc_now
 from app.database.models import (
-    AIUsageReservation,
     Business,
     BusinessKnowledge,
     BusinessStatus,
@@ -173,22 +173,10 @@ def recover_expired_customer_message_claims(
         ).all()
         for message in rows:
             if message.status == CustomerMessageStatus.PROCESSING:
-                reservation = session.scalar(
-                    select(AIUsageReservation)
-                    .where(
-                        AIUsageReservation.customer_message_id == message.id,
-                        AIUsageReservation.status == "reserved",
-                    )
-                    .with_for_update()
+                session.execute(
+                    text("SELECT public.sou2ai_recover_customer_usage(:message_id)"),
+                    {"message_id": message.id},
                 )
-                if reservation is not None:
-                    reconcile_ai_usage(
-                        session,
-                        reservation.id,
-                        usage=None,
-                        outcome="release",
-                        commit=False,
-                    )
                 message.status = CustomerMessageStatus.FAILED
                 message.failure_code = "customer.processing_lease_expired"
             else:
@@ -503,6 +491,8 @@ def process_inbound_message(
     recover_expired_customer_message_claims(settings, batch_size=25)
     identifier = uuid.UUID(message_id)
     reservation_id: uuid.UUID | None = None
+    generation_started = False
+    result: OwnerChatResult | None = None
     resolved_provider = provider or get_owner_chat_provider(settings)
     with get_session_factory()() as session:
         message = session.scalar(
@@ -592,6 +582,7 @@ def process_inbound_message(
                 lease_seconds=settings.customer_generation_lease_seconds,
             )
             reservation_id = claim.id
+            generation_started = True
             result = resolved_provider.generate(request)
             reply_text = _validate_customer_result(result, request, message.content)
             reply = CustomerMessage(
@@ -633,7 +624,13 @@ def process_inbound_message(
                     session,
                     reservation_id,
                     usage=exc.usage,
-                    outcome=("uncertain" if exc.usage_uncertain else "release"),
+                    outcome=(
+                        "reported_failure"
+                        if exc.usage is not None
+                        else "uncertain"
+                        if exc.usage_uncertain
+                        else "release"
+                    ),
                     provider_identifier=exc.provider_identifier,
                     model_identifier=exc.model_identifier,
                     commit=False,
@@ -645,7 +642,23 @@ def process_inbound_message(
         except ApplicationError, ValueError:
             if reservation_id is not None:
                 reconcile_ai_usage(
-                    session, reservation_id, usage=None, outcome="release", commit=False
+                    session,
+                    reservation_id,
+                    usage=result.usage if result is not None else None,
+                    outcome=(
+                        "reported_failure"
+                        if result is not None and result.usage is not None
+                        else "uncertain"
+                        if generation_started
+                        else "release"
+                    ),
+                    provider_identifier=result.provider_identifier
+                    if result is not None
+                    else None,
+                    model_identifier=result.model_identifier
+                    if result is not None
+                    else None,
+                    commit=False,
                 )
             message.status = CustomerMessageStatus.FAILED
             message.failure_code = "customer.generation_failed"
