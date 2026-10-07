@@ -94,8 +94,29 @@ def _profile_response(
 
 
 def _response(
-    source: OperationalDataSourceConfig, registry: ConnectionProfileRegistry
+    source: OperationalDataSourceConfig,
+    registry: ConnectionProfileRegistry,
+    session: Session | None = None,
 ) -> DataSourceResponse:
+    if source.mapping_profile_key == "discovered_products":
+        from app.services.source_mapping import latest_approved
+
+        revision = latest_approved(session, source) if session is not None else None
+        return DataSourceResponse(
+            id=source.id,
+            display_name=source.display_name,
+            adapter_type=source.adapter_type,
+            connection_profile_key=source.connection_profile_key,
+            mapping=None,
+            mapping_version=revision.version if revision else None,
+            status=source.status,
+            last_validated_at=source.last_validated_at,
+            last_successful_health_check_at=source.last_successful_health_check_at,
+            failure_code=source.failure_code,
+            capabilities=["products"] if revision else [],
+            created_at=source.created_at,
+            updated_at=source.updated_at,
+        )
     mapping = registry.get_mapping(
         source.mapping_profile_key, source.mapping_profile_version
     )
@@ -224,6 +245,20 @@ def list_connection_profiles(
     load_full_access_business(session, user, business_id)
     responses: list[ConnectionProfileResponse] = []
     for profile in registry.available_profiles():
+        if profile.mapping_profile_key == "discovered_products":
+            if business_id in profile.business_ids:
+                responses.append(
+                    ConnectionProfileResponse(
+                        key=profile.key,
+                        display_name=profile.display_name,
+                        description=profile.description,
+                        adapter_type=profile.adapter_type,
+                        mapping=None,
+                        capabilities=["products"],
+                        discovery_required=True,
+                    )
+                )
+            continue
         mapping = registry.get_mapping(
             profile.mapping_profile_key, profile.mapping_profile_version
         )
@@ -249,7 +284,9 @@ def create_data_source(
     mapping = registry.get_mapping(
         body.mapping_profile_key, body.mapping_profile_version
     )
-    if profile is None:
+    if profile is None or (
+        profile.business_ids and business_id not in profile.business_ids
+    ):
         session.rollback()
         raise ApplicationError(
             "Choose a supported connection profile.",
@@ -257,7 +294,7 @@ def create_data_source(
             error_code="unsupported_connection_profile",
         )
     if (
-        mapping is None
+        (mapping is None and profile.mapping_profile_key != "discovered_products")
         or profile.mapping_profile_key != body.mapping_profile_key
         or profile.mapping_profile_version != body.mapping_profile_version
     ):
@@ -268,7 +305,8 @@ def create_data_source(
             error_code="unsupported_mapping_profile",
         )
     try:
-        mapping.validate_definition()
+        if mapping is not None:
+            mapping.validate_definition()
     except MappingProfileError:
         session.rollback()
         raise ApplicationError(
@@ -293,8 +331,8 @@ def create_data_source(
         display_name=body.display_name,
         adapter_type=profile.adapter_type,
         connection_profile_key=profile.key,
-        mapping_profile_key=mapping.key,
-        mapping_profile_version=mapping.version,
+        mapping_profile_key=profile.mapping_profile_key,
+        mapping_profile_version=profile.mapping_profile_version,
     )
     session.add(source)
     try:
@@ -307,7 +345,7 @@ def create_data_source(
             status_code=status.HTTP_409_CONFLICT,
             error_code="data_source_configuration_conflict",
         ) from None
-    return _response(source, registry)
+    return _response(source, registry, session)
 
 
 def list_data_sources(
@@ -326,7 +364,7 @@ def list_data_sources(
         )
         .limit(MAX_DATA_SOURCES_PER_BUSINESS)
     ).all()
-    return [_response(source, registry) for source in sources]
+    return [_response(source, registry, session) for source in sources]
 
 
 def get_data_source(
@@ -336,7 +374,9 @@ def get_data_source(
     source_id: uuid.UUID,
     registry: ConnectionProfileRegistry,
 ) -> DataSourceResponse:
-    return _response(_load_source(session, user, business_id, source_id), registry)
+    return _response(
+        _load_source(session, user, business_id, source_id), registry, session
+    )
 
 
 def validate_data_source(
@@ -347,6 +387,10 @@ def validate_data_source(
     registry: ConnectionProfileRegistry,
 ) -> DataSourceResponse:
     source = _load_source(session, user, business_id, source_id)
+    if source.mapping_profile_key == "discovered_products":
+        from app.services.source_mapping import validate_mapped_source
+
+        return validate_mapped_source(session, user, business_id, source_id, registry)
     snapshot = _snapshot(source)
     session.commit()
 
@@ -372,7 +416,7 @@ def validate_data_source(
         source.failure_code = failure_code
     session.commit()
     session.refresh(source)
-    return _response(source, registry)
+    return _response(source, registry, session)
 
 
 def activate_data_source(
@@ -382,17 +426,23 @@ def activate_data_source(
     source_id: uuid.UUID,
     registry: ConnectionProfileRegistry,
 ) -> DataSourceResponse:
+    candidate = _load_source(session, user, business_id, source_id)
+    if candidate.mapping_profile_key == "discovered_products":
+        from app.services.source_mapping import validate_mapped_source
+
+        result = validate_mapped_source(session, user, business_id, source_id, registry)
+        if result.status is OperationalDataSourceStatus.UNHEALTHY:
+            raise _state_conflict("Revalidate the mapping before activation.")
     source = _load_source(session, user, business_id, source_id, for_update=True)
     if source.status is OperationalDataSourceStatus.ACTIVE:
         session.commit()
-        return _response(source, registry)
+        return _response(source, registry, session)
     if source.status is not OperationalDataSourceStatus.VALIDATED:
         session.rollback()
         raise _state_conflict("Validate the data source before activating it.")
     other_active = session.scalar(
         select(OperationalDataSourceConfig.id).where(
             OperationalDataSourceConfig.business_id == business_id,
-            OperationalDataSourceConfig.adapter_type == source.adapter_type,
             OperationalDataSourceConfig.status == OperationalDataSourceStatus.ACTIVE,
             OperationalDataSourceConfig.id != source.id,
         )
@@ -400,7 +450,7 @@ def activate_data_source(
     if other_active is not None:
         session.rollback()
         raise ApplicationError(
-            "Another source of this type is already active.",
+            "Another operational source is already active for this business.",
             status_code=status.HTTP_409_CONFLICT,
             error_code="active_data_source_conflict",
         )
@@ -412,11 +462,11 @@ def activate_data_source(
     except IntegrityError:
         session.rollback()
         raise ApplicationError(
-            "Another source of this type is already active.",
+            "Another operational source is already active for this business.",
             status_code=status.HTTP_409_CONFLICT,
             error_code="active_data_source_conflict",
         ) from None
-    return _response(source, registry)
+    return _response(source, registry, session)
 
 
 def check_data_source_health(
@@ -427,6 +477,10 @@ def check_data_source_health(
     registry: ConnectionProfileRegistry,
 ) -> DataSourceResponse:
     source = _load_source(session, user, business_id, source_id)
+    if source.mapping_profile_key == "discovered_products":
+        from app.services.source_mapping import validate_mapped_source
+
+        return validate_mapped_source(session, user, business_id, source_id, registry)
     if source.status not in {
         OperationalDataSourceStatus.VALIDATED,
         OperationalDataSourceStatus.ACTIVE,
@@ -458,7 +512,7 @@ def check_data_source_health(
         source.failure_code = failure_code
     session.commit()
     session.refresh(source)
-    return _response(source, registry)
+    return _response(source, registry, session)
 
 
 def disable_data_source(
@@ -471,9 +525,9 @@ def disable_data_source(
     source = _load_source(session, user, business_id, source_id, for_update=True)
     if source.status is OperationalDataSourceStatus.DISABLED:
         session.commit()
-        return _response(source, registry)
+        return _response(source, registry, session)
     source.status = OperationalDataSourceStatus.DISABLED
     source.failure_code = None
     session.commit()
     session.refresh(source)
-    return _response(source, registry)
+    return _response(source, registry, session)

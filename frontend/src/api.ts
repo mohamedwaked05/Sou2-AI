@@ -125,8 +125,9 @@ export interface ConnectionProfile {
   display_name: string;
   description: string;
   adapter_type: string;
-  mapping: OperationalMappingProfile;
+  mapping: OperationalMappingProfile | null;
   capabilities: string[];
+  discovery_required?: boolean;
 }
 
 export interface DataSource {
@@ -134,7 +135,8 @@ export interface DataSource {
   display_name: string;
   adapter_type: string;
   connection_profile_key: string;
-  mapping: OperationalMappingProfile;
+  mapping: OperationalMappingProfile | null;
+  mapping_version?: number | null;
   status: DataSourceStatus;
   last_validated_at: string | null;
   last_successful_health_check_at: string | null;
@@ -146,6 +148,69 @@ export interface DataSource {
 
 export type WhatsAppConnectionStatus =
   "CONFIGURED" | "VALIDATED" | "ACTIVE" | "UNHEALTHY" | "DISABLED";
+
+export interface ProductMapping {
+  contract_version: 1;
+  capability: "products";
+  object_id: string;
+  key_columns: string[];
+  name_columns: string[];
+  sku_column: string | null;
+  categories: {
+    object_id: string;
+    joins: { product_column: string; related_column: string }[];
+    label_column: string;
+  }[];
+  identifiers: {
+    object_id: string;
+    joins: { product_column: string; related_column: string }[];
+    value_column: string;
+    kind: "barcode" | "alternate_id";
+  }[];
+}
+
+export interface SchemaDiscovery {
+  engine: "postgresql" | "sqlserver";
+  objects: {
+    object_id: string;
+    schema_name: string;
+    name: string;
+    columns: { name: string; kind: string; nullable: boolean }[];
+    unique_keys: string[][];
+  }[];
+}
+
+export interface MappingReview {
+  id: string;
+  version: number;
+  status: "proposing" | "review" | "approved" | "failed";
+  discovery: SchemaDiscovery;
+  proposal: {
+    mapping: ProductMapping | null;
+    uncertainties: string[];
+    rationale: string;
+  } | null;
+  approved_mapping: ProductMapping | null;
+  schema_fingerprint: string;
+  failure_code: string | null;
+  validation_notes: string[];
+}
+
+export interface CatalogueProduct {
+  external_product_id: string;
+  names: string[];
+  sku: string | null;
+  categories: string[];
+  stock: null;
+}
+
+export interface CatalogueResult {
+  mapping_version: number;
+  status: "resolved" | "ambiguous" | "not_found";
+  items: CatalogueProduct[];
+  truncated: boolean;
+  capabilities: ["products"];
+}
 
 export interface WhatsAppConnection {
   id: string;
@@ -476,6 +541,50 @@ export const api = {
     request<DataSource>(`/businesses/${business}/data-sources/${source}/disable`, {
       method: "POST",
     }),
+  discoverSource: (business: string, source: string) =>
+    request<SchemaDiscovery>(
+      `/businesses/${business}/data-sources/${source}/discovery`,
+    ),
+  mappingReviews: (business: string, source: string) =>
+    request<MappingReview[]>(`/businesses/${business}/data-sources/${source}/mappings`),
+  proposeMapping: (business: string, source: string, key: string) =>
+    request<MappingReview>(
+      `/businesses/${business}/data-sources/${source}/mappings/propose`,
+      {
+        method: "POST",
+        ...json({ idempotency_key: key }),
+      },
+    ),
+  approveMapping: (
+    business: string,
+    source: string,
+    revision: string,
+    mapping: ProductMapping,
+  ) =>
+    request<MappingReview>(
+      `/businesses/${business}/data-sources/${source}/mappings/${revision}/approve`,
+      {
+        method: "POST",
+        ...json({ mapping, confirm_semantics: true, acknowledge_uncertainties: true }),
+      },
+    ),
+  searchCatalogue: (
+    business: string,
+    source: string,
+    selector: {
+      query?: string;
+      external_product_id?: string;
+      mapping_version?: number;
+      limit?: number;
+    },
+  ) =>
+    request<CatalogueResult>(
+      `/businesses/${business}/data-sources/${source}/products/search`,
+      {
+        method: "POST",
+        ...json(selector),
+      },
+    ),
   whatsAppConnections: (business: string) =>
     request<WhatsAppConnection[]>(`/businesses/${business}/channels/whatsapp`),
   configureWhatsApp: (business: string, displayName: string) =>

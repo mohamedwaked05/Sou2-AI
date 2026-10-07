@@ -1566,15 +1566,15 @@ class OperationalDataSourceConfig(Base):
             name="ck_operational_sources_display_name",
         ),
         CheckConstraint(
-            "adapter_type = 'postgresql_readonly'",
+            "adapter_type IN ('postgresql_readonly', 'sqlserver_readonly')",
             name="ck_operational_sources_adapter",
         ),
         CheckConstraint(
-            "connection_profile_key = 'fake_store_postgresql'",
+            "connection_profile_key ~ '^[a-z][a-z0-9_]{1,99}$'",
             name="ck_operational_sources_connection_profile",
         ),
         CheckConstraint(
-            "mapping_profile_key = 'fake_store_minimarket' "
+            "mapping_profile_key IN ('fake_store_minimarket', 'discovered_products') "
             "AND mapping_profile_version = 1",
             name="ck_operational_sources_mapping_profile",
         ),
@@ -1603,9 +1603,8 @@ class OperationalDataSourceConfig(Base):
             "id",
         ),
         Index(
-            "uq_operational_sources_active_type",
+            "uq_operational_sources_active_business",
             "business_id",
-            "adapter_type",
             unique=True,
             postgresql_where=text("status = 'ACTIVE'::operational_data_source_status"),
         ),
@@ -1645,6 +1644,58 @@ class OperationalDataSourceConfig(Base):
     @validates("display_name")
     def clean_display_name(self, _key: str, value: str) -> str:
         return " ".join(value.split())
+
+
+class SourceMappingRevision(Base):
+    """Immutable discovery provenance and reviewed, versioned catalogue mappings."""
+
+    __tablename__ = "source_mapping_revisions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["source_id", "business_id"],
+            ["operational_data_sources.id", "operational_data_sources.business_id"],
+            ondelete="CASCADE",
+            name="fk_mapping_revision_source_scope",
+        ),
+        UniqueConstraint("source_id", "version", name="uq_mapping_revision_version"),
+        UniqueConstraint(
+            "source_id", "idempotency_key", name="uq_mapping_revision_replay"
+        ),
+        CheckConstraint("version > 0", name="ck_mapping_revision_version"),
+        CheckConstraint(
+            "status IN ('proposing', 'review', 'approved', 'failed')",
+            name="ck_mapping_revision_status",
+        ),
+        CheckConstraint(
+            "(status = 'approved') = (approved_mapping IS NOT NULL AND approved_by IS NOT NULL AND approved_at IS NOT NULL)",
+            name="ck_mapping_revision_approval",
+        ),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    requested_by: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), nullable=False
+    )
+    idempotency_key: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    discovery: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    schema_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    proposal: Mapped[dict | None] = mapped_column(JSONB)
+    approved_mapping: Mapped[dict | None] = mapped_column(JSONB)
+    validation_notes: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    approved_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reservation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    failure_code: Mapped[str | None] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class UserOperationalPreference(Base):

@@ -168,6 +168,8 @@ class Settings(BaseSettings):
     operational_max_reporting_days: int = Field(default=366, ge=1, le=366)
     tool_call_audit_retention_days: int = Field(default=90, ge=1)
     tool_call_audit_hmac_secret: SecretStr | None = None
+    source_connections_json: SecretStr = SecretStr("[]")
+    source_mapping_provider: Literal["mock", "gemini"] = "mock"
     whatsapp_access_token: SecretStr | None = None
     meta_app_secret: SecretStr | None = None
     whatsapp_webhook_verify_token: SecretStr | None = None
@@ -294,11 +296,21 @@ class Settings(BaseSettings):
                 "OWNER_CHAT_GENERATION_LEASE_SECONDS must exceed "
                 "the selected owner-chat provider timeout."
             )
-        if self.owner_chat_provider == "gemini" and (
+        if (
+            self.owner_chat_provider == "gemini"
+            or self.source_mapping_provider == "gemini"
+        ) and (
             self.gemini_api_key is None
             or not self.gemini_api_key.get_secret_value().strip()
         ):
             raise ValueError("GEMINI_API_KEY is required when using Gemini.")
+        if (
+            self.source_mapping_provider == "gemini"
+            and self.gemini_request_timeout_seconds >= 240
+        ):
+            raise ValueError(
+                "Mapping provider timeout must be below the reservation lease."
+            )
         if (
             self.development_owner_chat_minute_limit is not None
             or self.development_owner_chat_hour_limit is not None

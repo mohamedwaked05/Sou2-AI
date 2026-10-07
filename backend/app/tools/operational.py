@@ -871,6 +871,15 @@ class OperationalToolExecutor:
     def _source_capabilities(
         self, source: OperationalDataSourceConfig
     ) -> frozenset[str]:
+        if source.mapping_profile_key == "discovered_products":
+            from app.services.source_mapping import connector_for, latest_approved
+
+            connector_for(self._profiles, source)
+            return (
+                frozenset({"products"})
+                if latest_approved(self._session, source)
+                else frozenset()
+            )
         profile = self._profiles.get_profile(source.connection_profile_key)
         mapping = self._profiles.get_mapping(
             source.mapping_profile_key, source.mapping_profile_version

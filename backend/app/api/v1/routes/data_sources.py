@@ -6,6 +6,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
+from app.agent.mapping_provider import MappingProvider, get_mapping_provider
 from app.api.dependencies import get_current_user
 from app.database.models import User
 from app.database.session import get_db_session
@@ -18,6 +19,14 @@ from app.schemas.data_sources import (
     DataSourceCreateRequest,
     DataSourceResponse,
 )
+from app.schemas.source_mapping import (
+    CatalogueRequest,
+    CatalogueResult,
+    MappingApproveRequest,
+    MappingProposeRequest,
+    MappingReview,
+    SchemaDiscovery,
+)
 from app.services.data_sources import (
     activate_data_source,
     check_data_source_health,
@@ -27,6 +36,13 @@ from app.services.data_sources import (
     list_connection_profiles,
     list_data_sources,
     validate_data_source,
+)
+from app.services.source_mapping import (
+    approve_mapping,
+    discover_source,
+    list_mapping_reviews,
+    propose_mapping,
+    search_catalogue,
 )
 
 router = APIRouter(
@@ -123,3 +139,69 @@ def disable(
     profiles: ProfileRegistry,
 ) -> DataSourceResponse:
     return disable_data_source(session, user, business_id, source_id, profiles)
+
+
+@router.get("/{source_id}/discovery", response_model=SchemaDiscovery)
+def discover(
+    business_id: uuid.UUID,
+    source_id: uuid.UUID,
+    session: DatabaseSession,
+    user: AuthenticatedUser,
+    profiles: ProfileRegistry,
+) -> SchemaDiscovery:
+    return discover_source(session, user, business_id, source_id, profiles)
+
+
+@router.post("/{source_id}/mappings/propose", response_model=MappingReview)
+def propose(
+    business_id: uuid.UUID,
+    source_id: uuid.UUID,
+    body: MappingProposeRequest,
+    session: DatabaseSession,
+    user: AuthenticatedUser,
+    profiles: ProfileRegistry,
+    provider: Annotated[MappingProvider, Depends(get_mapping_provider)],
+) -> MappingReview:
+    return propose_mapping(
+        session, user, business_id, source_id, body.idempotency_key, profiles, provider
+    )
+
+
+@router.get("/{source_id}/mappings", response_model=list[MappingReview])
+def reviews(
+    business_id: uuid.UUID,
+    source_id: uuid.UUID,
+    session: DatabaseSession,
+    user: AuthenticatedUser,
+    profiles: ProfileRegistry,
+) -> list[MappingReview]:
+    return list_mapping_reviews(session, user, business_id, source_id, profiles)
+
+
+@router.post(
+    "/{source_id}/mappings/{revision_id}/approve", response_model=MappingReview
+)
+def approve(
+    business_id: uuid.UUID,
+    source_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    body: MappingApproveRequest,
+    session: DatabaseSession,
+    user: AuthenticatedUser,
+    profiles: ProfileRegistry,
+) -> MappingReview:
+    return approve_mapping(
+        session, user, business_id, source_id, revision_id, body, profiles
+    )
+
+
+@router.post("/{source_id}/products/search", response_model=CatalogueResult)
+def products(
+    business_id: uuid.UUID,
+    source_id: uuid.UUID,
+    body: CatalogueRequest,
+    session: DatabaseSession,
+    user: AuthenticatedUser,
+    profiles: ProfileRegistry,
+) -> CatalogueResult:
+    return search_catalogue(session, user, business_id, source_id, body, profiles)

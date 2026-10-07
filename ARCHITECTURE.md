@@ -174,12 +174,13 @@ are never copied into the platform database.
 Active unexpired reservations reduce available stock. Restocking recommends the
 trusted arithmetic difference between target and available stock only when
 available stock is at or below the reorder point. No model, route, or tool can
-submit SQL, inspect the source schema, or receive its credentials.
+submit SQL or receive source credentials. Approved catalogue metadata discovery
+is a separate authenticated management operation described below.
 
 The public management API accepts only the allowlisted connection profile key and
 versioned mapping profile key. The environment-backed registry resolves the safe
 key to credentials inside the process and can later be replaced by a secret
-manager without changing the API. Mapping validation covers completed/excluded
+manager without changing the API. The legacy demo mapping validates completed/excluded
 sale statuses, refunds, active reservations, location meaning, quantities,
 revenue, currency, timezone, and required capabilities before activation.
 
@@ -193,6 +194,43 @@ the meantime. Management states are `CONFIGURED`, `VALIDATED`, `ACTIVE`,
 
 Unstructured RAG data is stored separately and covers approved documents such as
 policies, descriptions, warranties, FAQs, and business notes.
+
+### Reusable catalogue discovery and mapping
+
+Catalogue-only sources use PostgreSQL or Microsoft SQL Server connectors and
+`discovered_products` mappings. Deployment-managed `SOURCE_CONNECTIONS_JSON`
+binds each restricted connection to explicit business IDs and approved catalogue
+objects/columns. Remote connections require verified TLS; SQL Server uses ODBC 18.
+Discovery reads fixed metadata queries, including enforced unique keys and
+composite relationships. It forwards only approved metadata, never operational
+records or secret connection details, to the optional mapping provider.
+
+The provider-neutral mapping contract accepts product keys, searchable name
+columns, optional SKU, category joins and alternate identifiers. It accepts no SQL,
+filters, expressions or procedures. Gemini can propose this structure in one
+budget-admitted generation; offline mode returns explicit uncertainty. Reviewers
+must confirm semantics and acknowledge uncertainty before approval. Validation
+checks permissions, exact objects/columns, complete unique-key joins and bounded
+SELECT results. Approved revisions persist source/schema provenance and approval
+identity; database guards prevent rewriting them. Proposals have idempotent
+admission and conservative interrupted/unknown-usage reconciliation.
+
+Normal catalogue requests compile saved mappings through SQLAlchemy Core with
+quoted metadata-validated identifiers, bound values, an allowlisted operation,
+row bounds and database/driver statement deadlines. Compact catalogue stamps
+check schema and permissions before and after reads; normal requests neither
+rediscover mappings nor call a model. Explicit selection carries the offered
+mapping version, preserving string identifiers and rejecting stale selections.
+Ambiguous searches offer variants without choosing one. Missing stock is null.
+
+Authenticated Data Sources routes/UI expose discovery, structured review,
+approval, activation and catalogue search. Catalogue-only sources declare only
+`products`; existing owner-chat inventory/sales tools reject unsupported
+capabilities. The owner-chat planner does not yet dispatch the new catalogue
+search operation. Existing PostgreSQL demo tools and semantic rules remain
+supported. One active operational source per business avoids cross-engine
+selection ambiguity. Views, custom expressions, inferred translations/aliases,
+stock, pricing and sales mappings are outside this first phase.
 
 Owner chat detects requests for current inventory, sales, revenue, best sellers,
 and restocking before retrieval. An active healthy source enables the four

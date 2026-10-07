@@ -1,0 +1,121 @@
+{
+  "base_main": "d33c69282d22747cd20370120cdac24fd5e243ca",
+  "branch": "feat/reusable-product-mappings",
+  "tested_worktree_sha256": {
+    ".gitignore": "43cb6b19e48801e5c3258fd2dabad7d6b73258282d43521b16180f164936fc16",
+    "ARCHITECTURE.md": "a63c94cac709740255a46cc3bc71e820c00bb9a24c91a8244c6c24e11b6cd577",
+    "backend/.dockerignore": "9ef4e614a21c06d2cd1003363a6a181921ad1dc597dee24dd3bf3e3cad124968",
+    "backend/.env.example": "7e3b1e70375f55ce2e3f1062c773f7809cdd329d4e27b190de476de990b26c92",
+    "backend/Dockerfile": "81ffa9326378367fa0c81fba0ff39319c7f9ab7a3eab128984d3d6d6cba648dd",
+    "backend/pyproject.toml": "792c0b8219433a983799a47131ddfda2e22357f21f11eb7ff784c39e8c7cf7ce",
+    "backend/alembic/versions/20261007_16_source_mapping_revisions.py": "8f8f227e7a0ed54c988d47304a5c1a08294b65d33ed9356a82c9722a3e1f2983",
+    "backend/app/agent/mapping_provider.py": "ae26805f1e4b50ed05193c3d3d2074eee0185fd3c0554a77628cc1052ca9e318",
+    "backend/app/api/v1/routes/data_sources.py": "0512244987bb94007060ae5ab1c3414c4bc017ab8c5df2f42ae52d0ea8f9a123",
+    "backend/app/core/config.py": "022678ada7862d7cecb1c5b1e0a4376619d44181e2131932f4506401eb664237",
+    "backend/app/database/models.py": "6991b8b7a4899191beb480a2679dc765712a917f6fff0c475a779b6cee387600",
+    "backend/app/integrations/discovery.py": "3e3e812340bd2590df873ad077415c242553d12ae35dbdd9056cbf3619df897a",
+    "backend/app/integrations/mapped_products.py": "71314b1de841e417d7c0f2c7a87437251666cde0b77215e5d3ee1c5f139d1c97",
+    "backend/app/integrations/profiles.py": "d2d1df389def707b623409457e80f35ba0e22667bc0aa4fbe361b230e70fd445",
+    "backend/app/schemas/data_sources.py": "927aad9b5fea217e8bfa7a229df2ebd6f53a6511a6d5433db992ee70c0861ae5",
+    "backend/app/schemas/source_mapping.py": "e48485802dbe4c5100a61d4fd8d3492047645a80aa2f23e1c6138ee56a92df71",
+    "backend/app/services/data_sources.py": "0fed109483131800bd5b6d37d352db752dcc4697d0a6393f3bb7f63115b544ad",
+    "backend/app/services/source_mapping.py": "b0585844b0263770480ee25266211c494979d41af469b4fd093f71e81d9e7d4e",
+    "backend/app/tools/catalogue.py": "20a47db0c33737caf6a1b9ea8141b8ade60cc68fd6fbbea666071ed9307bbbd1",
+    "backend/app/tools/operational.py": "5ba5ba1b58108b512da3bba9e93f34e4b23a4c673c57b07badefe714f32c62db",
+    "backend/tests/test_source_mapping.py": "8a68c5e77dbf51d9e0b483b5567302fa8e602533b7b76f75e00b2b751e57afe4",
+    "backend/tests/test_mapping_migration.py": "bd2e33a37e6f7599eec2566985d25f3c2efbedec4534b196be59b786f9f3c6c0",
+    "backend/tests/test_historical_catalogue.py": "26759a16ff62273502e77e0764f54f6f1c694fe3ba0def99a51232b651697aa9",
+    "frontend/src/api.ts": "309180e0f73a92c95311b8e984628cd645debadabc374c5443ca76455f51091f",
+    "frontend/src/data-sources.tsx": "fc87622d4e07fc452dad427dfcf2582b248d743628bb6ecb24f65b4037e650f7",
+    "frontend/src/mapping-onboarding.tsx": "6e85d7e46c393ab82c343415477dbb8133940a520591786556392b5d9f2e51c4",
+    "frontend/src/mapping-onboarding.test.tsx": "48b79fc49809ce523b0d8c34215b15daa3379858a3789f875a21c9ba8335aaf9"
+  },
+  "normalized_lf_sha256": {
+    ".gitignore": "43cb6b19e48801e5c3258fd2dabad7d6b73258282d43521b16180f164936fc16",
+    "ARCHITECTURE.md": "1d6530ab4726cf29f8130279c83fb2fd2ef1e1bacd742d8ebb9135b2753669d4",
+    "backend/.dockerignore": "9ef4e614a21c06d2cd1003363a6a181921ad1dc597dee24dd3bf3e3cad124968",
+    "backend/.env.example": "4bfef07f92c483570a3831fed032a4e68e6be2dfdd1c5a0d70a62331b0241219",
+    "backend/Dockerfile": "81ffa9326378367fa0c81fba0ff39319c7f9ab7a3eab128984d3d6d6cba648dd",
+    "backend/pyproject.toml": "5d30ec13156f2b0f9320c215b3034b6996f8e145d1ec57bcb8e9e36b7a5ba127",
+    "backend/alembic/versions/20261007_16_source_mapping_revisions.py": "8f8f227e7a0ed54c988d47304a5c1a08294b65d33ed9356a82c9722a3e1f2983",
+    "backend/app/agent/mapping_provider.py": "ae26805f1e4b50ed05193c3d3d2074eee0185fd3c0554a77628cc1052ca9e318",
+    "backend/app/api/v1/routes/data_sources.py": "0512244987bb94007060ae5ab1c3414c4bc017ab8c5df2f42ae52d0ea8f9a123",
+    "backend/app/core/config.py": "0058b7b1b5d9c94f7ce2f55dfea0272a8cdabc0a1d95becb7faa8c7fca80f5c0",
+    "backend/app/database/models.py": "d133784cf42cbe3f717a9bcfd223772effc55453ff7cfcec984abd109b6a65d8",
+    "backend/app/integrations/discovery.py": "3e3e812340bd2590df873ad077415c242553d12ae35dbdd9056cbf3619df897a",
+    "backend/app/integrations/mapped_products.py": "71314b1de841e417d7c0f2c7a87437251666cde0b77215e5d3ee1c5f139d1c97",
+    "backend/app/integrations/profiles.py": "b0d108d6dd19a9ada6446b8d35ac2ed30d85d98d3dc56cc4fda4fdbded34ea2f",
+    "backend/app/schemas/data_sources.py": "927aad9b5fea217e8bfa7a229df2ebd6f53a6511a6d5433db992ee70c0861ae5",
+    "backend/app/schemas/source_mapping.py": "e48485802dbe4c5100a61d4fd8d3492047645a80aa2f23e1c6138ee56a92df71",
+    "backend/app/services/data_sources.py": "0fed109483131800bd5b6d37d352db752dcc4697d0a6393f3bb7f63115b544ad",
+    "backend/app/services/source_mapping.py": "b0585844b0263770480ee25266211c494979d41af469b4fd093f71e81d9e7d4e",
+    "backend/app/tools/catalogue.py": "20a47db0c33737caf6a1b9ea8141b8ade60cc68fd6fbbea666071ed9307bbbd1",
+    "backend/app/tools/operational.py": "b6efacf5442fe7871bd3e3f6e3ce6cbb276dc2209728aa215f43ac6a944cfa67",
+    "backend/tests/test_source_mapping.py": "8a68c5e77dbf51d9e0b483b5567302fa8e602533b7b76f75e00b2b751e57afe4",
+    "backend/tests/test_mapping_migration.py": "bd2e33a37e6f7599eec2566985d25f3c2efbedec4534b196be59b786f9f3c6c0",
+    "backend/tests/test_historical_catalogue.py": "26759a16ff62273502e77e0764f54f6f1c694fe3ba0def99a51232b651697aa9",
+    "frontend/src/api.ts": "309180e0f73a92c95311b8e984628cd645debadabc374c5443ca76455f51091f",
+    "frontend/src/data-sources.tsx": "fc87622d4e07fc452dad427dfcf2582b248d743628bb6ecb24f65b4037e650f7",
+    "frontend/src/mapping-onboarding.tsx": "6e85d7e46c393ab82c343415477dbb8133940a520591786556392b5d9f2e51c4",
+    "frontend/src/mapping-onboarding.test.tsx": "48b79fc49809ce523b0d8c34215b15daa3379858a3789f875a21c9ba8335aaf9"
+  },
+  "line_endings": "Exact working-tree bytes tested; LF-normalized hashes allow Git autocrlf comparison. No logical application edits after validation.",
+  "backend": {
+    "passed": 672,
+    "skipped": 1,
+    "seconds": 138.34,
+    "warning": "Upstream Starlette/httpx deprecation"
+  },
+  "engine_application_tests": {
+    "passed": 21,
+    "seconds": 11.81,
+    "providers": "mocks only",
+    "engines": [
+      "postgresql",
+      "sqlserver"
+    ]
+  },
+  "frontend": {
+    "passed": 43,
+    "typecheck": "passed",
+    "eslint": "passed",
+    "build": "passed",
+    "prettier_unmodified_failures": [
+      "frontend/README.md",
+      "frontend/src/workspace.tsx"
+    ]
+  },
+  "ruff": {
+    "lint": "passed",
+    "format": "passed",
+    "files": 162
+  },
+  "migration": {
+    "head": "20261007_16",
+    "sou2ai_test": "20261007_16",
+    "sou2ai_dev": "20261006_15",
+    "production": "untouched"
+  },
+  "live": {
+    "status": "awaiting approval",
+    "new_attempts": 0,
+    "historical_attempts": 22,
+    "historical_ceiling": 25,
+    "proposed_max_attempts": 1,
+    "proposed_cumulative_max": 23,
+    "metadata_objects": 4,
+    "metadata_columns": 12,
+    "metadata_utf8_bytes": 1850,
+    "records_exposed": 0,
+    "estimated_input_tokens": 1893,
+    "max_output_tokens": 2048,
+    "initial_reservation": 3941,
+    "normal_daily_allowance": 20000
+  },
+  "evidence_sha256": {
+    "backend/.tmp/mapping-system-20261006/combined.xml": "7c1224ffb6273f751339a90b0ed225287806339c66f6fd773569cb37d54478ae",
+    "data/generated/mapping-system-20261007/offline-validation.log": "8425d4fbb17f6337d39f79abc2cdb04ee2fba92402e41ebcde62e9942d9ff952",
+    "docs/notes/preference-completion-20261005-summary.json": "5cea2c32f4e04add1a9c42126e2dbaee1a2178705a86a5d2650f2032c3ff5d01"
+  },
+  "git_status": "Offline implementation commit prepared; main merge/push held for live validation."
+}

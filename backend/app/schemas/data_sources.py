@@ -30,8 +30,9 @@ class ConnectionProfileResponse(BaseModel):
     display_name: str
     description: str
     adapter_type: str
-    mapping: MappingProfileResponse
+    mapping: MappingProfileResponse | None
     capabilities: list[str]
+    discovery_required: bool = False
 
 
 class DataSourceCreateRequest(BaseModel):
@@ -60,7 +61,7 @@ class DataSourceResponse(BaseModel):
     display_name: str
     adapter_type: str
     connection_profile_key: str
-    mapping: MappingProfileResponse
+    mapping: MappingProfileResponse | None
     status: OperationalDataSourceStatus
     last_validated_at: datetime | None
     last_successful_health_check_at: datetime | None
@@ -68,3 +69,4 @@ class DataSourceResponse(BaseModel):
     capabilities: list[str]
     created_at: datetime
     updated_at: datetime
+    mapping_version: int | None = None

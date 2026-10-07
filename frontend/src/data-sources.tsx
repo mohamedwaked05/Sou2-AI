@@ -19,6 +19,7 @@ import {
   DataSourceStatus,
 } from "./api";
 import { Alert, BusyLabel, PageHeading, Skeleton } from "./ui";
+import { MappingOnboarding } from "./mapping-onboarding";
 
 const capabilityLabels: Record<string, string> = {
   products: "Products",
@@ -48,7 +49,7 @@ function safeErrorMessage(error: unknown) {
     data_source_state_conflict:
       "The source changed or is not ready for that action. Refresh and try again.",
     active_data_source_conflict:
-      "Another PostgreSQL operational source is already active for this business.",
+      "Another operational source is already active for this business.",
   };
   return messages[error.code] ?? error.message;
 }
@@ -72,6 +73,15 @@ function DataSourceBadge({ status }: { status: DataSourceStatus }) {
 
 function MappingSummary({ profile }: { profile: ConnectionProfile }) {
   const { mapping } = profile;
+  if (!mapping)
+    return (
+      <div className="mapping-preview">
+        <p>
+          Discover approved catalogue metadata, review a product mapping, then confirm
+          it before activation. Inventory, pricing and sales are unavailable.
+        </p>
+      </div>
+    );
   return (
     <div className="mapping-preview">
       <div>
@@ -109,7 +119,9 @@ function ConnectDialog({
   const nameId = useId();
   const dialog = useRef<HTMLDivElement>(null);
   const cancel = useRef<HTMLButtonElement>(null);
-  const [displayName, setDisplayName] = useState("Lebanese Minimarket Demo");
+  const [displayName, setDisplayName] = useState(
+    profile.mapping ? "Lebanese Minimarket Demo" : profile.display_name,
+  );
 
   useEffect(() => {
     const previousOverflow = document.body.style.overflow;
@@ -165,7 +177,11 @@ function ConnectDialog({
         <span className="dialog-source-icon">
           <Database aria-hidden="true" />
         </span>
-        <h2 id={titleId}>Connect PostgreSQL demo store</h2>
+        <h2 id={titleId}>
+          {profile.mapping
+            ? "Connect PostgreSQL demo store"
+            : "Connect catalogue source"}
+        </h2>
         <p>
           Sou2AI will use a deployment-managed, read-only profile. Credentials and
           arbitrary database addresses are never entered here.
@@ -308,11 +324,15 @@ function DisableDialog({
 
 function SourceCard({
   source,
+  businessId,
+  onRefresh,
   busyAction,
   onAction,
   onDisable,
 }: {
   source: DataSource;
+  businessId: string;
+  onRefresh: () => Promise<void>;
   busyAction: string;
   onAction: (
     source: DataSource,
@@ -331,7 +351,12 @@ function SourceCard({
           </span>
           <div>
             <h2>{source.display_name}</h2>
-            <p>PostgreSQL · deployment-managed read-only profile</p>
+            <p>
+              {source.adapter_type === "sqlserver_readonly"
+                ? "SQL Server"
+                : "PostgreSQL"}{" "}
+              · deployment-managed read-only profile
+            </p>
           </div>
         </div>
         <DataSourceBadge status={source.status} />
@@ -362,33 +387,47 @@ function SourceCard({
         <div>
           <dt>Mapping profile</dt>
           <dd>
-            {mapping.display_name} · v{mapping.version}
+            {mapping
+              ? `${mapping.display_name} · v${mapping.version}`
+              : source.mapping_version
+                ? `Catalogue mapping · v${source.mapping_version}`
+                : "Review required"}
           </dd>
         </div>
         <div>
           <dt>Source rules</dt>
           <dd>
-            {mapping.currency} · {mapping.source_timezone}
+            {mapping
+              ? `${mapping.currency} · ${mapping.source_timezone}`
+              : "Catalogue only; stock unknown"}
           </dd>
         </div>
       </dl>
 
-      <div className="source-semantics">
-        <div>
-          <ShieldCheck aria-hidden="true" />
-          <p>
-            Completed and returned sales are finalized; pending and cancelled sales are
-            excluded. Refunds reduce quantity and revenue.
-          </p>
+      {mapping ? (
+        <div className="source-semantics">
+          <div>
+            <ShieldCheck aria-hidden="true" />
+            <p>
+              Completed and returned sales are finalized; pending and cancelled sales
+              are excluded. Refunds reduce quantity and revenue.
+            </p>
+          </div>
+          <div>
+            <Warehouse aria-hidden="true" />
+            <p>
+              Branches are sales locations. Warehouses hold stock. Active, unexpired
+              reservations reduce available quantity.
+            </p>
+          </div>
         </div>
-        <div>
-          <Warehouse aria-hidden="true" />
-          <p>
-            Branches are sales locations. Warehouses hold stock. Active, unexpired
-            reservations reduce available quantity.
-          </p>
-        </div>
-      </div>
+      ) : (
+        <MappingOnboarding
+          businessId={businessId}
+          source={source}
+          onRefresh={onRefresh}
+        />
+      )}
 
       <section className="source-capabilities" aria-labelledby={`caps-${source.id}`}>
         <h3 id={`caps-${source.id}`}>Available capabilities</h3>
@@ -463,6 +502,7 @@ function SourceCard({
 export function DataSourcesPage({ business }: { business: Business }) {
   const [sources, setSources] = useState<DataSource[] | null>(null);
   const [profiles, setProfiles] = useState<ConnectionProfile[]>([]);
+  const [profileKey, setProfileKey] = useState("");
   const [showConnect, setShowConnect] = useState(false);
   const [disableTarget, setDisableTarget] = useState<DataSource | null>(null);
   const [busyAction, setBusyAction] = useState("");
@@ -494,7 +534,7 @@ export function DataSourcesPage({ business }: { business: Business }) {
   }, [load]);
 
   async function create(displayName: string) {
-    const profile = profiles[0];
+    const profile = profiles.find((item) => item.key === profileKey) ?? profiles[0];
     if (!profile) return;
     setBusyAction("create");
     setError("");
@@ -503,8 +543,8 @@ export function DataSourcesPage({ business }: { business: Business }) {
       const created = await api.createDataSource(business.id, {
         display_name: displayName,
         connection_profile_key: profile.key,
-        mapping_profile_key: profile.mapping.key,
-        mapping_profile_version: profile.mapping.version,
+        mapping_profile_key: profile.mapping?.key ?? "discovered_products",
+        mapping_profile_version: profile.mapping?.version ?? 1,
       });
       setSources((current) => [...(current ?? []), created]);
       setShowConnect(false);
@@ -574,7 +614,8 @@ export function DataSourcesPage({ business }: { business: Business }) {
     }
   }
 
-  const availableProfile = profiles[0];
+  const availableProfile =
+    profiles.find((item) => item.key === profileKey) ?? profiles[0];
   return (
     <>
       <PageHeading
@@ -591,6 +632,22 @@ export function DataSourcesPage({ business }: { business: Business }) {
       />
 
       {error ? <Alert>{error}</Alert> : null}
+      {profiles.length > 1 ? (
+        <label>
+          Connection profile
+          <select
+            value={availableProfile?.key ?? ""}
+            onChange={(event) => setProfileKey(event.target.value)}
+            disabled={busyAction !== ""}
+          >
+            {profiles.map((profile) => (
+              <option key={profile.key} value={profile.key}>
+                {profile.display_name}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : null}
       {success ? <Alert tone="success">{success}</Alert> : null}
 
       {sources === null ? (
@@ -634,7 +691,9 @@ export function DataSourcesPage({ business }: { business: Business }) {
                 className="btn"
                 onClick={() => setShowConnect(true)}
               >
-                Connect demo source
+                {availableProfile.mapping
+                  ? "Connect demo source"
+                  : "Connect catalogue source"}
               </button>
             </article>
           ) : (
@@ -650,6 +709,8 @@ export function DataSourcesPage({ business }: { business: Business }) {
             <SourceCard
               key={source.id}
               source={source}
+              businessId={business.id}
+              onRefresh={load}
               busyAction={busyAction}
               onAction={act}
               onDisable={setDisableTarget}
