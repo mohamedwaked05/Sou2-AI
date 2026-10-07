@@ -1084,7 +1084,8 @@ def test_saved_rejected_location_yes_keeps_validated_state_offline(
     executor = SimpleNamespace(
         sales_reporting_context=lambda *args: ("Asia/Beirut", ()),
         _active_source=lambda *args: SimpleNamespace(
-            updated_at=pending.source_updated_at
+            updated_at=pending.source_updated_at,
+            mapping_profile_key=FAKE_STORE_PROFILE.mapping_profile_key,
         ),
     )
     monkeypatch.setattr(owner_chat, "_pending_sales_clarification", lambda *args: False)

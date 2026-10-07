@@ -250,6 +250,10 @@ class MappedProductSource:
         self.mapping = mapping
         self.revision_version = revision_version
 
+    @property
+    def enforced_query_timeout_seconds(self) -> int:
+        return self.connector.config.query_timeout_seconds
+
     def search(self, request: CatalogueRequest) -> CatalogueResult:
         if (
             request.mapping_version is not None

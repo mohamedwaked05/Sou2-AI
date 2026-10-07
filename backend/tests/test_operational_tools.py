@@ -344,10 +344,11 @@ def executor_setup(client: TestClient, session: Session):
     return user, business, registry, executor
 
 
-def test_registry_contains_exactly_four_provider_neutral_tools() -> None:
+def test_registry_contains_five_provider_neutral_tools() -> None:
     registry = build_operational_tool_registry(timeout_seconds=2)
 
     assert tuple(registry) == (
+        "product_search",
         CURRENT_INVENTORY_TOOL,
         SALES_SUMMARY_TOOL,
         BEST_SELLING_PRODUCTS_TOOL,

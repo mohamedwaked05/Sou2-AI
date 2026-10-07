@@ -86,6 +86,12 @@ from app.schemas.owner_chat import (
     OwnerMessageRequest,
     OwnerTurnResponse,
 )
+from app.schemas.source_mapping import (
+    CatalogueProduct,
+    CatalogueRequest,
+    CatalogueResult,
+    PendingCatalogueClarification,
+)
 from app.services.ai_usage import (
     AIUsageReservationClaim,
     reconcile_ai_usage,
@@ -103,9 +109,11 @@ from app.services.conversations import get_default_conversation, load_conversati
 from app.tools.operational import (
     BEST_SELLING_PRODUCTS_TOOL,
     CURRENT_INVENTORY_TOOL,
+    PRODUCT_SEARCH_TOOL,
     RESTOCKING_RECOMMENDATIONS_TOOL,
     SALES_SUMMARY_TOOL,
     OperationalToolExecutor,
+    OperationalToolResult,
     ToolExecutionError,
     _contains_control_payload,
 )
@@ -1120,6 +1128,8 @@ def _build_category_resolution_request(
 def _operational_synthesis_status(output: object) -> str:
     """Classify backend-validated tool output for response-only verification."""
 
+    if isinstance(output, CatalogueResult):
+        return "data" if output.status == "resolved" else output.status
     if isinstance(output, MetricCapabilityResult):
         return "unsupported" if output.status == "unsupported" else "data"
     if isinstance(output, InventoryResult):
@@ -1839,6 +1849,7 @@ def _backend_operational_command(
     """Derive one allowlisted command from semantic intent and typed inputs only."""
 
     tool_by_operation = {
+        "product_search": PRODUCT_SEARCH_TOOL,
         "inventory_product": CURRENT_INVENTORY_TOOL,
         "inventory_category": CURRENT_INVENTORY_TOOL,
         "inventory_list": CURRENT_INVENTORY_TOOL,
@@ -1865,7 +1876,11 @@ def _backend_operational_command(
     proposal = _validated_provider_arguments(executor, tool_name, result.tool_arguments)
     arguments: dict[str, object] = {}
 
-    if tool_name == CURRENT_INVENTORY_TOOL:
+    if tool_name == PRODUCT_SEARCH_TOOL:
+        if proposal is None:
+            return None
+        arguments = proposal
+    elif tool_name == CURRENT_INVENTORY_TOOL:
         # Only the typed semantic entity can scope an inventory lookup. A provider
         # may propose an owner-facing location reference, which is separately
         # resolved by _prepare_inventory_location_arguments below.
@@ -3469,13 +3484,10 @@ def _exact_category_candidate_reference(
     return matches[0] if len(matches) == 1 else None
 
 
-def _pending_product_clarification(
+def _previous_product_clarification(
     session: Session,
-    executor: OperationalToolExecutor,
-    user: User,
-    business_id: uuid.UUID,
     owner_message_id: uuid.UUID,
-) -> PendingInventoryClarification | None:
+) -> dict[str, object] | None:
     """Read only the immediately preceding, scoped backend clarification."""
 
     owner_message = session.get(OwnerChatMessage, owner_message_id)
@@ -3489,10 +3501,31 @@ def _pending_product_clarification(
             OwnerChatMessage.generation_state == ChatGenerationState.COMPLETED,
         )
     )
+    if previous_owner is None:
+        # A failed turn has no answer and must not consume a catalogue choice.
+        previous_owner = session.scalar(
+            select(OwnerChatMessage)
+            .where(
+                OwnerChatMessage.conversation_id == owner_message.conversation_id,
+                OwnerChatMessage.sequence_number < owner_message.sequence_number,
+                OwnerChatMessage.role == ChatMessageRole.OWNER,
+                OwnerChatMessage.generation_state == ChatGenerationState.COMPLETED,
+            )
+            .order_by(OwnerChatMessage.sequence_number.desc())
+            .limit(1)
+        )
+        if (
+            previous_owner is None
+            or (previous_owner.operational_clarification or {}).get("operation")
+            != PRODUCT_SEARCH_TOOL
+        ):
+            return None
     previous_assistant = session.scalar(
         select(OwnerChatMessage).where(
             OwnerChatMessage.conversation_id == owner_message.conversation_id,
-            OwnerChatMessage.sequence_number == owner_message.sequence_number - 1,
+            OwnerChatMessage.sequence_number == previous_owner.sequence_number + 1
+            if previous_owner is not None
+            else False,
             OwnerChatMessage.role == ChatMessageRole.ASSISTANT,
             OwnerChatMessage.reply_to_message_id == previous_owner.id
             if previous_owner is not None
@@ -3505,10 +3538,27 @@ def _pending_product_clarification(
         or previous_owner.operational_clarification is None
     ):
         return None
+    return previous_owner.operational_clarification
+
+
+def _pending_product_clarification(
+    session: Session,
+    executor: OperationalToolExecutor,
+    user: User,
+    business_id: uuid.UUID,
+    owner_message_id: uuid.UUID,
+) -> PendingInventoryClarification | PendingCatalogueClarification | None:
+    state = _previous_product_clarification(session, owner_message_id)
+    if state is None:
+        return None
+    owner_message = session.get(OwnerChatMessage, owner_message_id)
     try:
-        pending = PendingInventoryClarification.model_validate(
-            previous_owner.operational_clarification
+        contract = (
+            PendingCatalogueClarification
+            if state.get("operation") == PRODUCT_SEARCH_TOOL
+            else PendingInventoryClarification
         )
+        pending = contract.model_validate(state)
     except ValidationError:
         return None
     source = executor._active_source(business_id)
@@ -3523,6 +3573,25 @@ def _pending_product_clarification(
         or pending.expires_at <= utc_now()
     ):
         return None
+    if isinstance(pending, PendingCatalogueClarification):
+        from app.integrations.discovery import SourceMappingError
+        from app.services.source_mapping import mapped_source
+
+        if (
+            pending.business_id != business_id
+            or pending.conversation_id != owner_message.conversation_id
+        ):
+            return None
+        try:
+            adapter = mapped_source(session, executor._profiles, source)
+        except SourceMappingError:
+            return None
+        if (
+            pending.mapping_version != adapter.revision_version
+            or pending.schema_fingerprint != adapter.discovery.schema_fingerprint
+            or pending.source_fingerprint != adapter.discovery.source_fingerprint
+        ):
+            return None
     return pending
 
 
@@ -3561,6 +3630,26 @@ def _operational_pending_context(
     pending = _pending_product_clarification(
         session, executor, user, business_id, owner.id
     )
+    if isinstance(pending, PendingCatalogueClarification):
+        return {
+            "operation": PRODUCT_SEARCH_TOOL,
+            "expected_reply": "selection",
+            "owner_request": pending.owner_request,
+            "question": _pending_inventory_reply(pending),
+            "candidates": [
+                {"names": item.names, "sku": item.sku} for item in pending.candidates
+            ],
+        }
+    previous_state = _previous_product_clarification(session, owner.id)
+    if (
+        pending is None
+        and (previous_state or {}).get("operation") == PRODUCT_SEARCH_TOOL
+    ):
+        return {
+            "operation": PRODUCT_SEARCH_TOOL,
+            "expected_reply": "restart",
+            "status": "invalid_or_expired",
+        }
     previous_owner = session.scalar(
         select(OwnerChatMessage).where(
             OwnerChatMessage.conversation_id == owner.conversation_id,
@@ -3650,6 +3739,10 @@ def _source_candidate_selection(
             )
             if isinstance(value := getattr(candidate, field, None), str)
         )
+        if isinstance(candidate, CatalogueProduct):
+            values += tuple(
+                _normalized_classifier_text(name) for name in candidate.names
+            )
         if any(f" {value} " in f" {normalized} " for value in values) or (
             grounded_phrase and any(f" {phrase} " in f" {value} " for value in values)
         ):
@@ -3657,7 +3750,18 @@ def _source_candidate_selection(
     return matches[0] if len(matches) == 1 else None
 
 
-def _pending_inventory_reply(pending: PendingInventoryClarification) -> str:
+def _pending_inventory_reply(
+    pending: PendingInventoryClarification | PendingCatalogueClarification,
+) -> str:
+    if isinstance(pending, PendingCatalogueClarification):
+        return _catalogue_reply(
+            CatalogueResult(
+                mapping_version=pending.mapping_version,
+                status="ambiguous",
+                items=pending.candidates,
+                truncated=pending.truncated,
+            )
+        )
     if pending.candidates:
         labels = [
             f"{item.name} ({item.sku})" if item.sku else item.name
@@ -3762,6 +3866,84 @@ def _store_product_clarification(
     owner_message.operational_clarification = pending.model_dump(mode="json")
 
 
+def _catalogue_label(item: CatalogueProduct) -> str:
+    return (
+        "/".join(_safe_operational_label(name, "Product") for name in item.names)
+        + f" (ID: {_safe_operational_label(item.external_product_id, 'product')})"
+        + (f"; SKU: {_safe_operational_label(item.sku, 'unknown')}" if item.sku else "")
+        + (
+            "; category: "
+            + "/".join(
+                _safe_operational_label(label, "unknown") for label in item.categories
+            )
+            if item.categories
+            else ""
+        )
+    )
+
+
+def _chat_catalogue_result(output: CatalogueResult) -> CatalogueResult:
+    """Only displayed choices are offered; leave space for the bounded reply."""
+    size = 0
+    offered = []
+    for item in output.items:
+        size += len(_catalogue_label(item)) + 2
+        if size > 12_000:
+            break
+        offered.append(item)
+    return output.model_copy(
+        update={
+            "items": tuple(offered),
+            "truncated": output.truncated or len(offered) < len(output.items),
+        }
+    )
+
+
+def _catalogue_reply(output: CatalogueResult) -> str:
+    """Render only validated catalogue fields; quantities and prices are unknown."""
+    if output.status == "not_found":
+        return "No matching catalogue product was found. Stock and prices are unknown."
+    output = _chat_catalogue_result(output)
+    labels = [_catalogue_label(item) for item in output.items]
+    reply = (
+        "Which catalogue product do you mean: " + "; ".join(labels) + "?"
+        if output.status == "ambiguous"
+        else "Catalogue product: " + labels[0] + "."
+    )
+    if output.truncated:
+        reply += " More variants may exist; narrow the search if yours is not offered."
+    return reply + " Stock and prices are unknown."
+
+
+def _store_catalogue_clarification(
+    session: Session,
+    user: User,
+    business_id: uuid.UUID,
+    owner_message_id: uuid.UUID,
+    executed: OperationalToolResult,
+) -> None:
+    output = executed.output
+    if not isinstance(output, CatalogueResult) or output.status != "ambiguous":
+        return
+    output = _chat_catalogue_result(output)
+    owner = session.get(OwnerChatMessage, owner_message_id)
+    pending = PendingCatalogueClarification(
+        business_id=business_id,
+        user_id=user.id,
+        conversation_id=owner.conversation_id,
+        source_id=executed.source_id,
+        source_updated_at=executed.source_updated_at,
+        mapping_version=output.mapping_version,
+        schema_fingerprint=executed.schema_fingerprint,
+        source_fingerprint=executed.source_fingerprint,
+        expires_at=utc_now() + PREFERENCE_PENDING_TTL,
+        candidates=output.items,
+        truncated=output.truncated,
+        owner_request=owner.content,
+    )
+    owner.operational_clarification = pending.model_dump(mode="json")
+
+
 def _store_inventory_choice(
     session: Session,
     executor: OperationalToolExecutor,
@@ -3826,6 +4008,16 @@ def _run_operational_loop(
     )
     pending_product = _pending_product_clarification(
         session, executor, user, business_id, claim.message_id
+    )
+    pending_catalogue = (
+        pending_product
+        if isinstance(pending_product, PendingCatalogueClarification)
+        else None
+    )
+    pending_product = (
+        pending_product
+        if isinstance(pending_product, PendingInventoryClarification)
+        else None
     )
     pending_product_candidates = (
         tuple(
@@ -3901,18 +4093,17 @@ def _run_operational_loop(
                 }
                 and exc.usage is not None
                 and exc.usage.authoritative
-                and pending_product is not None
+                and (pending_product is not None or pending_catalogue is not None)
             ):
                 # The rejected plan cannot execute. Known returned usage is still
                 # charged, while the source-backed question remains answerable.
                 aggregate_usage = _add_usage(aggregate_usage, exc.usage)
                 owner = session.get(OwnerChatMessage, claim.message_id)
-                owner.operational_clarification = pending_product.model_dump(
-                    mode="json"
-                )
+                pending = pending_product or pending_catalogue
+                owner.operational_clarification = pending.model_dump(mode="json")
                 session.commit()
                 return OwnerChatResult(
-                    reply=_pending_inventory_reply(pending_product),
+                    reply=_pending_inventory_reply(pending),
                     usage=aggregate_usage,
                     provider_identifier=exc.provider_identifier,
                     model_identifier=exc.model_identifier,
@@ -3924,6 +4115,51 @@ def _run_operational_loop(
                     else aggregate_usage
                 )
             raise
+        catalogue_arguments = None
+        if (request.pending_clarification or {}).get(
+            "operation"
+        ) == PRODUCT_SEARCH_TOOL:
+            selection = (
+                _source_candidate_selection(
+                    request.messages[-1].content,
+                    (result.tool_arguments or {}).get("query"),
+                    pending_catalogue.candidates,
+                )
+                if pending_catalogue is not None
+                and result.pending_reply not in {"unrelated", "cancel"}
+                else None
+            )
+            if result.pending_reply == "cancel" or (
+                result.pending_reply != "unrelated" and selection is None
+            ):
+                aggregate_usage = _add_usage(
+                    aggregate_usage, _usage_for_result(provider, request, result)
+                )
+                owner = session.get(OwnerChatMessage, claim.message_id)
+                if result.pending_reply == "cancel":
+                    reply = "The pending catalogue choice is cancelled."
+                elif pending_catalogue is None:
+                    reply = (
+                        "That catalogue selection is expired or no longer valid. "
+                        "Start a new search."
+                    )
+                else:
+                    owner.operational_clarification = pending_catalogue.model_dump(
+                        mode="json"
+                    )
+                    reply = _pending_inventory_reply(pending_catalogue)
+                session.commit()
+                return OwnerChatResult(
+                    reply=reply,
+                    usage=aggregate_usage,
+                    provider_identifier=result.provider_identifier,
+                    model_identifier=result.model_identifier,
+                ), aggregate_usage
+            if selection is not None:
+                catalogue_arguments = CatalogueRequest(
+                    external_product_id=selection.external_product_id,
+                    mapping_version=pending_catalogue.mapping_version,
+                ).model_dump(mode="json", exclude_none=True)
         original_action = result.decision
         selected_product = (
             _selected_pending_product(request.messages[-1].content, pending_product)
@@ -4000,6 +4236,25 @@ def _run_operational_loop(
         result, command = _consistent_operational_plan(
             result, executor, request.category_candidates, request
         )
+        if catalogue_arguments is not None:
+            command = _ValidatedOperationalCommand(
+                tool_name=PRODUCT_SEARCH_TOOL,
+                arguments=catalogue_arguments,
+                provider_tool_fields="backend_selection",
+                consistency_outcome="accepted",
+            )
+            result = replace(
+                result,
+                decision="tool",
+                semantic_operation=PRODUCT_SEARCH_TOOL,
+                tool_name=PRODUCT_SEARCH_TOOL,
+                tool_arguments=catalogue_arguments,
+                entity_kind=None,
+                entity_query=None,
+                reply="",
+                preference_key=None,
+                location_reference=None,
+            )
         _logger.info(
             "owner_chat_operational_plan semantic_operation=%s entity_kind=%s "
             "original_action=%s effective_action=%s consistency_outcome=%s "
@@ -4026,6 +4281,32 @@ def _run_operational_loop(
                 provider_identifier=result.provider_identifier,
                 model_identifier=result.model_identifier,
             )
+        if (
+            source is not None
+            and source.mapping_profile_key == "discovered_products"
+            and result.semantic_operation
+            not in {PRODUCT_SEARCH_TOOL, "conversation", "knowledge"}
+        ):
+            return OwnerChatResult(
+                reply="The connected catalogue provides product details only. "
+                "Stock, prices, inventory and sales are unknown.",
+                usage=aggregate_usage,
+                provider_identifier=result.provider_identifier,
+                model_identifier=result.model_identifier,
+            ), aggregate_usage
+        if (
+            source is not None
+            and source.mapping_profile_key == "discovered_products"
+            and result.semantic_operation == PRODUCT_SEARCH_TOOL
+            and command is None
+        ):
+            return OwnerChatResult(
+                reply="Specify a product name or identifier to search the catalogue. "
+                "Stock and prices are unknown.",
+                usage=aggregate_usage,
+                provider_identifier=result.provider_identifier,
+                model_identifier=result.model_identifier,
+            ), aggregate_usage
         if (
             pending_product is not None
             and selected_product is None
@@ -4956,6 +5237,16 @@ def _run_operational_loop(
             tool_name=executed.tool_name,
             output=executed.output.model_dump(mode="json"),
         )
+        if isinstance(executed.output, CatalogueResult):
+            _store_catalogue_clarification(
+                session, user, business_id, claim.message_id, executed
+            )
+            return OwnerChatResult(
+                reply=_catalogue_reply(executed.output),
+                usage=aggregate_usage,
+                provider_identifier=result.provider_identifier,
+                model_identifier=result.model_identifier,
+            ), aggregate_usage
         if executed.tool_name == CURRENT_INVENTORY_TOOL:
             _store_product_clarification(
                 session,
@@ -5074,6 +5365,23 @@ def _validate_pending_preference_reply(
     result: OwnerChatResult, request: OwnerChatRequest
 ) -> None:
     """Require AI-classified, current-message evidence before abandoning a choice."""
+    if (request.pending_clarification or {}).get("operation") == PRODUCT_SEARCH_TOOL:
+        if result.pending_reply == "replace":
+            raise OwnerChatProviderInvalidResponse(reason="invalid_pending_transition")
+        if result.pending_reply in {"cancel", "unrelated"}:
+            quote = result.pending_request
+            message = " ".join(request.messages[-1].content.split())
+            if (
+                not isinstance(quote, str)
+                or not quote.strip()
+                or " ".join(quote.split()) not in message
+            ):
+                raise OwnerChatProviderInvalidResponse(
+                    reason="invalid_pending_transition"
+                )
+        elif result.pending_request is not None:
+            raise OwnerChatProviderInvalidResponse(reason="invalid_pending_transition")
+        return
     if (request.pending_clarification or {}).get("operation") != "preference":
         if result.pending_reply in {"cancel", "replace"} or result.pending_request:
             raise OwnerChatProviderInvalidResponse(reason="invalid_pending_transition")
@@ -5132,6 +5440,7 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
         _validate_pending_preference_reply(result, request)
         result = normalize_legacy_operational_preference(result)
         if result.semantic_operation not in {
+            "product_search",
             "inventory_product",
             "inventory_category",
             "inventory_list",

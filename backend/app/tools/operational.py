@@ -9,7 +9,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from types import MappingProxyType
 from typing import Any, Literal
 
@@ -27,6 +27,8 @@ from app.database.models import (
     ToolCallStatus,
     User,
 )
+from app.integrations.discovery import SourceMappingError
+from app.integrations.mapped_products import MappedProductSource
 from app.integrations.operational import (
     OperationalDataInvalid,
     OperationalDataSource,
@@ -55,7 +57,9 @@ from app.schemas.operational import (
     SalesQuery,
     SalesSummary,
 )
+from app.schemas.source_mapping import CatalogueRequest, CatalogueResult
 from app.services.businesses import load_full_access_business
+from app.tools.catalogue import execute_product_search
 from app.utils.argument_hashing import hash_tool_arguments
 
 _logger = logging.getLogger(__name__)
@@ -64,6 +68,7 @@ CURRENT_INVENTORY_TOOL = "current_inventory"
 SALES_SUMMARY_TOOL = "sales_summary"
 BEST_SELLING_PRODUCTS_TOOL = "best_selling_products"
 RESTOCKING_RECOMMENDATIONS_TOOL = "restocking_recommendations"
+PRODUCT_SEARCH_TOOL = "product_search"
 UNKNOWN_TOOL_AUDIT_NAME = "unknown_tool"
 
 MAX_TOOL_RESULT_ROWS = 50
@@ -120,6 +125,22 @@ class CurrentInventoryPlannerInput(BaseModel):
         return normalized
 
 
+class ProductSearchPlannerInput(BaseModel):
+    """Search phrases only; approved selection scope is supplied by the backend."""
+
+    model_config = ConfigDict(extra="forbid")
+    query: str = Field(min_length=1, max_length=128)
+    limit: int = Field(default=20, ge=1, le=MAX_TOOL_RESULT_ROWS)
+
+    @field_validator("query")
+    @classmethod
+    def strip_query(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Product searches cannot be blank.")
+        return value
+
+
 class BestSellingProductsToolInput(BestSellersQuery):
     limit: int = Field(default=10, ge=1, le=MAX_BEST_SELLER_RESULTS)
 
@@ -150,7 +171,9 @@ class ToolExecutionError(Exception):
         super().__init__(code)
 
 
-ToolExecutor = Callable[[OperationalDataSource, BaseModel], BaseModel]
+ToolExecutor = Callable[
+    [OperationalDataSource | MappedProductSource, BaseModel], BaseModel
+]
 
 
 @dataclass(frozen=True)
@@ -182,6 +205,16 @@ class OperationalToolResult:
     tool_name: str
     output: BaseModel
     latency_ms: int
+    source_id: uuid.UUID | None = None
+    source_updated_at: datetime | None = None
+    schema_fingerprint: str | None = None
+    source_fingerprint: str | None = None
+
+
+def _product_search(source: MappedProductSource, query: BaseModel) -> BaseModel:
+    assert isinstance(source, MappedProductSource)
+    assert isinstance(query, CatalogueRequest)
+    return execute_product_search(source, query)
 
 
 def _inventory(source: OperationalDataSource, query: BaseModel) -> BaseModel:
@@ -327,6 +360,21 @@ def build_operational_tool_registry(
 
     definitions = (
         OperationalToolDefinition(
+            name=PRODUCT_SEARCH_TOOL,
+            description=(
+                "Search the approved product catalogue by name, key, SKU or alternate "
+                "identifier. Offer actual variants when ambiguous. Catalogue details "
+                "only; stock, prices, sales and inferred aliases are unknown."
+            ),
+            input_schema=CatalogueRequest,
+            provider_input_schema=ProductSearchPlannerInput,
+            output_schema=CatalogueResult,
+            capability="products",
+            result_limit=MAX_TOOL_RESULT_ROWS,
+            timeout_seconds=timeout_seconds,
+            executor=_product_search,
+        ),
+        OperationalToolDefinition(
             name=CURRENT_INVENTORY_TOOL,
             description=(
                 "Current inventory, quantities, reservations and availability; "
@@ -449,6 +497,24 @@ class OperationalToolExecutor:
                 self._session.rollback()
                 return ()
             capabilities = self._source_capabilities(source)
+            if source.mapping_profile_key == "discovered_products":
+                from app.services.source_mapping import mapped_source
+
+                adapter = mapped_source(self._session, self._profiles, source)
+                if not self._adapter_timeout_is_acceptable(adapter):
+                    self._session.rollback()
+                    return ()
+                expected_updated = source.updated_at
+                self._session.commit()
+                with adapter.connector.connection() as connection:
+                    adapter.connector.assert_schema(adapter.discovery, connection)
+                self._session.refresh(source)
+                if (
+                    source.status is not OperationalDataSourceStatus.ACTIVE
+                    or source.updated_at != expected_updated
+                ):
+                    return ()
+                return (self.registry[PRODUCT_SEARCH_TOOL],)
             adapter = self._profiles.resolve(source.connection_profile_key)
             if not self._adapter_timeout_is_acceptable(adapter):
                 self._session.rollback()
@@ -465,6 +531,7 @@ class OperationalToolExecutor:
                 definition
                 for definition in self.registry.values()
                 if definition.capability in capabilities
+                and definition.name != PRODUCT_SEARCH_TOOL
             )
         except Exception as exc:
             _logger.warning(
@@ -666,6 +733,10 @@ class OperationalToolExecutor:
             )
 
         result: BaseModel | None = None
+        schema_fingerprint = None
+        source_fingerprint = None
+        source_id = None
+        source_updated_at = None
         error_code: str | None = None
         audit_status = ToolCallStatus.ERROR
         try:
@@ -707,28 +778,45 @@ class OperationalToolExecutor:
                 raise ToolExecutionError("capability_unavailable")
             source_id = source.id
             source_updated_at = source.updated_at
-            adapter = self._profiles.resolve(source.connection_profile_key)
+            is_catalogue = source.mapping_profile_key == "discovered_products"
+            if definition.name == PRODUCT_SEARCH_TOOL:
+                if not is_catalogue:
+                    raise ToolExecutionError("capability_unavailable")
+                from app.services.source_mapping import mapped_source
+
+                adapter = mapped_source(self._session, self._profiles, source)
+                schema_fingerprint = adapter.discovery.schema_fingerprint
+                source_fingerprint = adapter.discovery.source_fingerprint
+            else:
+                adapter = self._profiles.resolve(source.connection_profile_key)
             if not self._adapter_timeout_is_acceptable(
                 adapter, maximum_seconds=definition.timeout_seconds
             ):
                 raise ToolExecutionError("integration_unavailable")
-            mapping = self._profiles.get_mapping(
-                source.mapping_profile_key, source.mapping_profile_version
-            )
-            if mapping is None:
-                raise ToolExecutionError("integration_unavailable")
-            self._session.commit()
-            health = adapter.check_health()
-            mapping.validate_health(health)
-            if (
-                definition.name == SALES_SUMMARY_TOOL
-                and getattr(query, "metric", "revenue") not in mapping.supported_metrics
-            ):
-                result = _unsupported_metric_result(
-                    query, mapping.supported_metrics, health.source_timezone or "UTC"
-                )
-            else:
+            if is_catalogue:
+                self._session.commit()
                 result = definition.executor(adapter, query)
+            else:
+                mapping = self._profiles.get_mapping(
+                    source.mapping_profile_key, source.mapping_profile_version
+                )
+                if mapping is None:
+                    raise ToolExecutionError("integration_unavailable")
+                self._session.commit()
+                health = adapter.check_health()
+                mapping.validate_health(health)
+                if (
+                    definition.name == SALES_SUMMARY_TOOL
+                    and getattr(query, "metric", "revenue")
+                    not in mapping.supported_metrics
+                ):
+                    result = _unsupported_metric_result(
+                        query,
+                        mapping.supported_metrics,
+                        health.source_timezone or "UTC",
+                    )
+                else:
+                    result = definition.executor(adapter, query)
             elapsed = time.monotonic() - started
             if elapsed > definition.timeout_seconds:
                 raise ToolExecutionError("timeout")
@@ -742,12 +830,24 @@ class OperationalToolExecutor:
                     OperationalDataSourceConfig.business_id == business_id,
                 )
             )
+            if current is not None:
+                self._session.refresh(current)
             if (
                 current is None
                 or current.status is not OperationalDataSourceStatus.ACTIVE
                 or current.updated_at != source_updated_at
             ):
                 raise ToolExecutionError("integration_unavailable")
+            if is_catalogue:
+                from app.services.source_mapping import latest_approved
+
+                revision = latest_approved(self._session, current)
+                if (
+                    revision is None
+                    or revision.version != adapter.revision_version
+                    or revision.schema_fingerprint != schema_fingerprint
+                ):
+                    raise ToolExecutionError("integration_unavailable")
             audit_status = ToolCallStatus.SUCCESS
         except ToolExecutionError as exc:
             error_code = exc.code
@@ -772,6 +872,18 @@ class OperationalToolExecutor:
             error_code = "adapter_failure"
         except MappingProfileError:
             error_code = "integration_unavailable"
+        except SourceMappingError as exc:
+            error_code = (
+                "invalid_arguments"
+                if exc.code
+                in {
+                    "mapping_selection_stale",
+                    "invalid_product_identifier",
+                    "empty_product_search",
+                }
+                else "integration_unavailable"
+            )
+            audit_status = ToolCallStatus.DENIED
         except Exception as exc:
             error_code = (
                 "authorization_denied"
@@ -806,6 +918,10 @@ class OperationalToolExecutor:
             tool_name=audit_name,
             output=result,
             latency_ms=latency_ms,
+            source_id=source_id,
+            source_updated_at=source_updated_at,
+            schema_fingerprint=schema_fingerprint,
+            source_fingerprint=source_fingerprint,
         )
 
     def reject(

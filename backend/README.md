@@ -223,12 +223,69 @@ run without holding a Sou2AI row lock, while the final tenant update rechecks th
 configuration under a lock. The Data Sources UI presents this lifecycle and the
 approved capabilities without accepting database coordinates or credentials.
 
-Owner chat uses these configurations only through the fixed `current_inventory`,
-`sales_summary`, `best_selling_products`, and `restocking_recommendations` tools.
+Owner chat uses the legacy demo configuration through the fixed
+`current_inventory`, `sales_summary`, `best_selling_products`, and
+`restocking_recommendations` tools. Approved discovered PostgreSQL and SQL Server
+catalogues instead expose only `product_search` through the same mapped execution
+path as catalogue search. Availability verifies current permissions, approved
+version, schema/source provenance and timeout. Source-backed ambiguity retains
+its business/user/conversation/source scope and original expiry; explicit unique
+offered choices re-read the source. Stock, prices, inventory and sales remain
+unknown. Catalogue replies render validated fields without resolver/synthesis
+calls; the planner receives search phrases rather than selection IDs.
 The centralized executor rechecks full tenant access, `ACTIVE` business and source
 state, live health, mapping capability, strict arguments, timeout, and result
 bounds. Arbitrary SQL, schema inspection, dynamic tools, and model access to
 credentials remain forbidden.
+
+### Local SQL Server backend with ODBC 18
+
+The existing [Dockerfile](Dockerfile) provides Python 3.14 and Microsoft's ODBC
+Driver 18. On the current Windows host, Driver 18 is absent and importing the
+OneDrive-backed SQLAlchemy SQL Server dialect raises `OSError: [Errno 22] Invalid
+argument`. The verified alternative uses the Linux backend image with the current
+`app` mounted read-only. It starts Uvicorn with a restricted runtime PostgreSQL
+connection at migration `20261007_16` and reaches SQL Server with the existing
+restricted reader. Driver `libmsodbcsql-18.7.so.1.1`, encrypted source connectivity,
+metadata/provenance checks, Hila `READ_ONLY`, and host HTTP health `200` were
+verified. No Windows privilege or installation change is required.
+
+From the repository root, this is the launch shape. `$PrivateEnvironment` is a
+string-valued environment dictionary prepared **in memory** by the existing
+DPAPI/private credential mechanism; do not print it or save plaintext JSON. It
+must supply the restricted `POSTGRESQL_DATABASE_URL`, `SOURCE_CONNECTIONS_JSON`
+(JSON array of operator-approved business bindings and discovery scopes), and
+the usual application settings. Migrator/operator credentials are unnecessary.
+For an offline check, set both providers to `mock` and omit the Gemini key.
+
+```powershell
+docker build -t sou2ai-local-backend -f backend/Dockerfile backend
+$SqlContainer = "sou2ai-supermarket-hila23-sqlserver-1"
+$AppPath = (Resolve-Path backend/app).Path
+$Launcher = 'import json,os,sys; os.environ.update(json.load(sys.stdin)); os.execvp("python",["python","-m","uvicorn","app.main:app","--host","0.0.0.0","--port","18089"])'
+$PrivateEnvironment | ConvertTo-Json -Compress -Depth 20 |
+  docker run --rm -i --network "container:$SqlContainer" `
+    --mount "type=bind,source=$AppPath,target=/app/app,readonly" `
+    sou2ai-local-backend python -c $Launcher
+```
+
+Sharing the local SQL Server container's network namespace makes its existing
+source available at `127.0.0.1:1433` inside the backend. The source URL requires
+`driver=ODBC+Driver+18+for+SQL+Server&Encrypt=yes`. The existing local-only
+`TrustServerCertificate=yes` exception is confined to loopback development;
+remote sources still require certificate verification. No global TLS setting
+changes. Application PostgreSQL/Redis addresses must be reachable from this
+namespace; use restricted runtime credentials. Docker cannot combine this
+network mode with `-p`: the verification used a separate credential-free TCP
+proxy on the SQL Server's Docker network, published only at `127.0.0.1:18789`,
+forwarding to the backend at port `18089`. The host then reached
+`http://127.0.0.1:18789/api/v1/health`. The private harness and proxy were removed
+from running containers after verification; they are not repository dependencies.
+
+Credentials were delivered only through stdin and installed in the backend
+process environment, absent from Docker environment metadata, images and command
+arguments. See the [catalogue chat validation handoff](../docs/notes/reusable-product-chat-20261007.md)
+for the actual checks, limitations and separately authorized live plan.
 
 From `backend`, apply or roll back the schema:
 

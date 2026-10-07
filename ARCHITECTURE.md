@@ -225,10 +225,18 @@ Ambiguous searches offer variants without choosing one. Missing stock is null.
 
 Authenticated Data Sources routes/UI expose discovery, structured review,
 approval, activation and catalogue search. Catalogue-only sources declare only
-`products`; existing owner-chat inventory/sales tools reject unsupported
-capabilities. The owner-chat planner does not yet dispatch the new catalogue
-search operation. Existing PostgreSQL demo tools and semantic rules remain
-supported. One active operational source per business avoids cross-engine
+`products`. Owner chat exposes the typed `product_search` operation only after
+checking the approved mapping, restricted permissions, schema/source provenance
+and enforced timeout. It executes the same validated mapped-product path as the
+catalogue API and renders bounded source-backed details without a resolver or
+synthesis call. Inventory, pricing and sales remain unavailable for these sources.
+Ambiguity stores the offered string identifiers with business, user, conversation,
+source, mapping version, schema/source fingerprints and expiry. Unresolved replies
+preserve that state and expiry; a unique explicit offered choice re-reads the
+approved source. Expired, stale or cross-scope choices cannot execute. Terminal
+replay bypasses generation, source reads, accounting and mutations. Existing
+PostgreSQL demo tools and semantic rules remain supported. One active operational
+source per business avoids cross-engine
 selection ambiguity. Views, custom expressions, inferred translations/aliases,
 stock, pricing and sales mappings are outside this first phase.
 
@@ -254,8 +262,10 @@ flowchart TD
     P -->|Final answer| FINAL[Persist assistant response]
 ```
 
-The registry contains only `current_inventory`, `sales_summary`,
-`best_selling_products`, and `restocking_recommendations`. A turn permits at most
+The registry contains `product_search` for approved discovered catalogue sources,
+and `current_inventory`, `sales_summary`, `best_selling_products`, and
+`restocking_recommendations` for the legacy PostgreSQL demo. Each source exposes
+only its supported operations. A turn permits at most
 two executions and three provider calls, rejects an identical repeated request,
 and treats returned records as untrusted data rather than instructions. Current
 operational data takes precedence over history, documents, profile text, and model

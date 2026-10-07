@@ -5,7 +5,7 @@ import json
 import uuid
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 
 class MappingContract(BaseModel):
@@ -90,7 +90,7 @@ class IdentifierMapping(MappingContract):
 
 class ProductMapping(MappingContract):
     contract_version: Literal[1] = 1
-    capability: Literal["products"] = "products"
+    capability: Literal["products"]
     object_id: str = Field(pattern=r"^o[0-9]{1,3}$")
     key_columns: tuple[str, ...] = Field(min_length=1, max_length=4)
     name_columns: tuple[str, ...] = Field(min_length=1, max_length=3)
@@ -166,3 +166,30 @@ class CatalogueResult(MappingContract):
     items: tuple[CatalogueProduct, ...] = Field(max_length=50)
     truncated: bool
     capabilities: tuple[Literal["products"], ...] = ("products",)
+
+
+class PendingCatalogueClarification(MappingContract):
+    """Scoped source choices; the planner cannot create selection identifiers."""
+
+    operation: Literal["product_search"] = "product_search"
+    business_id: uuid.UUID
+    user_id: uuid.UUID
+    conversation_id: uuid.UUID
+    source_id: uuid.UUID
+    source_updated_at: AwareDatetime
+    mapping_version: int = Field(ge=1)
+    schema_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    source_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    expires_at: AwareDatetime
+    candidates: tuple[CatalogueProduct, ...] = Field(min_length=1, max_length=50)
+    truncated: bool
+    owner_request: str = Field(min_length=1, max_length=14_000)
+
+    @model_validator(mode="after")
+    def validate_choices(self) -> PendingCatalogueClarification:
+        identifiers = [item.external_product_id for item in self.candidates]
+        if len(set(identifiers)) != len(identifiers) or (
+            len(identifiers) < 2 and not self.truncated
+        ):
+            raise ValueError("A catalogue clarification requires ambiguous choices.")
+        return self

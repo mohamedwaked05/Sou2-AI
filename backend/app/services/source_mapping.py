@@ -115,9 +115,16 @@ def mapped_source(
     if revision is None:
         raise SourceMappingError("mapping_approval_required")
     try:
+        discovery = SchemaDiscovery.model_validate(revision.discovery)
+        connector = connector_for(registry, source)
+        if (
+            revision.schema_fingerprint != discovery.schema_fingerprint
+            or connector.source_fingerprint != discovery.source_fingerprint
+        ):
+            raise SourceMappingError("mapping_schema_changed")
         return MappedProductSource(
-            connector_for(registry, source),
-            SchemaDiscovery.model_validate(revision.discovery),
+            connector,
+            discovery,
             ProductMapping.model_validate(revision.approved_mapping),
             revision.version,
         )

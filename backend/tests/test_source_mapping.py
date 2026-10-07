@@ -4,7 +4,9 @@ import json
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from threading import Event
+from typing import NamedTuple
 
 import httpx
 import pytest
@@ -15,12 +17,14 @@ from app.agent.mapping_provider import (
 )
 from app.agent.owner_chat_provider import (
     GeminiOwnerChatProvider,
+    OwnerChatProviderInvalidResponse,
     OwnerChatProviderUnavailable,
     TokenUsage,
+    get_owner_chat_provider,
 )
 from app.core.config import get_settings
 from app.core.exceptions import ApplicationError
-from app.database.models import SourceMappingRevision, User
+from app.database.models import OwnerChatMessage, SourceMappingRevision, User
 from app.integrations.discovery import (
     DiscoveryScope,
     EngineConnector,
@@ -34,7 +38,9 @@ from app.integrations.mapped_products import (
 from app.integrations.profiles import ConnectionProfile, get_connection_profile_registry
 from app.main import app
 from app.schemas.source_mapping import (
+    CatalogueProduct,
     CatalogueRequest,
+    CatalogueResult,
     CategoryMapping,
     DiscoveredColumn,
     DiscoveredObject,
@@ -44,14 +50,17 @@ from app.schemas.source_mapping import (
     ProductMapping,
     SchemaDiscovery,
 )
+from app.services import owner_chat
 from app.tools.operational import OperationalToolExecutor, ToolExecutionError
 from pydantic import SecretStr, ValidationError
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.dialects import mssql, postgresql
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
+from tests.test_business_api import complete_profile
 from tests.test_data_sources import create_owner_business, headers
+from tests.test_owner_chat import submit
 
 
 def opaque_discovery(engine="postgresql"):
@@ -89,6 +98,7 @@ def opaque_discovery(engine="postgresql"):
 
 def opaque_mapping():
     return ProductMapping(
+        capability="products",
         object_id="o1",
         key_columns=("s", "k"),
         name_columns=("a", "b"),
@@ -228,6 +238,14 @@ def catalogue_flow(
 ):
     user, business = create_owner_business(
         db_session, "mapping@example.com", "Opaque Test Catalogue"
+    )
+    assert complete_profile(api_client, user, str(business.id)).status_code == 200
+    assert (
+        api_client.post(
+            f"/api/v1/businesses/{business.id}/onboarding/confirm",
+            headers=headers(user),
+        ).status_code
+        == 200
     )
     schema = "mapping_fixture_" + uuid.uuid4().hex[:10]
     monkeypatch.setattr(
@@ -685,6 +703,541 @@ def test_gemini_contract_handles_untrusted_metadata_without_records():
     assert "source_fingerprint" not in serialized and "Pepsi" not in serialized
     assert "SELECT" not in serialized
     assert seen[0]["generationConfig"]["maxOutputTokens"] == 2048
+    schema = seen[0]["generationConfig"]["responseJsonSchema"]["$defs"][
+        "ProductMapping"
+    ]
+    assert "capability" in schema["required"]
+    assert schema["properties"]["capability"]["enum"] == ["products"]
+    assert "const" not in schema["properties"]["capability"]
+    assert (
+        ProductMapping.model_json_schema()["properties"]["capability"]["const"]
+        == "products"
+    )
+    instruction = seen[0]["systemInstruction"]["parts"][0]["text"]
+    assert 'capability must be exactly "products"' in instruction
+
+
+@pytest.mark.parametrize("capability", ["catalogue", None])
+def test_gemini_mapping_rejects_invalid_capability_without_repair(capability):
+    proposal = MappingProposal(
+        mapping=opaque_mapping(),
+        uncertainties=("Confirm semantics.",),
+        rationale="Metadata proposal.",
+    ).model_dump(mode="json")
+    if capability is None:
+        proposal["mapping"].pop("capability")
+    else:
+        proposal["mapping"]["capability"] = capability
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "finishReason": "STOP",
+                        "content": {"parts": [{"text": json.dumps(proposal)}]},
+                    }
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 824,
+                    "candidatesTokenCount": 313,
+                    "totalTokenCount": 1137,
+                },
+            },
+        )
+
+    provider = GeminiMappingProvider(
+        GeminiOwnerChatProvider(
+            api_key="mock-only",
+            model="gemini-3-flash-preview",
+            timeout_seconds=2,
+            transport=httpx.MockTransport(respond),
+        )
+    )
+    with pytest.raises(OwnerChatProviderInvalidResponse) as rejected:
+        provider.propose(opaque_discovery())
+    assert rejected.value.reason == "mapping_response"
+    assert rejected.value.usage == TokenUsage(824, 313, 1137, True)
+    assert len(calls) == 1
+
+
+def catalogue_chat_provider(plans):
+    """Real Gemini serialization/parsing with a strictly offline transport."""
+    calls = []
+
+    def respond(request):
+        calls.append(json.loads(request.content))
+        plan = plans.pop(0)
+        if isinstance(plan, Exception):
+            raise plan
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "finishReason": "STOP",
+                        "content": {"parts": [{"text": json.dumps(plan)}]},
+                    }
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "candidatesTokenCount": 80,
+                    "totalTokenCount": 180,
+                },
+            },
+        )
+
+    provider = GeminiOwnerChatProvider(
+        api_key="mock-only",
+        model="gemini-3-flash-preview",
+        timeout_seconds=2,
+        transport=httpx.MockTransport(respond),
+    )
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+    return provider, calls
+
+
+def catalogue_plan(query="Pepsi", **extra):
+    return {
+        "decision": "tool",
+        "semantic_operation": "product_search",
+        "tool_name": "product_search",
+        "arguments": {"query": query},
+        **extra,
+    }
+
+
+class CatalogueChatSnapshot(NamedTuple):
+    messages: int
+    tools: int
+    reservations: int
+    charged: int
+    held: int
+    knowledge: int
+    state: dict[str, object]
+
+
+def catalogue_chat_snapshot(migrator, business_id):
+    with migrator.connect() as connection:
+        counts = connection.execute(
+            text("""
+            SELECT
+              (SELECT count(*) FROM public.owner_chat_messages m
+                JOIN public.owner_conversations c ON c.id=m.conversation_id
+                WHERE c.business_id=:id) AS messages,
+              (SELECT count(*) FROM public.tool_call_logs
+                WHERE business_id=:id) AS tools,
+              (SELECT count(*) FROM public.ai_usage_reservations
+                WHERE business_id=:id) AS reservations,
+              (SELECT coalesce(sum(total_tokens_used),0)
+                FROM public.business_ai_usage_daily WHERE business_id=:id) AS charged,
+              (SELECT coalesce(sum(tokens_reserved),0)
+                FROM public.business_ai_usage_daily WHERE business_id=:id) AS held,
+              (SELECT count(*) FROM public.business_knowledge
+                WHERE business_id=:id) AS knowledge
+        """),
+            {"id": business_id},
+        ).one()
+        state = {}
+        for table in (
+            "tool_call_logs",
+            "ai_usage_reservations",
+            "business_ai_usage_daily",
+            "source_mapping_revisions",
+            "operational_data_sources",
+            "business_knowledge",
+            "owner_chat_rate_limit_events",
+        ):
+            state[table] = connection.execute(
+                text(
+                    f"SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text) "
+                    f"FROM public.{table} t WHERE business_id=:id"
+                ),
+                {"id": business_id},
+            ).scalar_one()
+        state["messages"] = connection.execute(
+            text("""
+            SELECT jsonb_agg(to_jsonb(m) ORDER BY m.sequence_number)
+            FROM public.owner_chat_messages m
+            JOIN public.owner_conversations c ON c.id=m.conversation_id
+            WHERE c.business_id=:id
+        """),
+            {"id": business_id},
+        ).scalar_one()
+        return CatalogueChatSnapshot(*counts, state)
+
+
+def test_catalogue_choices_respect_chat_reply_bound_without_inventing_labels():
+    output = CatalogueResult(
+        mapping_version=1,
+        status="ambiguous",
+        truncated=False,
+        items=tuple(
+            CatalogueProduct(
+                external_product_id=str(index) + "x" * 700,
+                names=("A" * 255, "B" * 255, "C" * 255),
+                sku="s" * 128,
+                categories=("D" * 255, "E" * 255, "F" * 255),
+            )
+            for index in range(50)
+        ),
+    )
+    offered = owner_chat._chat_catalogue_result(output)
+    assert 1 < len(offered.items) < len(output.items)
+    assert offered.items == output.items[: len(offered.items)] and offered.truncated
+    reply = owner_chat._catalogue_reply(output)
+    assert len(reply) <= 14_000
+    assert all(item.external_product_id in reply for item in offered.items)
+    assert all(
+        item.external_product_id not in reply
+        for item in output.items[len(offered.items) :]
+    )
+
+
+def exercise_catalogue_owner_chat(flow, expected):
+    """Shared authenticated production path for differently named real sources."""
+    client, session, migrator, user, business, path, registry, _ = flow
+    chosen = expected[0]
+    phrase = chosen["names"][0]
+    provider, calls = catalogue_chat_provider(
+        [
+            catalogue_plan(),
+            catalogue_plan(phrase, pending_reply="unresolved"),
+            catalogue_plan(phrase, pending_reply="selection"),
+        ]
+    )
+    reads = []
+
+    def record_read(*args):
+        reads.append(1)
+
+    event.listen(registry.external.engine, "before_cursor_execute", record_read)
+    try:
+        response = submit(client, user, business.id, "Find Pepsi", "catalogue-search")
+        assert response.status_code == 200
+        data = response.json()
+        origin = session.get(OwnerChatMessage, data["owner_message"]["id"])
+        state = origin.operational_clarification
+        assert state["business_id"] == str(business.id)
+        assert state["user_id"] == str(user.id)
+        assert state["conversation_id"] == str(origin.conversation_id)
+        assert state["candidates"] == expected
+        assert all(
+            item["names"][0] in data["assistant_message"]["content"]
+            for item in expected
+        )
+        assert state["mapping_version"] == 1
+        assert (
+            len(state["schema_fingerprint"]) == len(state["source_fingerprint"]) == 64
+        )
+        before_eh = len(reads)
+        unresolved = submit(client, user, business.id, "eh", "catalogue-unresolved")
+        assert unresolved.status_code == 200
+        current = session.get(
+            OwnerChatMessage, unresolved.json()["owner_message"]["id"]
+        )
+        assert current.operational_clarification == state
+        assert (
+            unresolved.json()["assistant_message"]["content"]
+            == data["assistant_message"]["content"]
+        )
+        # Availability checks metadata, but unresolved replies do not query products.
+        assert len(reads) > before_eh
+        # Only the fictional schema can change; historical data stays read-only.
+        fictional = registry.external.config.discovery_scope[0].object_name == "q9"
+        if fictional:
+            schema = registry.external.config.discovery_scope[0].schema_name
+            with migrator.begin() as connection:
+                connection.execute(
+                    text(
+                        f"UPDATE \"{schema}\".q9 SET a=:name WHERE k='0007' AND s='01'"
+                    ),
+                    {"name": "Pepsi Mini Updated"},
+                )
+        selected = submit(client, user, business.id, phrase, "catalogue-selection")
+        assert selected.status_code == 200
+        content = selected.json()["assistant_message"]["content"]
+        assert ("Pepsi Mini Updated" if fictional else phrase) in content
+        assert "Stock and prices are unknown" in content
+        assert all(
+            name not in content
+            for item in expected[1:]
+            for name in item["names"]
+            if name and name != phrase
+        )
+        assert len(calls) == 3
+        before = catalogue_chat_snapshot(migrator, business.id)
+        assert before.held == 0 and before.charged >= 540
+        read_count = len(reads)
+
+        def forbidden(*args):
+            raise AssertionError("Replay reached generation or estimation")
+
+        provider.generate = forbidden
+        provider.estimate_input_tokens = forbidden
+        for message, key, original in [
+            ("Find Pepsi", "catalogue-search", response),
+            ("eh", "catalogue-unresolved", unresolved),
+            (phrase, "catalogue-selection", selected),
+        ]:
+            replay = submit(client, user, business.id, message, key)
+            assert replay.status_code == 200
+            assert replay.json() == {**original.json(), "replayed": True}
+        assert catalogue_chat_snapshot(migrator, business.id) == before
+        assert len(reads) == read_count and len(calls) == 3
+        tool_schema = calls[0]["generationConfig"]["responseJsonSchema"]["anyOf"][0]
+        assert tool_schema["properties"]["tool_name"]["enum"] == ["product_search"]
+        assert (
+            "external_product_id"
+            not in tool_schema["properties"]["arguments"]["properties"]
+        )
+    finally:
+        event.remove(registry.external.engine, "before_cursor_execute", record_read)
+
+
+def test_authenticated_catalogue_owner_chat(catalogue_flow):
+    prepare_approved(catalogue_flow)
+    client, _, _, user, _, path, _, _ = catalogue_flow
+    expected = call(client, user, path + "/products/search", {"query": "Pepsi"}).json()[
+        "items"
+    ]
+    exercise_catalogue_owner_chat(catalogue_flow, expected)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("business_id", "foreign"),
+        ("user_id", "foreign"),
+        ("conversation_id", "foreign"),
+        ("source_id", "foreign"),
+        ("source_updated_at", "old"),
+        ("expires_at", "old"),
+        ("mapping_version", 2),
+        ("schema_fingerprint", "b" * 64),
+        ("source_fingerprint", "b" * 64),
+    ],
+)
+def test_catalogue_chat_rejects_invalid_selection_scope(catalogue_flow, field, value):
+    prepare_approved(catalogue_flow)
+    client, session, migrator, user, business, _, _, _ = catalogue_flow
+    _, calls = catalogue_chat_provider(
+        [catalogue_plan(), catalogue_plan("Pepsi Mini", pending_reply="selection")]
+    )
+    first = submit(client, user, business.id, "Find Pepsi", "first")
+    assert first.status_code == 200
+    origin = session.get(OwnerChatMessage, first.json()["owner_message"]["id"])
+    state = dict(origin.operational_clarification)
+    state[field] = (
+        str(uuid.uuid4())
+        if value == "foreign"
+        else (
+            (datetime.now(UTC) - timedelta(days=1)).isoformat()
+            if value == "old"
+            else value
+        )
+    )
+    origin.operational_clarification = state
+    session.commit()
+    before = catalogue_chat_snapshot(migrator, business.id)
+    result = submit(client, user, business.id, "Pepsi Mini", "invalid")
+    assert result.status_code == 200
+    assert "no longer valid" in result.json()["assistant_message"]["content"]
+    after = catalogue_chat_snapshot(migrator, business.id)
+    assert before.tools == after.tools and after.held == 0 and len(calls) == 2
+
+
+def test_catalogue_chat_never_executes_a_guessed_offered_selection(catalogue_flow):
+    prepare_approved(catalogue_flow)
+    client, session, migrator, user, business, _, _, _ = catalogue_flow
+    _, calls = catalogue_chat_provider(
+        [catalogue_plan(), catalogue_plan("Pepsi Mini", pending_reply="selection")]
+    )
+    first = submit(client, user, business.id, "Find Pepsi", "first")
+    before = catalogue_chat_snapshot(migrator, business.id)
+    result = submit(client, user, business.id, "non-offered product", "invalid")
+    assert result.status_code == 200
+    origin = session.get(OwnerChatMessage, first.json()["owner_message"]["id"])
+    latest = session.get(OwnerChatMessage, result.json()["owner_message"]["id"])
+    assert latest.operational_clarification == origin.operational_clarification
+    assert catalogue_chat_snapshot(migrator, business.id).tools == before.tools
+    assert len(calls) == 2
+
+
+def test_catalogue_selection_rejects_a_reapproved_mapping(catalogue_flow):
+    prepare_approved(catalogue_flow)
+    client, session, migrator, user, business, path, _, _ = catalogue_flow
+    _, calls = catalogue_chat_provider(
+        [catalogue_plan(), catalogue_plan("Pepsi Mini", pending_reply="selection")]
+    )
+    first = submit(client, user, business.id, "Find Pepsi", "first")
+    assert first.status_code == 200
+    origin = session.get(OwnerChatMessage, first.json()["owner_message"]["id"])
+    assert origin.operational_clarification["mapping_version"] == 1
+    assert call(client, user, path + "/disable").status_code == 200
+    prepare_approved(catalogue_flow)
+    before = catalogue_chat_snapshot(migrator, business.id)
+    response = submit(client, user, business.id, "Pepsi Mini", "stale")
+    assert response.status_code == 200
+    assert "no longer valid" in response.json()["assistant_message"]["content"]
+    assert catalogue_chat_snapshot(migrator, business.id).tools == before.tools
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("change", ["permissions", "schema", "timeout", "provenance"])
+def test_catalogue_tool_availability_revalidates_approved_source(
+    catalogue_flow, change
+):
+    prepare_approved(catalogue_flow)
+    client, session, migrator, user, business, _, registry, _ = catalogue_flow
+    executor = OperationalToolExecutor(session, registry, get_settings())
+    assert [
+        item.name for item in executor.available_definitions(user, business.id)
+    ] == ["product_search"]
+    connector = registry.external
+    schema = connector.config.discovery_scope[0].schema_name
+    if change in {"permissions", "schema"}:
+        with migrator.begin() as connection:
+            connection.execute(
+                text(
+                    f'REVOKE SELECT(b) ON "{schema}".q9 FROM sou2ai_runtime'
+                    if change == "permissions"
+                    else f'ALTER TABLE "{schema}".q9 ALTER COLUMN b DROP NOT NULL'
+                )
+            )
+    elif change == "timeout":
+        connector.config = connector.config.model_copy(
+            update={"query_timeout_seconds": 3}
+        )
+    else:
+        connector.source_fingerprint = "b" * 64
+    assert executor.available_definitions(user, business.id) == ()
+
+
+@pytest.mark.parametrize("transition", ["cancel", "unrelated"])
+def test_catalogue_pending_explicit_transition(catalogue_flow, transition):
+    prepare_approved(catalogue_flow)
+    client, session, migrator, user, business, _, _, _ = catalogue_flow
+    plan = (
+        {
+            "decision": "final",
+            "semantic_operation": "conversation",
+            "pending_reply": "cancel",
+            "pending_request": "Cancel that choice",
+        }
+        if transition == "cancel"
+        else catalogue_plan(
+            "Other", pending_reply="unrelated", pending_request="Find Other"
+        )
+    )
+    _, calls = catalogue_chat_provider([catalogue_plan(), plan])
+    assert submit(client, user, business.id, "Find Pepsi", "first").status_code == 200
+    before = catalogue_chat_snapshot(migrator, business.id)
+    response = submit(
+        client,
+        user,
+        business.id,
+        "Cancel that choice" if transition == "cancel" else "Find Other",
+        "next",
+    )
+    assert response.status_code == 200
+    latest = session.get(OwnerChatMessage, response.json()["owner_message"]["id"])
+    assert latest.operational_clarification is None
+    assert ("cancelled" if transition == "cancel" else "Other") in response.json()[
+        "assistant_message"
+    ]["content"]
+    assert catalogue_chat_snapshot(migrator, business.id).tools == before.tools + (
+        transition == "unrelated"
+    )
+    assert len(calls) == 2
+
+
+def test_catalogue_pending_provider_failure_recovers_without_renewing_expiry(
+    catalogue_flow,
+):
+    prepare_approved(catalogue_flow)
+    client, session, migrator, user, business, _, _, _ = catalogue_flow
+    _, calls = catalogue_chat_provider(
+        [
+            catalogue_plan(),
+            {"decision": "tool", "semantic_operation": "product_search"},
+            catalogue_plan("Pepsi Mini", pending_reply="selection"),
+        ]
+    )
+    first = submit(client, user, business.id, "Find Pepsi", "first")
+    assert first.status_code == 200
+    origin = session.get(OwnerChatMessage, first.json()["owner_message"]["id"])
+    before = catalogue_chat_snapshot(migrator, business.id)
+    recovered = submit(client, user, business.id, "eh", "bad-plan")
+    assert recovered.status_code == 200
+    latest = session.get(OwnerChatMessage, recovered.json()["owner_message"]["id"])
+    assert latest.operational_clarification == origin.operational_clarification
+    assert catalogue_chat_snapshot(migrator, business.id).tools == before.tools
+    assert (
+        submit(client, user, business.id, "Pepsi Mini", "selected").status_code == 200
+    )
+    assert len(calls) == 3
+
+
+def test_catalogue_pending_survives_failed_turn_and_failure_replay(catalogue_flow):
+    prepare_approved(catalogue_flow)
+    client, session, migrator, user, business, _, _, _ = catalogue_flow
+    _, calls = catalogue_chat_provider(
+        [
+            catalogue_plan(),
+            httpx.ReadTimeout("mock timeout"),
+            catalogue_plan("Pepsi Mini", pending_reply="selection"),
+        ]
+    )
+    first = submit(client, user, business.id, "Find Pepsi", "first")
+    assert first.status_code == 200
+    failed = submit(client, user, business.id, "eh", "failed")
+    assert failed.status_code == 503
+    before = catalogue_chat_snapshot(migrator, business.id)
+    replay = submit(client, user, business.id, "eh", "failed")
+    assert replay.status_code == 409
+    assert catalogue_chat_snapshot(migrator, business.id) == before and len(calls) == 2
+    selected = submit(client, user, business.id, "Pepsi Mini", "selected")
+    assert selected.status_code == 200
+    assert "Pepsi Mini" in selected.json()["assistant_message"]["content"]
+    assert len(calls) == 3 and catalogue_chat_snapshot(migrator, business.id).held == 0
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "inventory_product",
+        "restocking",
+        "sales_summary",
+        "product_price",
+        "unsupported",
+    ],
+)
+def test_catalogue_chat_unsupported_operations_do_not_fabricate(
+    catalogue_flow, operation
+):
+    prepare_approved(catalogue_flow)
+    client, _, migrator, user, business, _, _, _ = catalogue_flow
+    plan = {
+        "decision": "unavailable",
+        "semantic_operation": operation,
+        "reply": "There are 999 units in stock.",
+    }
+    if operation == "inventory_product":
+        plan.update(entity_kind="product", entity_query="Pepsi")
+    _, calls = catalogue_chat_provider([plan])
+    before = catalogue_chat_snapshot(migrator, business.id)
+    response = submit(
+        client, user, business.id, "How much Pepsi stock is there?", "stock"
+    )
+    assert response.status_code == 200
+    reply = response.json()["assistant_message"]["content"]
+    assert "unknown" in reply and "999" not in reply
+    assert catalogue_chat_snapshot(migrator, business.id).tools == before.tools
+    assert len(calls) == 1
 
 
 def test_sqlserver_opaque_schema_application_flow(catalogue_flow):
@@ -753,6 +1306,7 @@ def test_sqlserver_opaque_schema_application_flow(catalogue_flow):
     assert selected.json()["status"] == "resolved"
     assert selected.json()["items"][0]["categories"] == ["Drinks"]
     assert selected.json()["items"][0]["stock"] is None
+    exercise_catalogue_owner_chat(flow, result.json()["items"])
     bad_config = connector.config.model_copy(
         update={
             "discovery_scope": (

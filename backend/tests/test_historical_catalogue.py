@@ -17,8 +17,13 @@ from app.schemas.source_mapping import MappingProposal, SchemaDiscovery
 from pydantic import SecretStr
 from sqlalchemy import text
 
+from tests.test_business_api import complete_profile
 from tests.test_data_sources import create_owner_business, headers
-from tests.test_source_mapping import FixtureRegistry, call
+from tests.test_source_mapping import (
+    FixtureRegistry,
+    call,
+    exercise_catalogue_owner_chat,
+)
 
 
 def test_historical_catalogue_application_flow(
@@ -29,6 +34,14 @@ def test_historical_catalogue_application_flow(
         pytest.skip("Requires the private restricted-reader validation harness.")
     user, business = create_owner_business(
         db_session, "historical-test@example.com", "Isolated Historical Catalogue"
+    )
+    assert complete_profile(api_client, user, str(business.id)).status_code == 200
+    assert (
+        api_client.post(
+            f"/api/v1/businesses/{business.id}/onboarding/confirm",
+            headers=headers(user),
+        ).status_code
+        == 200
     )
     with migration_engine.begin() as connection:
         connection.execute(
@@ -193,8 +206,23 @@ def test_historical_catalogue_application_flow(
             {"id": business.id},
         ).one()
         assert row.total_tokens_used == 280 and row.tokens_reserved == 0
+    exercise_catalogue_owner_chat(
+        (
+            api_client,
+            db_session,
+            migration_engine,
+            user,
+            business,
+            path,
+            registry,
+            provider,
+        ),
+        matches["items"],
+    )
     connector.engine.dispose()
     print(
         "Historical catalogue: 13 variants, second-name search passed; "
-        "literal Arabic alias unavailable; stock unknown; mock usage 280, hold 0."
+        "literal Arabic alias unavailable; owner-chat search, eh, selection "
+        "and replay passed; "
+        "stock unknown; mock proposal/chat usage 820, hold 0."
     )
