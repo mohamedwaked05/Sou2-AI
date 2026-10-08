@@ -207,3 +207,14 @@ instruction requires separate approval of the plan above. After that validation
 is authorized and passes: review the final frozen diff, merge into local main and
 push main, preserving unrelated work and comparing remote history first. Until
 then, main stays unchanged. No deployment or draft PR is part of this task.
+
+## Subsequent bounded live validation - 2026-10-09
+
+The implementation above remained unchanged at `9b94b91`. Subsequent explicitly
+authorized retained-environment runs completed the real proposal and all four
+planners at cumulative **31/31**, with actual source queries, reviewed approval,
+original ambiguity expiry, unknown stock, zero-cost terminal replay and zero
+holds. Historical failures, charges and stop markers remain preserved. The earlier
+23/25 plan and unverified status are historical, not the current authorization.
+See the [live completion record](reusable-product-chat-stock-live-20261009.md)
+for actual usage, verifier correction, backup, startup and remaining limitations.

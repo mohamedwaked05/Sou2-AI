@@ -287,6 +287,23 @@ process environment, absent from Docker environment metadata, images and command
 arguments. See the [catalogue chat validation handoff](../docs/notes/reusable-product-chat-20261007.md)
 for the actual checks, limitations and separately authorized live plan.
 
+The retained live validation on 2026-10-09 reverified the same startup path with
+host health at `127.0.0.1:18990`, a task-owned persistent PostgreSQL volume and
+isolated Redis. It completed metadata-only proposal, reviewed approval, owner-chat
+search/ambiguity/selection and unknown stock. See the
+[live completion record](../docs/notes/reusable-product-chat-stock-live-20261009.md).
+Its private environment and backups remain retained; they are not development
+fixtures or credentials to copy into another business.
+
+This application requires migration `20261007_16`, following `20261006_15`.
+Apply ordered migrations to an authorized target with separately injected migrator
+credentials before starting the restricted runtime; never put migrator credentials
+in the API environment. Revision 16 adds mapping review/admission guards and one
+active operational source per business. Its downgrade refuses while mapped source
+configuration or revisions exist. The live test inspected its already-migrated
+isolated database and did not migrate shared development. Retain a restore-tested
+backup and a persistent PostgreSQL volume for resumable validation.
+
 From `backend`, apply or roll back the schema:
 
 ```powershell
