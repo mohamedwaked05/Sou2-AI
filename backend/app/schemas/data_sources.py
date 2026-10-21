@@ -6,6 +6,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.database.models import OperationalDataSourceStatus
+from app.schemas.source_mapping import CatalogueCoverage
 
 
 class MappingProfileResponse(BaseModel):
@@ -57,6 +58,8 @@ class DataSourceCreateRequest(BaseModel):
 
 
 class DataSourceResponse(BaseModel):
+    catalogue_coverage: CatalogueCoverage | None = None
+    quality_approval_status: str | None = None
     id: uuid.UUID
     display_name: str
     adapter_type: str

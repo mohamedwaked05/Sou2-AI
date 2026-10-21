@@ -1698,6 +1698,108 @@ class SourceMappingRevision(Base):
     )
 
 
+class CatalogueQualityReportRecord(Base):
+    """Immutable bounded quality evidence; source rows remain external."""
+
+    __tablename__ = "catalogue_quality_reports"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["source_id", "business_id"],
+            ["operational_data_sources.id", "operational_data_sources.business_id"],
+            ondelete="RESTRICT",
+        ),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    business_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    capability: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="catalogue", server_default="catalogue"
+    )
+    revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("source_mapping_revisions.id", ondelete="RESTRICT"), nullable=True
+    )
+    requested_by: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), nullable=False
+    )
+    mapping: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    source_updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    report: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class CatalogueQualityApproval(Base):
+    """Append-only full/partial approvals and revocations, serialized per source."""
+
+    __tablename__ = "catalogue_quality_approvals"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["source_id", "business_id"],
+            ["operational_data_sources.id", "operational_data_sources.business_id"],
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("source_id", "version", name="uq_quality_approval_version"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    capability: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="catalogue", server_default="catalogue"
+    )
+    report_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("catalogue_quality_reports.id", ondelete="RESTRICT"), nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    approval_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    approved_by: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class SourceOperationalMappingRevision(Base):
+    """Append-only operational approval, dependent on an exact catalogue revision."""
+
+    __tablename__ = "source_operational_mapping_revisions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["source_id", "business_id"],
+            ["operational_data_sources.id", "operational_data_sources.business_id"],
+            ondelete="RESTRICT",
+            name="fk_operational_mapping_source",
+        ),
+        UniqueConstraint("source_id", "version", name="uq_operational_mapping_version"),
+        CheckConstraint("version > 0", name="ck_operational_mapping_version"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    catalogue_revision_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("source_mapping_revisions.id", ondelete="RESTRICT"), nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    mapping: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    discovery: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    approved_by: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), nullable=False
+    )
+    approved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class UserOperationalPreference(Base):
     """One validated user default for a capability on a connected source."""
 

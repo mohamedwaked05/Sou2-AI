@@ -58,6 +58,7 @@ def get_engine() -> Engine:
     engine = create_engine(
         settings.postgresql_database_url,
         pool_pre_ping=True,
+        hide_parameters=True,
         connect_args={
             "connect_timeout": settings.postgresql_connect_timeout_seconds,
         },

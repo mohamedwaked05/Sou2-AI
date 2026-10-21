@@ -99,7 +99,11 @@ function mockActiveWorkspace(...messagePages: ChatMessage[][]) {
   vi.spyOn(api, "business").mockResolvedValueOnce(activeBusiness);
   const messages = vi.spyOn(api, "messages");
   for (const items of messagePages) {
-    messages.mockResolvedValueOnce({ items, next_cursor: null });
+    messages.mockResolvedValueOnce({
+      items,
+      next_cursor: null,
+      conversation_id: "default-conversation",
+    });
   }
   return messages;
 }
@@ -285,7 +289,11 @@ it("shows the classified owner-chat provider error", async () => {
     working_hours: [],
   });
   vi.spyOn(api, "messages")
-    .mockResolvedValueOnce({ items: [], next_cursor: null })
+    .mockResolvedValueOnce({
+      items: [],
+      next_cursor: null,
+      conversation_id: "default-conversation",
+    })
     .mockResolvedValueOnce({
       items: [
         {
@@ -323,7 +331,9 @@ it("shows the classified owner-chat provider error", async () => {
     ),
   ).toBeInTheDocument();
   expect(
-    await screen.findByText("Response failed. Send a new message to try again."),
+    await screen.findByText(
+      "No answer was generated. Check the error above; if a request limit was reached, wait before sending again.",
+    ),
   ).toBeInTheDocument();
 });
 
@@ -377,7 +387,9 @@ it("renders a failed owner turn as terminal history", async () => {
   );
 
   expect(
-    await screen.findByText("Response failed. Send a new message to try again."),
+    await screen.findByText(
+      "No answer was generated. Check the error above; if a request limit was reached, wait before sending again.",
+    ),
   ).toBeInTheDocument();
 });
 
@@ -713,7 +725,12 @@ it("submits once with Enter through the existing form path", async () => {
   fireEvent.keyDown(composer, { key: "Enter", code: "Enter" });
 
   await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
-  expect(send).toHaveBeenCalledWith("business-1", "Hello there");
+  expect(send).toHaveBeenCalledWith(
+    "business-1",
+    "Hello there",
+    expect.any(String),
+    "default-conversation",
+  );
 });
 
 it("keeps Shift+Enter as a newline without submitting", async () => {
@@ -771,10 +788,17 @@ it("keeps the Send button as a working submission path", async () => {
     target: { value: "Button message" },
   });
 
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  const button = screen.getByRole("button", { name: "Send message" });
+  await waitFor(() => expect(button).toBeEnabled());
+  fireEvent.click(button);
 
   await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
-  expect(send).toHaveBeenCalledWith("business-1", "Button message");
+  expect(send).toHaveBeenCalledWith(
+    "business-1",
+    "Button message",
+    expect.any(String),
+    "default-conversation",
+  );
 });
 
 it("grows the composer with wrapped content", async () => {

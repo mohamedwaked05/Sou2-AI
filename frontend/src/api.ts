@@ -131,6 +131,8 @@ export interface ConnectionProfile {
 }
 
 export interface DataSource {
+  catalogue_coverage?: CatalogueCoverage | null;
+  quality_approval_status?: string | null;
   id: string;
   display_name: string;
   adapter_type: string;
@@ -155,6 +157,7 @@ export interface ProductMapping {
   object_id: string;
   key_columns: string[];
   name_columns: string[];
+  row_scopes?: { column: string; value: string | number }[];
   sku_column: string | null;
   categories: {
     object_id: string;
@@ -170,14 +173,36 @@ export interface ProductMapping {
 }
 
 export interface SchemaDiscovery {
+  source_fingerprint?: string;
   engine: "postgresql" | "sqlserver";
+  relationships?: {
+    source_object_id: string;
+    source_columns: string[];
+    target_object_id: string;
+    target_columns: string[];
+  }[];
   objects: {
     object_id: string;
     schema_name: string;
     name: string;
-    columns: { name: string; kind: string; nullable: boolean }[];
+    columns: {
+      name: string;
+      kind: string;
+      nullable: boolean;
+      type_signature?: string | null;
+    }[];
     unique_keys: string[][];
   }[];
+}
+
+export interface OperationalWorkspace {
+  proposals?: Record<string, unknown>;
+  discovery: SchemaDiscovery;
+  context: Record<string, unknown>;
+  product_mapping: ProductMapping;
+  mapping_schema: Record<string, unknown>;
+  limitations: string[];
+  history: { id: string; version: number; mapping: Record<string, unknown> }[];
 }
 
 export interface MappingReview {
@@ -205,11 +230,70 @@ export interface CatalogueProduct {
 }
 
 export interface CatalogueResult {
+  coverage?: CatalogueCoverage | null;
   mapping_version: number;
   status: "resolved" | "ambiguous" | "not_found";
   items: CatalogueProduct[];
   truncated: boolean;
   capabilities: ["products"];
+}
+
+export interface CatalogueCoverage {
+  approval_type: "full" | "partial";
+  approval_id?: string | null;
+  approval_version?: number | null;
+  excluded_records: number;
+  total_records: number | null;
+  valid_records: number | null;
+  expires_at?: string | null;
+  disclosure?: string | null;
+}
+
+export interface QualityReport {
+  id: string;
+  business_id: string;
+  source_id: string;
+  revision_id: string;
+  mapping_version: number;
+  mapping: ProductMapping;
+  schema_fingerprint: string;
+  source_fingerprint: string;
+  validated_at: string;
+  expires_at: string;
+  total_records: number | null;
+  valid_records: number | null;
+  invalid_records: number | null;
+  invalid_percent: string | null;
+  max_invalid_percent: string;
+  reason_counts: Record<string, number>;
+  relationship_counts?: Record<string, number>;
+  structural_status: "PASS" | "BLOCKED" | "INCOMPLETE";
+  impact:
+    | "SAFE_FOR_CAPABILITY"
+    | "SAFE_WITH_EXCLUSIONS"
+    | "BLOCKED_BY_MAPPING"
+    | "BLOCKED_BY_DATA_QUALITY"
+    | "INSUFFICIENT_CAPABILITY_EVIDENCE"
+    | "SAFE_FOR_PARTIAL_CATALOGUE"
+    | "REQUIRES_OWNER_REVIEW"
+    | "UNSAFE"
+    | "UNKNOWN_IMPACT";
+  findings: string[];
+  eligible: boolean;
+  recommended_action: string;
+  diagnostics: {
+    identifier: string | null;
+    name: string | null;
+    rules: string[];
+    explanation: string;
+    relationship_concerns: string[];
+    safe_exclusion: boolean;
+    severity: "warning" | "blocked";
+    suggested_action: string;
+    locator_note: string;
+  }[];
+  diagnostics_truncated: boolean;
+  integrity: string;
 }
 
 export interface WhatsAppConnection {
@@ -258,11 +342,97 @@ export interface CustomerMessage {
   updated_at: string;
 }
 
+export type CapabilityFamily = "inventory" | "pricing" | "sales" | "financial";
+export interface CapabilityQualityReport {
+  id: string;
+  capability: CapabilityFamily;
+  integrity: string;
+  mapping: Record<string, unknown>;
+  discovery: SchemaDiscovery;
+  meaning: string;
+  validated_at: string;
+  expires_at: string;
+  total_records: number | null;
+  valid_records: number | null;
+  invalid_records: number | null;
+  invalid_percent: string | null;
+  max_invalid_percent: string;
+  denominator: string;
+  structural_status: string;
+  impact: string;
+  eligible: boolean;
+  reason_counts: Record<string, number>;
+  record_counts: Record<string, number>;
+  findings: string[];
+  diagnostics: {
+    object_id: string;
+    identifier: (string | null)[];
+    rules: string[];
+    explanation: string;
+    safe_exclusion: boolean;
+    locator_note: string;
+  }[];
+  diagnostics_truncated: boolean;
+}
+export interface CapabilityState {
+  capability: CapabilityFamily;
+  status: string;
+  connection_status: string;
+  mapping_status: string;
+  quality_status: string;
+  approval_status: string;
+  runtime_status: string;
+  runtime_invalid_records?: number | null;
+  prerequisites: string[];
+  candidates: {
+    object_id: string;
+    unique_keys: string[][];
+    numeric_fields: string[];
+    time_fields: string[];
+  }[];
+  report: CapabilityQualityReport | null;
+  latest_validation?: CapabilityQualityReport | null;
+  history?: {
+    version: number;
+    report_id: string;
+    approval_type: string;
+    approved_at: string;
+    expires_at: string;
+  }[];
+  approval_version: number | null;
+  expires_at: string | null;
+  tools: string[];
+}
+export interface CapabilityWorkspace {
+  discovery: SchemaDiscovery | null;
+  connection_status: string;
+  context: Record<string, unknown>;
+  identity_mapping: ProductMapping | null;
+  capabilities: CapabilityState[];
+  access_inventory: {
+    objects?: {
+      schema_name: string;
+      object_name: string;
+      columns: {
+        name: string;
+        kind: string;
+        readable: boolean;
+        approved_scope: boolean;
+      }[];
+    }[];
+    truncated?: boolean;
+    limitation?: string;
+    reason?: string;
+  };
+  limitations: string[];
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
     public code = "request_failed",
     message = "Something went wrong. Please try again.",
+    public retryAfterSeconds?: number,
   ) {
     super(message);
   }
@@ -271,6 +441,9 @@ export class ApiError extends Error {
 export function ownerChatErrorMessage(error: unknown) {
   if (!(error instanceof ApiError)) {
     return "We couldn't reach the assistant. Please try again.";
+  }
+  if (error.code === "owner_chat_rate_limited" && error.retryAfterSeconds) {
+    return `The chat request limit was reached. Try again in ${error.retryAfterSeconds} seconds.`;
   }
   const messages: Record<string, string> = {
     assistant_rate_limited:
@@ -299,22 +472,41 @@ export function setAccessToken(token: string | null) {
 
 async function parseError(response: Response) {
   const body = (await response.json().catch(() => null)) as {
-    error?: { code?: string; message?: string };
+    error?: {
+      code?: string;
+      message?: string;
+      fields?: { location?: (string | number)[]; message?: string }[];
+    };
   } | null;
-  return new ApiError(response.status, body?.error?.code, body?.error?.message);
+  const fields = body?.error?.fields
+    ?.slice(0, 3)
+    .map(
+      (field) =>
+        `${field.location?.filter((part) => part !== "body").join(".")}: ${field.message?.slice(0, 220)}`,
+    )
+    .join("; ");
+  return new ApiError(
+    response.status,
+    body?.error?.code,
+    fields ? `${body?.error?.message} ${fields}` : body?.error?.message,
+    Number(response.headers.get("Retry-After")) || undefined,
+  );
 }
 
 async function performRefresh(): Promise<boolean> {
-  const response = await fetch(`${base}/auth/refresh`, {
-    method: "POST",
-    credentials: "include",
+  const response = await request<{ access_token: string }>(
+    "/auth/refresh",
+    { method: "POST" },
+    { retryAuth: false },
+  ).catch((error: unknown) => {
+    if (error instanceof ApiError && error.status === 401) return null;
+    throw error;
   });
-  if (!response.ok) {
+  if (!response) {
     accessToken = null;
     return false;
   }
-  const body = (await response.json()) as { access_token: string };
-  accessToken = body.access_token;
+  accessToken = response.access_token;
   return true;
 }
 
@@ -330,24 +522,44 @@ function refreshSession(): Promise<boolean> {
 async function request<T>(
   path: string,
   init: RequestInit = {},
-  options: { retryAuth?: boolean } = {},
+  options: { retryAuth?: boolean; timeoutMs?: number } = {},
 ): Promise<T> {
-  const headers = new Headers(init.headers);
-  if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
-  const response = await fetch(`${base}${path}`, {
-    ...init,
-    headers,
-    credentials: "include",
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  init.signal?.addEventListener("abort", abort, { once: true });
+  if (init.signal?.aborted) abort();
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(
+        new ApiError(0, "request_timeout", "The request took too long. Please retry."),
+      );
+      controller.abort();
+    }, options.timeoutMs ?? 30_000);
   });
-  if (
-    response.status === 401 &&
-    (options.retryAuth ?? true) &&
-    (await refreshSession())
-  ) {
-    return request<T>(path, init, { retryAuth: false });
+  async function execute(retryAuth: boolean): Promise<T> {
+    controller.signal.throwIfAborted();
+    const headers = new Headers(init.headers);
+    if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
+    const response = await fetch(`${base}${path}`, {
+      ...init,
+      signal: controller.signal,
+      headers,
+      credentials: "include",
+    });
+    if (response.status === 401 && retryAuth && (await refreshSession())) {
+      return execute(false);
+    }
+    if (!response.ok) throw await parseError(response);
+    return response.status === 204 ? (undefined as T) : (response.json() as Promise<T>);
   }
-  if (!response.ok) throw await parseError(response);
-  return response.status === 204 ? (undefined as T) : (response.json() as Promise<T>);
+  try {
+    // A single deadline covers fetch, auth refresh/retry and response body parsing.
+    return await Promise.race([execute(options.retryAuth ?? true), timeout]);
+  } finally {
+    clearTimeout(timer!);
+    init.signal?.removeEventListener("abort", abort);
+  }
 }
 
 function json(body: unknown): RequestInit {
@@ -431,16 +643,33 @@ export const api = {
   updateBusiness: (id: string, body: object) =>
     request<Business>(`/businesses/${id}`, { method: "PATCH", ...json(body) }),
   confirm: (id: string) =>
-    request<Business>(`/businesses/${id}/onboarding/confirm`, { method: "POST" }),
-  messages: (id: string) =>
-    request<{ items: ChatMessage[]; next_cursor: string | null }>(
-      `/businesses/${id}/owner-chat/messages`,
-    ),
-  send: (id: string, content: string) =>
-    request(`/businesses/${id}/owner-chat/messages`, {
+    request<Business>(`/businesses/${id}/onboarding/confirm`, {
       method: "POST",
-      ...json({ content, idempotency_key: crypto.randomUUID() }),
     }),
+  messages: (id: string, conversationId?: string) =>
+    request<{
+      items: ChatMessage[];
+      next_cursor: string | null;
+      conversation_id?: string | null;
+    }>(
+      conversationId
+        ? `/businesses/${id}/conversations/${conversationId}/messages`
+        : `/businesses/${id}/owner-chat/messages`,
+    ),
+  send: (
+    id: string,
+    content: string,
+    idempotencyKey: string = crypto.randomUUID(),
+    conversationId?: string,
+  ) =>
+    request(
+      conversationId
+        ? `/businesses/${id}/conversations/${conversationId}/messages`
+        : `/businesses/${id}/owner-chat/messages`,
+      { method: "POST", ...json({ content, idempotency_key: idempotencyKey }) },
+      // Above the supported 300-second turn lease plus the replay wait margin.
+      { timeoutMs: 360_000 },
+    ),
   conversations: (business: string, includeArchived = false, cursor?: string) => {
     const query = new URLSearchParams();
     if (includeArchived) query.set("include_archived", "true");
@@ -460,11 +689,17 @@ export const api = {
     request<{ items: ChatMessage[]; next_cursor: string | null }>(
       `/businesses/${business}/conversations/${conversation}/messages`,
     ),
-  sendConversationMessage: (business: string, conversation: string, content: string) =>
-    request(`/businesses/${business}/conversations/${conversation}/messages`, {
-      method: "POST",
-      ...json({ content, idempotency_key: crypto.randomUUID() }),
-    }),
+  sendConversationMessage: (
+    business: string,
+    conversation: string,
+    content: string,
+    idempotencyKey: string = crypto.randomUUID(),
+  ) =>
+    request(
+      `/businesses/${business}/conversations/${conversation}/messages`,
+      { method: "POST", ...json({ content, idempotency_key: idempotencyKey }) },
+      { timeoutMs: 360_000 },
+    ),
   archiveConversation: (business: string, conversation: string) =>
     request<Conversation>(
       `/businesses/${business}/conversations/${conversation}/archive`,
@@ -547,6 +782,125 @@ export const api = {
     ),
   mappingReviews: (business: string, source: string) =>
     request<MappingReview[]>(`/businesses/${business}/data-sources/${source}/mappings`),
+  rejectMapping: (business: string, source: string, revision: string) =>
+    request<MappingReview>(
+      `/businesses/${business}/data-sources/${source}/mappings/${revision}/reject`,
+      { method: "POST" },
+    ),
+  catalogueQuality: (business: string, source: string) =>
+    request<QualityReport | null>(
+      `/businesses/${business}/data-sources/${source}/quality`,
+    ),
+  validateCatalogueQuality: (
+    business: string,
+    source: string,
+    revision: string,
+    mapping: ProductMapping,
+  ) =>
+    request<QualityReport>(
+      `/businesses/${business}/data-sources/${source}/quality/validate`,
+      {
+        method: "POST",
+        ...json({ revision_id: revision, mapping }),
+      },
+      { timeoutMs: 45_000 },
+    ),
+  approveCatalogueQuality: (business: string, source: string, report: QualityReport) =>
+    request<CatalogueCoverage>(
+      `/businesses/${business}/data-sources/${source}/quality/approve`,
+      {
+        method: "POST",
+        ...json({
+          approval_type: report.invalid_records === 0 ? "full" : "partial",
+          report_id: report.id,
+          integrity: report.integrity,
+          excluded_records: report.invalid_records,
+          total_records: report.total_records,
+          confirm_semantics: true,
+          acknowledge_uncertainties: true,
+          confirm_catalogue_only: true,
+        }),
+      },
+      { timeoutMs: 45_000 },
+    ),
+  revokeCatalogueQuality: (business: string, source: string) =>
+    request<void>(`/businesses/${business}/data-sources/${source}/quality/revoke`, {
+      method: "POST",
+    }),
+  capabilityWorkspace: (business: string, source: string) =>
+    request<CapabilityWorkspace>(
+      `/businesses/${business}/data-sources/${source}/capabilities`,
+      {},
+      { timeoutMs: 45_000 },
+    ),
+  capabilityQuality: (
+    business: string,
+    source: string,
+    family: CapabilityFamily,
+    reportId: string,
+  ) =>
+    request<CapabilityQualityReport>(
+      `/businesses/${business}/data-sources/${source}/capabilities/${family}/quality?report_id=${encodeURIComponent(reportId)}`,
+    ),
+  validateCapability: (
+    business: string,
+    source: string,
+    family: CapabilityFamily,
+    body: {
+      mapping: Record<string, unknown>;
+      discovery: SchemaDiscovery;
+      meaning: string;
+    },
+  ) =>
+    request<CapabilityQualityReport>(
+      `/businesses/${business}/data-sources/${source}/capabilities/${family}/validate`,
+      { method: "POST", ...json(body) },
+      { timeoutMs: 45_000 },
+    ),
+  approveCapability: (
+    business: string,
+    source: string,
+    family: CapabilityFamily,
+    report: CapabilityQualityReport,
+  ) =>
+    request<{ approval_id: string; version: number; status: string }>(
+      `/businesses/${business}/data-sources/${source}/capabilities/${family}/approve`,
+      {
+        method: "POST",
+        ...json({
+          report_id: report.id,
+          integrity: report.integrity,
+          total_records: report.total_records,
+          excluded_records: 0,
+          confirm_semantics: true,
+          confirm_scope: true,
+          confirm_enable_capability: true,
+        }),
+      },
+      { timeoutMs: 45_000 },
+    ),
+  revokeCapability: (business: string, source: string, family: CapabilityFamily) =>
+    request<void>(
+      `/businesses/${business}/data-sources/${source}/capabilities/${family}/revoke`,
+      { method: "POST" },
+    ),
+  operationalWorkspace: (business: string, source: string) =>
+    request<OperationalWorkspace>(
+      `/businesses/${business}/data-sources/${source}/operational-mappings`,
+    ),
+  reviewOperations: (
+    business: string,
+    source: string,
+    action: "validate" | "preview" | "approve",
+    body: Record<string, unknown>,
+  ) =>
+    request<Record<string, unknown>>(
+      `/businesses/${business}/data-sources/${source}/operational-mappings/${action}`,
+      {
+        method: "POST",
+        ...json(body),
+      },
+    ),
   proposeMapping: (business: string, source: string, key: string) =>
     request<MappingReview>(
       `/businesses/${business}/data-sources/${source}/mappings/propose`,
@@ -554,6 +908,7 @@ export const api = {
         method: "POST",
         ...json({ idempotency_key: key }),
       },
+      { timeoutMs: 300_000 },
     ),
   approveMapping: (
     business: string,
@@ -565,7 +920,11 @@ export const api = {
       `/businesses/${business}/data-sources/${source}/mappings/${revision}/approve`,
       {
         method: "POST",
-        ...json({ mapping, confirm_semantics: true, acknowledge_uncertainties: true }),
+        ...json({
+          mapping,
+          confirm_semantics: true,
+          acknowledge_uncertainties: true,
+        }),
       },
     ),
   searchCatalogue: (
@@ -622,9 +981,10 @@ export const api = {
     ),
   customerConversations: (business: string, cursor?: string) => {
     const suffix = cursor ? `?${new URLSearchParams({ cursor }).toString()}` : "";
-    return request<{ items: CustomerConversation[]; next_cursor: string | null }>(
-      `/businesses/${business}/channels/whatsapp/conversations${suffix}`,
-    );
+    return request<{
+      items: CustomerConversation[];
+      next_cursor: string | null;
+    }>(`/businesses/${business}/channels/whatsapp/conversations${suffix}`);
   },
   customerMessages: (business: string, conversation: string, cursor?: string) => {
     const suffix = cursor ? `?${new URLSearchParams({ cursor }).toString()}` : "";

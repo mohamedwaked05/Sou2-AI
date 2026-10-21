@@ -102,7 +102,26 @@ def _response(
         from app.services.source_mapping import latest_approved
 
         revision = latest_approved(session, source) if session is not None else None
+        from app.services.capabilities import active_capability_tools
+
+        operational = (
+            active_capability_tools(session, registry, source)
+            if session is not None
+            else ()
+        )
+        coverage, quality_status = None, None
+        if revision is not None:
+            from app.integrations.discovery import SourceMappingError
+            from app.services.catalogue_quality import approved_coverage
+
+            try:
+                _, coverage = approved_coverage(session, source, revision)
+                quality_status = "partial" if coverage else "full"
+            except SourceMappingError as exc:
+                quality_status = exc.code
         return DataSourceResponse(
+            catalogue_coverage=coverage,
+            quality_approval_status=quality_status,
             id=source.id,
             display_name=source.display_name,
             adapter_type=source.adapter_type,
@@ -113,7 +132,7 @@ def _response(
             last_validated_at=source.last_validated_at,
             last_successful_health_check_at=source.last_successful_health_check_at,
             failure_code=source.failure_code,
-            capabilities=["products"] if revision else [],
+            capabilities=(["products"] if revision else []) + list(operational),
             created_at=source.created_at,
             updated_at=source.updated_at,
         )
@@ -526,6 +545,10 @@ def disable_data_source(
     if source.status is OperationalDataSourceStatus.DISABLED:
         session.commit()
         return _response(source, registry, session)
+    if source.mapping_profile_key == "discovered_products":
+        from app.services.catalogue_quality import revoke_for_source
+
+        revoke_for_source(session, source, user)
     source.status = OperationalDataSourceStatus.DISABLED
     source.failure_code = None
     session.commit()

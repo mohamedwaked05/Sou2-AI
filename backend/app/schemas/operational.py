@@ -17,6 +17,8 @@ from pydantic import (
     model_validator,
 )
 
+from app.schemas.source_mapping import CatalogueRequest
+
 MAX_OPERATIONAL_ROWS = 100
 MAX_BEST_SELLER_ROWS = 50
 MAX_REPORTING_DAYS = 366
@@ -229,6 +231,22 @@ class ProductResolution(OperationalContract):
         return self
 
 
+class ProductDiscoveryResult(OperationalContract):
+    """Product records retrieved independently of stock or resolution precedence."""
+
+    continuation: str | None = None
+    pagination_scope: str | None = None
+    discovery_request: CatalogueRequest | None = None
+    items: tuple[Product, ...] = Field(max_length=50)
+    metadata: OperationalResultMetadata
+
+    @model_validator(mode="after")
+    def unique_products(self) -> ProductDiscoveryResult:
+        if len({item.external_product_id for item in self.items}) != len(self.items):
+            raise ValueError("Discovery requires distinct product identities.")
+        return self
+
+
 class CategoryCandidate(OperationalContract):
     external_category_id: str = Field(min_length=1, max_length=128)
     label: str = Field(min_length=1, max_length=255)
@@ -424,6 +442,7 @@ class PendingInventoryClarification(OperationalContract):
     """Backend-only context, never provider-created executable arguments."""
 
     operation: Literal["current_inventory"] = "current_inventory"
+    state_kind: Literal["clarification"] = "clarification"
     user_id: uuid.UUID
     source_id: uuid.UUID
     source_updated_at: AwareDatetime

@@ -9,7 +9,14 @@ import {
   ShieldCheck,
   Warehouse,
 } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useId, useRef, useState } from "react";
+import {
+  FormEvent,
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
 import {
   api,
   ApiError,
@@ -23,6 +30,13 @@ import { MappingOnboarding } from "./mapping-onboarding";
 
 const capabilityLabels: Record<string, string> = {
   products: "Products",
+  stock: "Current inventory",
+  availability: "Availability",
+  prices: "Current prices",
+  sales: "Sales reporting",
+  revenue: "Financial reporting",
+  refunds: "Refund reporting",
+  restocking: "Restocking",
   inventory: "Current inventory",
   sales_summaries: "Sales summaries",
   best_sellers: "Best sellers",
@@ -62,11 +76,29 @@ function formatTimestamp(value: string | null) {
   }).format(new Date(value));
 }
 
-function DataSourceBadge({ status }: { status: DataSourceStatus }) {
+function DataSourceBadge({
+  status,
+  partial = false,
+  qualityBlocked = false,
+  catalogueIssue = false,
+}: {
+  status: DataSourceStatus;
+  partial?: boolean;
+  qualityBlocked?: boolean;
+  catalogueIssue?: boolean;
+}) {
   return (
-    <span className={`source-status source-status-${status.toLowerCase()}`}>
+    <span
+      className={`source-status source-status-${qualityBlocked ? "unhealthy" : partial || catalogueIssue ? "partial" : status.toLowerCase()}`}
+    >
       <CircleDot aria-hidden="true" size={13} />
-      {statusLabels[status]}
+      {qualityBlocked
+        ? "Coverage needs revalidation"
+        : catalogueIssue
+          ? "Catalogue review required"
+          : partial
+            ? `${statusLabels[status]} — partial catalogue`
+            : statusLabels[status]}
     </span>
   );
 }
@@ -77,8 +109,9 @@ function MappingSummary({ profile }: { profile: ConnectionProfile }) {
     return (
       <div className="mapping-preview">
         <p>
-          Discover approved catalogue metadata, review a product mapping, then confirm
-          it before activation. Inventory, pricing and sales are unavailable.
+          Discover approved catalogue metadata, review a product mapping, then
+          confirm it before activation. Inventory, pricing, sales and financial
+          reporting have independent review and approval.
         </p>
       </div>
     );
@@ -97,8 +130,8 @@ function MappingSummary({ profile }: { profile: ConnectionProfile }) {
         </strong>
       </div>
       <p>
-        Completed and returned sales are finalized; pending and cancelled sales are
-        excluded. Active, unexpired reservations reduce available stock.
+        Completed and returned sales are finalized; pending and cancelled sales
+        are excluded. Active, unexpired reservations reduce available stock.
       </p>
     </div>
   );
@@ -183,8 +216,8 @@ function ConnectDialog({
             : "Connect catalogue source"}
         </h2>
         <p>
-          Sou2AI will use a deployment-managed, read-only profile. Credentials and
-          arbitrary database addresses are never entered here.
+          Sou2AI will use a deployment-managed, read-only profile. Credentials
+          and arbitrary database addresses are never entered here.
         </p>
         <form onSubmit={(event) => void submit(event)}>
           <label className="field-label" htmlFor={nameId}>
@@ -295,8 +328,9 @@ function DisableDialog({
         </span>
         <h2 id={titleId}>Disable this data source?</h2>
         <p>
-          <strong>{source.display_name}</strong> will stop being available to Sou2AI.
-          Its safe configuration remains so you can validate it again later.
+          <strong>{source.display_name}</strong> will stop being available to
+          Sou2AI. Its safe configuration remains so you can validate it again
+          later.
         </p>
         <div className="form-actions">
           <button
@@ -322,6 +356,20 @@ function DisableDialog({
   );
 }
 
+function sourceIssue(code: string | null): string {
+  if (code === "catalogue_value_invalid") {
+    return "The connection works, but catalogue data contains an invalid product identifier or a missing usable name. Run catalogue quality validation to review safe exclusions. Inventory, pricing, sales and finance have separate validation and approval.";
+  }
+  if (
+    code?.includes("fingerprint") ||
+    code?.includes("schema") ||
+    code?.startsWith("mapping_")
+  ) {
+    return "The source structure or approved mapping did not pass validation. Review the mapping and discovered metadata; no new mapping has been approved.";
+  }
+  return "The source health check failed. Check reader access and source availability, then validate again. Private connection details are not displayed.";
+}
+
 function SourceCard({
   source,
   businessId,
@@ -343,7 +391,9 @@ function SourceCard({
   const busy = busyAction.startsWith(`${source.id}:`);
   const mapping = source.mapping;
   return (
-    <article className={`source-card source-card-${source.status.toLowerCase()}`}>
+    <article
+      className={`source-card source-card-${source.status.toLowerCase()}`}
+    >
       <header className="source-card-header">
         <div className="source-identity">
           <span>
@@ -359,18 +409,26 @@ function SourceCard({
             </p>
           </div>
         </div>
-        <DataSourceBadge status={source.status} />
+        <DataSourceBadge
+          status={source.status}
+          catalogueIssue={source.failure_code?.startsWith("catalogue_")}
+          partial={source.catalogue_coverage?.approval_type === "partial"}
+          qualityBlocked={source.quality_approval_status?.startsWith(
+            "catalogue_",
+          )}
+        />
       </header>
 
       {source.status === "UNHEALTHY" ? (
         <div className="source-warning" role="status">
           <AlertCircle aria-hidden="true" />
           <div>
-            <strong>Connection needs attention</strong>
-            <p>
-              The source is unavailable or no longer matches its approved mapping. No
-              private connection details were exposed.
-            </p>
+            <strong>Source validation needs attention</strong>
+            <p>{sourceIssue(source.failure_code)}</p>
+            <details>
+              <summary>Diagnostic code</summary>
+              <code>{source.failure_code ?? "source_unavailable"}</code>
+            </details>
           </div>
         </div>
       ) : null}
@@ -409,15 +467,15 @@ function SourceCard({
           <div>
             <ShieldCheck aria-hidden="true" />
             <p>
-              Completed and returned sales are finalized; pending and cancelled sales
-              are excluded. Refunds reduce quantity and revenue.
+              Completed and returned sales are finalized; pending and cancelled
+              sales are excluded. Refunds reduce quantity and revenue.
             </p>
           </div>
           <div>
             <Warehouse aria-hidden="true" />
             <p>
-              Branches are sales locations. Warehouses hold stock. Active, unexpired
-              reservations reduce available quantity.
+              Branches are sales locations. Warehouses hold stock. Active,
+              unexpired reservations reduce available quantity.
             </p>
           </div>
         </div>
@@ -429,7 +487,10 @@ function SourceCard({
         />
       )}
 
-      <section className="source-capabilities" aria-labelledby={`caps-${source.id}`}>
+      <section
+        className="source-capabilities"
+        aria-labelledby={`caps-${source.id}`}
+      >
         <h3 id={`caps-${source.id}`}>Available capabilities</h3>
         <ul>
           {source.capabilities.map((capability) => (
@@ -453,7 +514,9 @@ function SourceCard({
           >
             <BusyLabel
               busy={busyAction === `${source.id}:validate`}
-              idle={source.status === "DISABLED" ? "Validate again" : "Validate"}
+              idle={
+                source.status === "DISABLED" ? "Validate again" : "Validate"
+              }
             />
           </button>
         ) : null}
@@ -464,7 +527,10 @@ function SourceCard({
             disabled={busy}
             onClick={() => void onAction(source, "activate")}
           >
-            <BusyLabel busy={busyAction === `${source.id}:activate`} idle="Activate" />
+            <BusyLabel
+              busy={busyAction === `${source.id}:activate`}
+              idle="Activate"
+            />
           </button>
         ) : null}
         {source.status === "VALIDATED" ||
@@ -479,7 +545,7 @@ function SourceCard({
             <RefreshCw aria-hidden="true" size={16} />
             <BusyLabel
               busy={busyAction === `${source.id}:health`}
-              idle="Test connection"
+              idle="Check source health"
             />
           </button>
         ) : null}
@@ -534,7 +600,8 @@ export function DataSourcesPage({ business }: { business: Business }) {
   }, [load]);
 
   async function create(displayName: string) {
-    const profile = profiles.find((item) => item.key === profileKey) ?? profiles[0];
+    const profile =
+      profiles.find((item) => item.key === profileKey) ?? profiles[0];
     if (!profile) return;
     setBusyAction("create");
     setError("");
@@ -556,7 +623,10 @@ export function DataSourcesPage({ business }: { business: Business }) {
     }
   }
 
-  async function act(source: DataSource, action: "validate" | "activate" | "health") {
+  async function act(
+    source: DataSource,
+    action: "validate" | "activate" | "health",
+  ) {
     setBusyAction(`${source.id}:${action}`);
     setError("");
     setSuccess("");
@@ -576,15 +646,18 @@ export function DataSourcesPage({ business }: { business: Business }) {
       const messages = {
         validate:
           updated.status === "UNHEALTHY"
-            ? "Validation finished, but the source needs attention."
-            : "Connection and mapping validated.",
+            ? sourceIssue(updated.failure_code)
+            : updated.status === "VALIDATED"
+              ? "Connection and mapping validated. Activate the source to enable its approved capabilities."
+              : "Connection and mapping validated.",
         activate: "Data source activated.",
         health:
           updated.status === "UNHEALTHY"
-            ? "Connection test failed safely."
-            : "Connection test succeeded.",
+            ? sourceIssue(updated.failure_code)
+            : "Source health check passed: reader access, approved schema and bounded source results.",
       };
-      setSuccess(messages[action]);
+      if (updated.status === "UNHEALTHY") setError(messages[action]);
+      else setSuccess(messages[action]);
     } catch (caught) {
       setError(safeErrorMessage(caught));
     } finally {
@@ -598,7 +671,10 @@ export function DataSourcesPage({ business }: { business: Business }) {
     setError("");
     setSuccess("");
     try {
-      const updated = await api.disableDataSource(business.id, disableTarget.id);
+      const updated = await api.disableDataSource(
+        business.id,
+        disableTarget.id,
+      );
       setSources(
         (current) =>
           current?.map((item) => (item.id === updated.id ? updated : item)) ?? [
@@ -623,7 +699,11 @@ export function DataSourcesPage({ business }: { business: Business }) {
         description="Manage tenant-scoped, read-only operational connections for this business. Live records stay in the source system."
         action={
           availableProfile ? (
-            <button type="button" className="btn" onClick={() => setShowConnect(true)}>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => setShowConnect(true)}
+            >
               <PlugZap aria-hidden="true" size={18} />
               Connect source
             </button>
@@ -664,8 +744,8 @@ export function DataSourcesPage({ business }: { business: Business }) {
           <h2>Connect trusted live business data</h2>
           <p>
             Products, inventory, sales summaries, best sellers, and restocking
-            recommendations can be read from an approved source without copying its
-            operational records into Sou2AI.
+            recommendations can be read from an approved source without copying
+            its operational records into Sou2AI.
           </p>
           {availableProfile ? (
             <article className="supported-source-card">

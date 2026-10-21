@@ -139,7 +139,13 @@ def test_queries_quote_and_bind_opaque_composite_schema(dialect, engine):
     sql = str(statement.compile(dialect=dialect))
     assert "OR 1=1" not in sql
     assert "EXISTS" in sql and "LEFT OUTER JOIN" in sql
-    assert values["term"] == "%x~%' OR 1=1 --~[~_%"
+    # Each literal word is independently bound by the existing search contract.
+    assert {key: value for key, value in values.items() if key.startswith("term_")} == {
+        "term_0": "%x~%'%",
+        "term_1": "%or%",
+        "term_2": "%1=1%",
+        "term_3": "%--~[~_%",
+    }
     assert "q9" in sql and "r3" in sql and "u8" in sql
     assert ("TOP" if engine == "sqlserver" else "LIMIT") in sql
 
@@ -888,7 +894,7 @@ def test_catalogue_choices_respect_chat_reply_bound_without_inventing_labels():
     offered = owner_chat._chat_catalogue_result(output)
     assert 1 < len(offered.items) < len(output.items)
     assert offered.items == output.items[: len(offered.items)] and offered.truncated
-    reply = owner_chat._catalogue_reply(output)
+    reply = owner_chat._catalogue_reply(output, "List products with IDs and SKUs")
     assert len(reply) <= 14_000
     assert all(item.external_product_id in reply for item in offered.items)
     assert all(

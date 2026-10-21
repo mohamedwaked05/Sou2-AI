@@ -10,7 +10,10 @@ htmlcov/
 
 # Environment and local editor files
 .env
+.env.*
+!.env.example
 backend/.env
+.tmp/
 .vscode/settings.json
 .vscode/tasks.json
 .vscode/launch.json
@@ -28,9 +31,14 @@ data/generated/*
 *.db
 *.sqlite
 *.sqlite3
+*.dump
+*.bak
+backups/
+volumes/
 
 # Visual review tooling (local Chromium profile)
 frontend/.visual-review/
+frontend/curl
 
 # OS files
 .DS_Store

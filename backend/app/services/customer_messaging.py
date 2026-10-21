@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.channels.contracts import DeliveryStatusEvent, InboundTextEvent
 from app.channels.privacy import encrypt_identity, identity_hash, masked_identity
+from app.core.admission import require_open_admission
 from app.core.config import Settings
 from app.core.security import utc_now
 from app.database.models import (
@@ -59,6 +60,7 @@ def ingest_inbound_event(
     session: Session, event: InboundTextEvent, settings: Settings
 ) -> bool:
     """Persist one normalized message exactly once before queueing it."""
+    require_open_admission(settings)
     connection = _active_connection(session, event.phone_number_id)
     existing = session.scalar(
         select(InboundWebhookDelivery).where(
@@ -152,6 +154,7 @@ def ingest_inbound_event(
 
 
 def ingest_delivery_event(session: Session, event: DeliveryStatusEvent) -> bool:
+    require_open_admission()
     connection = _active_connection(session, event.phone_number_id)
     if session.scalar(
         select(InboundWebhookDelivery.id).where(

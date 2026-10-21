@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime, time
@@ -10,11 +13,12 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from pydantic import SecretStr, ValidationError
-from sqlalchemy import Engine, create_engine, event, text
+from sqlalchemy import Engine, bindparam, create_engine, event, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
 from app.core.config import Settings, get_settings
+from app.integrations.discovery import SourceMappingError
 from app.integrations.operational import (
     OperationalDataInvalid,
     OperationalQueryTimeout,
@@ -35,6 +39,7 @@ from app.schemas.operational import (
     LocationResolutionQuery,
     OperationalResultMetadata,
     Product,
+    ProductDiscoveryResult,
     ProductResolution,
     ProductResolutionCandidate,
     ProductResolutionQuery,
@@ -44,6 +49,38 @@ from app.schemas.operational import (
     RestockingRecommendationsResult,
     SalesQuery,
     SalesSummary,
+)
+from app.schemas.source_mapping import CatalogueRequest
+from app.utils.product_reference import search_terms
+
+_PRODUCT_DISCOVERY_SQL = text(
+    r"""
+    SELECT item.item_code AS external_product_id, item.merchant_sku AS sku,
+           item.ean_barcode AS barcode, item.display_label AS product_name,
+           category.label AS category
+    FROM minimarket.catalog_items AS item
+    LEFT JOIN minimarket.categories AS category
+        ON category.category_id = item.category_id
+    WHERE item.active = true AND (
+        (CAST(:external_product_id AS text) IS NOT NULL
+            AND item.item_code = :external_product_id)
+        OR (CAST(:external_product_id AS text) IS NULL AND (
+            lower(regexp_replace(btrim(item.display_label), '\s+', ' ', 'g'))
+                LIKE :partial_reference ESCAPE '\'
+            OR lower(item.item_code) = :normalized_reference
+            OR lower(item.merchant_sku) = :normalized_reference
+            OR lower(item.ean_barcode) = :normalized_reference
+            OR EXISTS (
+                SELECT 1 FROM minimarket.catalog_item_aliases AS alias
+                WHERE alias.item_id = item.item_id AND alias.approved = true
+                AND lower(regexp_replace(btrim(alias.alias), '\s+', ' ', 'g'))
+                    LIKE :partial_reference ESCAPE '\'
+            )
+        ))
+    )
+    ORDER BY product_name, external_product_id
+    LIMIT :row_limit
+    """
 )
 
 _SOURCE_CONFIGURATION_SQL = text(
@@ -102,16 +139,14 @@ _INVENTORY_SQL = text(
           AND (
               CAST(:branch_code AS text) IS NULL
               OR (
-                  location.location_type = ANY(CAST(:branch_location_types AS text[]))
+                  location.location_type IN :branch_location_types
                   AND location.location_code = :branch_code
               )
           )
           AND (
               CAST(:warehouse_code AS text) IS NULL
               OR (
-                  location.location_type = ANY(
-                      CAST(:warehouse_location_types AS text[])
-                  )
+                  location.location_type IN :warehouse_location_types
                   AND location.location_code = :warehouse_code
               )
           )
@@ -125,7 +160,7 @@ _INVENTORY_SQL = text(
        )
     ORDER BY
         CASE
-            WHEN location_type = ANY(CAST(:branch_location_types AS text[])) THEN 0
+            WHEN location_type IN :branch_location_types THEN 0
             ELSE 1
         END,
         location_code,
@@ -133,6 +168,9 @@ _INVENTORY_SQL = text(
         external_product_id
     LIMIT :row_limit
     """
+).bindparams(
+    bindparam("branch_location_types", expanding=True),
+    bindparam("warehouse_location_types", expanding=True),
 )
 
 _PRODUCT_RESOLUTION_EXACT_SQL = text(
@@ -227,7 +265,7 @@ _PRODUCT_RESOLUTION_TOKEN_SQL = text(
     WITH reference_terms AS (
         SELECT DISTINCT lower(btrim(term)) AS term
         FROM regexp_split_to_table(:reference, '\s+') AS split(term)
-        WHERE char_length(btrim(term)) >= 3
+        WHERE char_length(btrim(term)) >= 1
     ), matches AS (
         SELECT
             item.item_id,
@@ -271,7 +309,7 @@ _PRODUCT_RESOLUTION_TOKEN_SQL = text(
     )
     SELECT *, 'partial_name' AS match_type
     FROM matches
-    WHERE matched_terms = (SELECT max(matched_terms) FROM matches)
+    WHERE matched_terms = (SELECT count(*) FROM reference_terms)
       AND matched_terms > 0
     ORDER BY matched_terms DESC, product_name, external_product_id
     LIMIT :row_limit
@@ -336,7 +374,7 @@ _SALES_SUMMARY_SQL = text(
               OR branch_location_id = (
                   SELECT location_id
                   FROM minimarket.stock_locations
-                  WHERE location_type = 'BRANCH'
+                  WHERE location_type IN :branch_location_types
                     AND location_code = :branch_code
               )
           )
@@ -364,7 +402,7 @@ _SALES_SUMMARY_SQL = text(
               OR receipt.branch_location_id = (
                   SELECT location_id
                   FROM minimarket.stock_locations
-                  WHERE location_type = 'BRANCH'
+                  WHERE location_type IN :branch_location_types
                     AND location_code = :branch_code
               )
           )
@@ -388,7 +426,7 @@ _SALES_SUMMARY_SQL = text(
     FROM sale_totals AS sale
     CROSS JOIN refund_totals AS refund
     """
-)
+).bindparams(bindparam("branch_location_types", expanding=True))
 
 _BEST_SELLERS_SQL = text(
     """
@@ -408,7 +446,7 @@ _BEST_SELLERS_SQL = text(
               OR receipt.branch_location_id = (
                   SELECT location_id
                   FROM minimarket.stock_locations
-                  WHERE location_type = 'BRANCH'
+                  WHERE location_type IN :branch_location_types
                     AND location_code = :branch_code
               )
           )
@@ -433,7 +471,7 @@ _BEST_SELLERS_SQL = text(
               OR receipt.branch_location_id = (
                   SELECT location_id
                   FROM minimarket.stock_locations
-                  WHERE location_type = 'BRANCH'
+                  WHERE location_type IN :branch_location_types
                     AND location_code = :branch_code
               )
           )
@@ -468,7 +506,7 @@ _BEST_SELLERS_SQL = text(
         item.item_code ASC
     LIMIT :row_limit
     """
-)
+).bindparams(bindparam("branch_location_types", expanding=True))
 
 
 def _reject_privileged_operational_connection(
@@ -548,6 +586,7 @@ class PostgreSQLOperationalAdapter:
         self._engine = create_engine(
             url,
             pool_pre_ping=True,
+            hide_parameters=True,
             connect_args={
                 "connect_timeout": connect_timeout_seconds,
                 "options": (
@@ -562,6 +601,114 @@ class PostgreSQLOperationalAdapter:
     @property
     def enforced_query_timeout_seconds(self) -> int:
         return self.query_timeout_milliseconds // 1000
+
+    def search_products(self, query: CatalogueRequest) -> ProductDiscoveryResult:
+        """Discover records without fetching inventory or prioritizing exact names."""
+        try:
+            reference = self._normalized_reference(query.query or "")
+            scope = hashlib.sha256(
+                json.dumps(
+                    [
+                        query.model_dump(
+                            mode="json", exclude={"continuation", "limit"}
+                        ),
+                        str(getattr(self._engine, "url", id(self._engine))),
+                    ],
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()
+            extra = {}
+            filters = ["item.active = true"]
+            if query.external_product_id is not None:
+                filters.append("item.item_code = :external_product_id")
+            elif not query.browse:
+                term_clauses = []
+                for i, term in enumerate(search_terms(reference)):
+                    extra[f"term_{i}"] = self._escaped_search(term)
+                    term_clauses.append(f"""(
+                        replace(lower(item.display_label), ' ', '')
+                            LIKE :term_{i} ESCAPE '\\'
+                        OR EXISTS (SELECT 1 FROM minimarket.catalog_item_aliases a
+                            WHERE a.item_id=item.item_id AND a.approved=true
+                            AND replace(lower(a.alias), ' ', '')
+                                LIKE :term_{i} ESCAPE '\\'))""")
+                if not term_clauses or len(term_clauses) > 16:
+                    raise SourceMappingError("empty_product_search")
+                filters.append(
+                    "(("
+                    + " AND ".join(term_clauses)
+                    + ") OR lower(item.item_code)=:normalized_reference "
+                    "OR lower(item.merchant_sku)=:normalized_reference "
+                    "OR lower(item.ean_barcode)=:normalized_reference)"
+                )
+            if query.category:
+                extra["category"] = query.category.casefold()
+                filters.append("lower(category.label) = :category")
+            if query.continuation:
+                try:
+                    cursor = json.loads(base64.urlsafe_b64decode(query.continuation))
+                    if (
+                        cursor["scope"] != scope
+                        or not isinstance(cursor["after"], list)
+                        or len(cursor["after"]) != 1
+                        or not isinstance(cursor["after"][0], str)
+                    ):
+                        raise ValueError
+                    extra["after"] = cursor["after"][0]
+                except ValueError, TypeError, KeyError:
+                    raise SourceMappingError("invalid_catalogue_continuation") from None
+                filters.append("item.item_code > :after")
+            statement = text(
+                """SELECT item.item_code AS external_product_id,
+                item.merchant_sku AS sku, item.ean_barcode AS barcode,
+                item.display_label AS product_name, category.label AS category
+                FROM minimarket.catalog_items item
+                LEFT JOIN minimarket.categories category
+                    ON category.category_id=item.category_id
+                WHERE """
+                + " AND ".join(filters)
+                + " ORDER BY item.item_code LIMIT :row_limit"
+            )
+            with self._engine.connect() as connection:
+                self._prepare_read(connection)
+                source = self._source_configuration(connection)
+                rows = list(
+                    connection.execute(
+                        statement,
+                        {
+                            "external_product_id": query.external_product_id,
+                            "normalized_reference": reference,
+                            "partial_reference": self._escaped_search(reference),
+                            "row_limit": query.limit + 1,
+                            **extra,
+                        },
+                    ).mappings()
+                )
+            limited = rows[: query.limit]
+            return ProductDiscoveryResult(
+                pagination_scope=scope,
+                discovery_request=query.model_copy(update={"continuation": None}),
+                continuation=base64.urlsafe_b64encode(
+                    json.dumps(
+                        {"scope": scope, "after": [limited[-1]["external_product_id"]]}
+                    ).encode()
+                ).decode()
+                if len(rows) > query.limit
+                else None,
+                items=tuple(self._normalize_product(row) for row in limited),
+                metadata=self._metadata(
+                    source,
+                    row_count=len(limited),
+                    requested_limit=query.limit,
+                    is_truncated=len(rows) > query.limit,
+                ),
+            )
+        except (SQLAlchemyError, RuntimeError) as exc:
+            self._raise_safe_database_error(exc)
+        except ValidationError, KeyError, TypeError, ArithmeticError:
+            raise OperationalDataInvalid(
+                "Operational source data is invalid."
+            ) from None
 
     def resolve_product(self, query: ProductResolutionQuery) -> ProductResolution:
         try:
@@ -804,6 +951,7 @@ class PostgreSQLOperationalAdapter:
                             "start_at": start_at,
                             "end_at": end_at,
                             "branch_code": query.branch_external_id,
+                            "branch_location_types": self._branch_source_location_types,
                         },
                     )
                     .mappings()
@@ -851,6 +999,7 @@ class PostgreSQLOperationalAdapter:
                             "start_at": start_at,
                             "end_at": end_at,
                             "branch_code": query.branch_external_id,
+                            "branch_location_types": self._branch_source_location_types,
                             "row_limit": query.limit + 1,
                         },
                     ).mappings()

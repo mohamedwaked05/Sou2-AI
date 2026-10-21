@@ -83,6 +83,7 @@ class OwnerTurnResponse(BaseModel):
 
 
 class ConversationHistoryResponse(BaseModel):
+    conversation_id: uuid.UUID | None = None
     items: list[ChatMessageResponse]
     next_cursor: str | None
 

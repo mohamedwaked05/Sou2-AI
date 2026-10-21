@@ -57,6 +57,7 @@ import {
 import { ScheduleEditor } from "./businesses";
 import { CATEGORIES, categoryLabel, LOCATIONS } from "./constants";
 import { DataSourcesPage } from "./data-sources";
+import { ChatContent } from "./chat-content";
 import {
   Alert,
   BusyLabel,
@@ -86,6 +87,13 @@ const navItems = [
 
 const PINNED_BOTTOM_THRESHOLD_PX = 96;
 const COMPOSER_MAX_LINES = 6;
+
+type PendingOwnerTurn = {
+  content: string;
+  key: string;
+  conversationId?: string;
+  creation?: Promise<Conversation>;
+};
 
 function usePinnedToBottom(
   contentVersion: unknown,
@@ -183,23 +191,32 @@ export function WorkspaceRoute({
   const { id = "", page = "overview" } = useParams();
   const [business, setBusiness] = useState<Business | null>(null);
   const [error, setError] = useState("");
+  const [errorBusinessId, setErrorBusinessId] = useState("");
+  // Keep unresolved turn keys across navigation for this authenticated workspace.
+  const pendingTurns = useRef(new Map<string, PendingOwnerTurn>());
   useEffect(() => {
     let current = true;
+    setError("");
     api
       .business(id)
       .then((item) => current && setBusiness(item))
-      .catch((caught) => current && setError(errorMessage(caught)));
+      .catch((caught) => {
+        if (current) {
+          setErrorBusinessId(id);
+          setError(errorMessage(caught));
+        }
+      });
     return () => {
       current = false;
     };
   }, [id]);
-  if (error)
+  if (error && errorBusinessId === id)
     return (
       <main className="grid min-h-dvh place-items-center p-6">
         <Alert>{error}</Alert>
       </main>
     );
-  if (!business) return <WorkspaceLoading />;
+  if (!business || business.id !== id) return <WorkspaceLoading />;
   return (
     <AppShell
       business={business}
@@ -209,7 +226,13 @@ export function WorkspaceRoute({
       setDark={setDark}
       onLogout={onLogout}
     >
-      <WorkspacePage page={page} business={business} onBusinessChange={setBusiness} />
+      <WorkspacePage
+        key={`${business.id}:${page}`}
+        page={page}
+        business={business}
+        onBusinessChange={setBusiness}
+        pendingTurns={pendingTurns.current}
+      />
     </AppShell>
   );
 }
@@ -493,13 +516,23 @@ function WorkspacePage({
   page,
   business,
   onBusinessChange,
+  pendingTurns,
 }: {
   page: string;
   business: Business;
   onBusinessChange: (business: Business) => void;
+  pendingTurns: Map<string, PendingOwnerTurn>;
 }) {
+  const location = useLocation();
   if (page === "overview") return <OverviewPage business={business} />;
-  if (page === "chat") return <ChatPage business={business} />;
+  if (page === "chat")
+    return (
+      <ChatPage
+        key={`${business.id}:${new URLSearchParams(location.search).get("conversation") ?? "default"}`}
+        business={business}
+        pendingTurns={pendingTurns}
+      />
+    );
   if (page === "conversations") return <ConversationsPage business={business} />;
   if (page === "knowledge") return <KnowledgePage business={business} />;
   if (page === "settings")
@@ -715,38 +748,68 @@ function Metric({
   );
 }
 
-function ChatPage({ business }: { business: Business }) {
+function ChatPage({
+  business,
+  pendingTurns,
+}: {
+  business: Business;
+  pendingTurns: Map<string, PendingOwnerTurn>;
+}) {
   const location = useLocation();
   const selectedId = new URLSearchParams(location.search).get("conversation");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [conversation, setConversation] = useState<Conversation | null>(null);
-  const [text, setText] = useState("");
+  const scope = `${business.id}:${selectedId ?? "default"}`;
+  const [text, setText] = useState(() => pendingTurns.get(scope)?.content ?? "");
+  const defaultConversationId = useRef(pendingTurns.get(scope)?.conversationId);
+  const canCreateDefaultConversation = useRef(false);
   const [loading, setLoading] = useState(business.is_active);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const composingRef = useRef(false);
+  const active = useRef(true);
+  const sendingRef = useRef(false);
+  const loadVersion = useRef(0);
+  useEffect(() => {
+    active.current = true;
+    return () => {
+      active.current = false;
+      loadVersion.current += 1;
+    };
+  }, []);
   const messageScroll = usePinnedToBottom(messages, !loading, business.id, sending);
   const load = useCallback(async () => {
-    if (!business.is_active) return;
+    if (!business.is_active || !active.current) return;
+    const version = ++loadVersion.current;
+    const current = () => active.current && version === loadVersion.current;
     try {
       if (selectedId) {
         const [selected, history] = await Promise.all([
           api.conversation(business.id, selectedId),
           api.conversationMessages(business.id, selectedId),
         ]);
+        if (!current()) return;
         setConversation(selected);
         setMessages(history.items);
       } else {
+        const boundId =
+          pendingTurns.get(scope)?.conversationId ?? defaultConversationId.current;
+        const history = boundId
+          ? await api.messages(business.id, boundId)
+          : await api.messages(business.id);
+        if (!current()) return;
+        defaultConversationId.current = boundId ?? history.conversation_id ?? undefined;
+        canCreateDefaultConversation.current = history.conversation_id === null;
         setConversation(null);
-        setMessages((await api.messages(business.id)).items);
+        setMessages(history.items);
       }
     } catch (caught) {
-      setError(errorMessage(caught));
+      if (current()) setError(errorMessage(caught));
     } finally {
-      setLoading(false);
+      if (current()) setLoading(false);
     }
-  }, [business.id, business.is_active, selectedId]);
+  }, [business.id, business.is_active, selectedId, pendingTurns, scope]);
   useEffect(() => {
     void load();
   }, [load]);
@@ -756,22 +819,78 @@ function ChatPage({ business }: { business: Business }) {
   async function send(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const content = text.trim();
-    if (!content || sending || conversation?.archived) return;
+    if (!content || sendingRef.current || loading || conversation?.archived) return;
+    sendingRef.current = true;
+    // An initial history load must not overwrite history refreshed by this send.
+    loadVersion.current += 1;
+    const pending = pendingTurns.get(scope);
+    const key = pending?.content === content ? pending.key : crypto.randomUUID();
+    let conversationId =
+      selectedId ?? pending?.conversationId ?? defaultConversationId.current;
+    pendingTurns.set(scope, {
+      content,
+      key,
+      conversationId,
+      creation: pending?.creation,
+    });
     setSending(true);
     setError("");
     try {
       if (selectedId) {
-        await api.sendConversationMessage(business.id, selectedId, content);
+        await api.sendConversationMessage(business.id, selectedId, content, key);
       } else {
-        await api.send(business.id, content);
+        if (!conversationId) {
+          if (!canCreateDefaultConversation.current)
+            throw new ApiError(
+              503,
+              "chat_scope_unavailable",
+              "Reload the conversation before sending this message.",
+            );
+          const creation = pending?.creation ?? api.createConversation(business.id);
+          pendingTurns.set(scope, { content, key, creation });
+          let created: Conversation;
+          try {
+            created = await creation;
+          } catch (caught) {
+            const turn = pendingTurns.get(scope);
+            if (turn?.creation === creation)
+              pendingTurns.set(scope, { ...turn, creation: undefined });
+            throw caught;
+          }
+          conversationId = created.id;
+          if (pendingTurns.get(scope)?.key === key)
+            pendingTurns.set(scope, { content, key, conversationId });
+          defaultConversationId.current = conversationId;
+        }
+        await api.send(business.id, content, key, conversationId);
       }
+      if (active.current && pendingTurns.get(scope)?.key === key)
+        pendingTurns.delete(scope);
+      if (!active.current) return;
       setText("");
       await load();
     } catch (caught) {
+      if (
+        active.current &&
+        caught instanceof ApiError &&
+        [
+          "owner_turn_failed",
+          "assistant_timeout",
+          "assistant_invalid_response",
+          "assistant_transport_failure",
+          "assistant_rate_limited",
+          "owner_chat_rate_limited",
+        ].includes(caught.code) &&
+        pendingTurns.get(scope)?.key === key
+      ) {
+        pendingTurns.delete(scope);
+      }
+      if (!active.current) return;
       setError(ownerChatErrorMessage(caught));
       await load();
     } finally {
-      setSending(false);
+      sendingRef.current = false;
+      if (active.current) setSending(false);
     }
   }
   return (
@@ -846,7 +965,7 @@ function ChatPage({ business }: { business: Business }) {
                 name="message"
                 rows={1}
                 maxLength={4000}
-                disabled={sending || conversation?.archived}
+                disabled={loading || sending || conversation?.archived}
                 value={text}
                 onChange={(event) => setText(event.target.value)}
                 onCompositionStart={() => {
@@ -874,7 +993,7 @@ function ChatPage({ business }: { business: Business }) {
               <button
                 type="submit"
                 className="btn"
-                disabled={sending || !text.trim() || conversation?.archived}
+                disabled={loading || sending || !text.trim() || conversation?.archived}
                 aria-label="Send message"
               >
                 <Send size={18} />
@@ -895,9 +1014,14 @@ function Message({ message }: { message: ChatMessage }) {
         {message.role === "owner" ? "You" : <Bot />}
       </span>
       <div>
-        <div className="message-bubble">{message.content}</div>
+        <div className="message-bubble">
+          <ChatContent content={message.content} />
+        </div>
         {message.role === "owner" && message.generation_state === "failed" && (
-          <p role="status">Response failed. Send a new message to try again.</p>
+          <p role="status">
+            No answer was generated. Check the error above; if a request limit was
+            reached, wait before sending again.
+          </p>
         )}
         {message.role === "owner" && message.generation_state === "processing" && (
           <p role="status">Response is being generated.</p>
@@ -936,6 +1060,15 @@ function ConversationsPage({ business }: { business: Business }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState<"create" | "archive" | "">("");
   const [archiveTarget, setArchiveTarget] = useState<Conversation | null>(null);
+  const active = useRef(true);
+  const listVersion = useRef(0);
+  useEffect(() => {
+    active.current = true;
+    return () => {
+      active.current = false;
+      listVersion.current += 1;
+    };
+  }, []);
   const selectedConversationId = selected?.id ?? null;
   const conversationScroll = usePinnedToBottom(
     messages,
@@ -944,8 +1077,11 @@ function ConversationsPage({ business }: { business: Business }) {
   );
   const loadConversations = useCallback(async () => {
     if (channel !== "owner") return;
+    const version = ++listVersion.current;
+    const current = () => active.current && version === listVersion.current;
     try {
       const response = await api.conversations(business.id, true);
+      if (!current()) return;
       setConversations(response.items);
       setSelected((current) => {
         if (current) {
@@ -956,12 +1092,16 @@ function ConversationsPage({ business }: { business: Business }) {
         );
       });
     } catch (caught) {
-      setConversations([]);
+      if (!current()) return;
+      setConversations((items) => items ?? []);
       setError(errorMessage(caught));
     }
   }, [business.id, channel]);
   useEffect(() => {
     void loadConversations();
+    return () => {
+      listVersion.current += 1;
+    };
   }, [loadConversations]);
   useEffect(() => {
     if (channel !== "owner") return;
@@ -970,45 +1110,55 @@ function ConversationsPage({ business }: { business: Business }) {
       return;
     }
     setMessages(null);
+    let current = true;
     api
       .conversationMessages(business.id, selectedConversationId)
-      .then((response) => setMessages(response.items))
+      .then((response) => current && setMessages(response.items))
       .catch((caught) => {
+        if (!current) return;
         setMessages([]);
         setError(errorMessage(caught));
       });
+    return () => {
+      current = false;
+    };
   }, [business.id, channel, selectedConversationId]);
 
   async function createNewConversation() {
+    if (busy) return;
     setBusy("create");
     setError("");
     try {
       const created = await api.createConversation(business.id);
+      if (!active.current) return;
+      listVersion.current += 1;
       setConversations((items) => [created, ...(items ?? [])]);
       setSelected(created);
     } catch (caught) {
-      setError(errorMessage(caught));
+      if (active.current) setError(errorMessage(caught));
     } finally {
-      setBusy("");
+      if (active.current) setBusy("");
     }
   }
 
   async function archiveSelected() {
-    if (!archiveTarget) return;
+    if (!archiveTarget || busy) return;
     setBusy("archive");
     setError("");
     try {
       const archived = await api.archiveConversation(business.id, archiveTarget.id);
+      if (!active.current) return;
+      listVersion.current += 1;
       setConversations(
         (items) =>
           items?.map((item) => (item.id === archived.id ? archived : item)) ?? [],
       );
-      setSelected(archived);
+      setSelected((current) => (current?.id === archived.id ? archived : current));
       setArchiveTarget(null);
     } catch (caught) {
-      setError(errorMessage(caught));
+      if (active.current) setError(errorMessage(caught));
     } finally {
-      setBusy("");
+      if (active.current) setBusy("");
     }
   }
 

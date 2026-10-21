@@ -76,6 +76,21 @@ function mockLoad(sources: DataSource[] = []) {
 }
 
 describe("Data Sources management", () => {
+  it("distinguishes source data errors from a connection failure after validation", async () => {
+    mockLoad([configuredSource()]);
+    vi.spyOn(api, "validateDataSource").mockResolvedValueOnce(
+      configuredSource({
+        status: "UNHEALTHY",
+        failure_code: "catalogue_value_invalid",
+        last_validated_at: "2026-10-17T19:00:00Z",
+      }),
+    );
+    render(<DataSourcesPage business={business} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Validate" }));
+    expect(await screen.findAllByText(/invalid product identifier/)).toHaveLength(2);
+    expect(screen.getByText("Catalogue review required")).toBeVisible();
+    expect(screen.queryByText("Data source activated.")).toBeNull();
+  });
   beforeEach(() => {
     Object.defineProperty(window, "innerWidth", {
       configurable: true,
@@ -190,12 +205,12 @@ describe("Data Sources management", () => {
     const check = vi.spyOn(api, "checkDataSource").mockResolvedValueOnce(unhealthy);
     render(<DataSourcesPage business={business} />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Test connection" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Check source health" }));
 
     await waitFor(() => expect(check).toHaveBeenCalledWith("business-1", "source-1"));
     expect(await screen.findByText("Needs attention")).toBeInTheDocument();
-    expect(screen.getByText("Connection needs attention")).toBeInTheDocument();
-    expect(screen.getByText("Connection test failed safely.")).toBeInTheDocument();
+    expect(screen.getByText("Source validation needs attention")).toBeInTheDocument();
+    expect(screen.getAllByText(/The source health check failed/)).toHaveLength(2);
     expect(document.body.textContent).not.toMatch(
       /postgresql:\/\/|password|select \*/i,
     );

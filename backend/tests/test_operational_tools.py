@@ -599,8 +599,7 @@ def test_unknown_category_reaches_inventory_resolution_without_source_fallback(
 
     assert response.status_code == 200, response.text
     assert (
-        "matching live catalogue category"
-        in response.json()["assistant_message"]["content"]
+        "No matching source record" in response.json()["assistant_message"]["content"]
     )
     assert (
         "can't access live operational data"
@@ -608,11 +607,7 @@ def test_unknown_category_reaches_inventory_resolution_without_source_fallback(
     )
     assert source.category_references == ["Electronics"]
     assert source.calls == []
-    assert len(provider.requests) == 2
-    assert provider.requests[1].mode == "operational_synthesis"
-    supplied = provider.requests[1].tool_results[0].output
-    assert supplied["category_resolution"]["status"] == "not_found"
-    assert provider.requests[1].validated_result_status == "not_found"
+    assert len(provider.requests) == 1
     assert any(
         "category_input_kind=query" in message for message in diagnostic_messages
     )
@@ -666,10 +661,9 @@ def test_inventory_category_semantics_normalize_a_provider_final_to_inventory(
     assert response.status_code == 200, response.text
     assert source.category_references == ["unresolved future category"]
     assert source.calls == []
-    assert len(provider.requests) == 3
+    assert len(provider.requests) == 2
     assert provider.requests[0].mode == "operational"
     assert provider.requests[1].mode == "category_resolution"
-    assert provider.requests[2].mode == "operational_synthesis"
     assert any(
         "semantic_operation=inventory_category" in message
         and "entity_kind=category" in message
@@ -791,7 +785,11 @@ def test_bounded_category_candidates_do_not_block_unresolved_source_lookup(
     assert response.status_code == 200, response.text
     assert len(provider.requests[0].category_candidates) == 50
     assert source.category_references == ["outside candidate page"]
-    assert provider.requests[1].validated_result_status == "not_found"
+    assert (
+        "No matching source record" in response.json()["assistant_message"]["content"]
+    )
+
+    assert len(provider.requests) == 1
 
 
 def test_final_without_tool_keeps_active_source_fallback_truthful(
@@ -912,11 +910,9 @@ def test_category_semantic_match_redispatches_inventory_with_source_label(
     assert [request.mode for request in provider.requests] == [
         "operational",
         "category_resolution",
-        "operational_synthesis",
     ]
     assert provider.requests[1].messages[-1].content == "drinks"
     assert provider.requests[1].max_output_tokens == 64
-    assert provider.requests[1].tools == ()
     with migration_engine.connect() as connection:
         reservation = connection.execute(
             text(
@@ -971,7 +967,6 @@ def test_exact_category_label_bypasses_semantic_resolver_and_releases_reserve(
     assert source.calls == [CURRENT_INVENTORY_TOOL]
     assert [request.mode for request in provider.requests] == [
         "operational",
-        "operational_synthesis",
     ]
     with migration_engine.connect() as connection:
         reservation = connection.execute(
@@ -1027,7 +1022,6 @@ def test_category_resolver_timeout_charges_uncertain_usage_once_and_falls_back(
     assert [request.mode for request in provider.requests] == [
         "operational",
         "category_resolution",
-        "operational_synthesis",
     ]
     with migration_engine.connect() as connection:
         reservation = connection.execute(
@@ -1137,7 +1131,6 @@ def test_unrecognized_category_resolution_reference_falls_back_to_source_lookup(
     assert [request.mode for request in provider.requests] == [
         "operational",
         "category_resolution",
-        "operational_synthesis",
     ]
 
 
@@ -1165,7 +1158,7 @@ def test_profit_metric_returns_missing_capability_and_revenue_alternative(
     assert result.output.period.start_date.isoformat() == "2026-08-20"
 
 
-def test_owner_receives_unsupported_profit_facts_and_preserves_franco_style(
+def test_owner_receives_shared_unsupported_profit_facts(
     api_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     user, business = active_business(
@@ -1211,22 +1204,22 @@ def test_owner_receives_unsupported_profit_facts_and_preserves_franco_style(
     assert "COGS" in response.json()["assistant_message"]["content"]
     assert "unavailable" not in response.json()["assistant_message"]["content"]
     assert SALES_SUMMARY_TOOL in {tool.name for tool in provider.requests[0].tools}
-    assert provider.requests[1].mode == "operational_synthesis"
-    assert provider.requests[1].tools == ()
-    supplied = provider.requests[1].tool_results[0].output
-    assert supplied["requested_metric"] == "gross_profit"
-    assert supplied["supported_metrics"] == ["revenue", "sales_count"]
-    assert "minimarket" not in str(supplied)
     assert any("metric=gross_profit" in message for message in diagnostic_messages)
     assert any(
         "capability_outcome=unsupported" in message for message in diagnostic_messages
     )
-    assert any(
-        "owner_chat_operational_synthesis outcome=final schema=response_only" in message
-        for message in diagnostic_messages
-    )
     assert all("rebe7" not in message for message in diagnostic_messages)
     assert all("Ma fina" not in message for message in diagnostic_messages)
+
+    assert len(provider.requests) == 1
+    assert (
+        "Supported metrics: revenue, sales count"
+        in response.json()["assistant_message"]["content"]
+    )
+    assert any(
+        "final_synthesis_path=deterministic" in message
+        for message in diagnostic_messages
+    )
 
 
 def test_location_preference_is_saved_without_an_inventory_read_and_applied_later(
@@ -2027,7 +2020,7 @@ def test_stale_location_preference_is_removed_without_an_inventory_query(
     assert usage.status == "completed"
 
 
-def test_unsupported_profit_uses_capability_fallback_when_synthesis_is_invalid(
+def test_unsupported_profit_uses_shared_capability_facts_without_synthesis(
     api_client: TestClient, db_session: Session
 ) -> None:
     user, business = active_business(
@@ -2068,8 +2061,7 @@ def test_unsupported_profit_uses_capability_fallback_when_synthesis_is_invalid(
     assert "revenue" in content
     assert "sales count" in content
     assert "live operational data" not in content.lower()
-    assert len(provider.requests) == 2
-    assert provider.requests[1].mode == "operational_synthesis"
+    assert len(provider.requests) == 1
     assert source.calls == []
 
 
@@ -2345,13 +2337,9 @@ def test_owner_loop_executes_live_tool_aggregates_usage_and_replays_without_work
     assert first.status_code == 200, first.text
     assert replay.status_code == 200
     assert replay.json()["replayed"] is True
-    assert len(provider.requests) == 2
+    assert len(provider.requests) == 1
     assert CURRENT_INVENTORY_TOOL in {tool.name for tool in provider.requests[0].tools}
     assert provider.requests[0].tool_results == ()
-    supplied = provider.requests[1].tool_results[0]
-    assert supplied.tool_name == CURRENT_INVENTORY_TOOL
-    assert supplied.output["items"][0]["available_quantity"] == "8"
-    assert "connection_profile" not in str(supplied.output)
     assert source.calls == [CURRENT_INVENTORY_TOOL]
     assert enqueued == []
     assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
@@ -2363,9 +2351,12 @@ def test_owner_loop_executes_live_tool_aggregates_usage_and_replays_without_work
                 "FROM ai_usage_reservations"
             )
         ).one()
-    assert reservation.input_tokens == 20
-    assert reservation.output_tokens == 4
-    assert reservation.total_tokens == 24
+    assert reservation.input_tokens == 10
+    assert reservation.output_tokens == 2
+    assert reservation.total_tokens == 12
+
+    assert "8 available" in first.json()["assistant_message"]["content"]
+    assert "connection_profile" not in first.json()["assistant_message"]["content"]
 
 
 def test_semantic_product_intent_without_a_tool_proposal_derives_inventory_once(
@@ -2403,8 +2394,7 @@ def test_semantic_product_intent_without_a_tool_proposal_derives_inventory_once(
     )
 
     assert response.status_code == 200, response.text
-    assert len(provider.requests) == 2
-    assert provider.requests[1].mode == "operational_synthesis"
+    assert len(provider.requests) == 1
     assert source.resolution_references == ["PEPSI-1500"]
     assert source.calls == [CURRENT_INVENTORY_TOOL]
     assert source.last_inventory_query.external_product_id == "P1001"
@@ -2414,10 +2404,10 @@ def test_semantic_product_intent_without_a_tool_proposal_derives_inventory_once(
             text("SELECT status, total_tokens FROM ai_usage_reservations")
         ).one()
     assert reservation.status == "completed"
-    assert reservation.total_tokens == 24
+    assert reservation.total_tokens == 12
 
 
-def test_backend_derived_inventory_passes_every_validated_row_to_synthesis(
+def test_backend_derived_inventory_renders_every_validated_row_without_synthesis(
     api_client: TestClient,
     db_session: Session,
 ) -> None:
@@ -2460,7 +2450,9 @@ def test_backend_derived_inventory_passes_every_validated_row_to_synthesis(
 
     assert response.status_code == 200, response.text
     assert source.calls == [CURRENT_INVENTORY_TOOL]
-    assert len(provider.requests[1].tool_results[0].output["items"]) == 3
+
+    assert len(provider.requests) == 1
+    assert "\n1. " in response.json()["assistant_message"]["content"]
 
 
 def test_prohibited_provider_tool_is_rejected_before_any_adapter_call(
@@ -2700,10 +2692,11 @@ def test_unresolved_product_turn_returns_safe_answer_without_rag_or_guessing(
     assert "99" not in content
     assert response.json()["assistant_message"]["sources"] == []
     if status == "ambiguous":
-        assert "Which one do you mean?" in content
-        assert "PEPSI-330" in content and "PEPSI-1500" in content
+        assert "Which product do you mean?" in content
+        assert all(candidate.name in content for candidate in candidates)
+        assert "SKU:" not in content and "ID:" not in content
     else:
-        assert "couldn't find that product" in content
+        assert "No matching source record" in content
     assert source.calls == []
     assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
 
@@ -2862,7 +2855,7 @@ def test_unhealthy_source_keeps_safe_unavailable_bypass(
         )
 
 
-def test_response_only_synthesis_rejects_a_tool_request_without_replanning(
+def test_inventory_skips_synthesis_that_could_request_a_second_tool(
     api_client: TestClient, db_session: Session
 ) -> None:
     user, business = active_business(
@@ -2894,9 +2887,7 @@ def test_response_only_synthesis_rejects_a_tool_request_without_replanning(
     assert (
         "current inventory" in response.json()["assistant_message"]["content"].lower()
     )
-    assert len(provider.requests) == 2
-    assert provider.requests[1].mode == "operational_synthesis"
-    assert provider.requests[1].tools == ()
+    assert len(provider.requests) == 1
     assert source.calls == [CURRENT_INVENTORY_TOOL]
     audits = db_session.scalars(
         select(ToolCallLog).order_by(ToolCallLog.created_at, ToolCallLog.id)
@@ -2904,7 +2895,7 @@ def test_response_only_synthesis_rejects_a_tool_request_without_replanning(
     assert [audit.status for audit in audits] == [ToolCallStatus.SUCCESS]
 
 
-def test_tool_result_uses_response_only_synthesis_without_a_second_plan(
+def test_tool_result_uses_shared_factual_presentation_without_synthesis(
     api_client: TestClient, db_session: Session
 ) -> None:
     user, business = active_business(
@@ -2941,14 +2932,12 @@ def test_tool_result_uses_response_only_synthesis_without_a_second_plan(
     )
 
     assert response.status_code == 200, response.text
-    assert len(provider.requests) == 2
+    assert len(provider.requests) == 1
     assert source.calls == [CURRENT_INVENTORY_TOOL]
     assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
-    assert provider.requests[1].mode == "operational_synthesis"
-    assert provider.requests[1].tools == ()
-    assert [item.tool_name for item in provider.requests[1].tool_results] == [
-        CURRENT_INVENTORY_TOOL
-    ]
+
+    assert len(provider.requests) == 1
+    assert "\n1. " in response.json()["assistant_message"]["content"]
 
 
 def test_inventory_synthesis_cannot_label_positive_validated_stock_as_empty(
@@ -2985,15 +2974,16 @@ def test_inventory_synthesis_cannot_label_positive_validated_stock_as_empty(
     )
 
     assert response.status_code == 200, response.text
-    assert provider.requests[1].mode == "operational_synthesis"
-    assert provider.requests[1].validated_result_status == "data"
     assert (
         "current inventory" in response.json()["assistant_message"]["content"].lower()
     )
     assert source.calls == [CURRENT_INVENTORY_TOOL]
 
+    assert len(provider.requests) == 1
+    assert "\n1. " in response.json()["assistant_message"]["content"]
 
-def test_synthesis_failure_uses_safe_fallback_and_replay_does_no_work(
+
+def test_unused_synthesis_failure_cannot_affect_inventory_or_replay(
     api_client: TestClient, db_session: Session, migration_engine: Engine
 ) -> None:
     user, business = active_business(
@@ -3033,7 +3023,7 @@ def test_synthesis_failure_uses_safe_fallback_and_replay_does_no_work(
     assert "current inventory" in first.json()["assistant_message"]["content"].lower()
     assert replay.status_code == 200
     assert replay.json()["replayed"] is True
-    assert len(provider.requests) == 2
+    assert len(provider.requests) == 1
     assert source.calls == [CURRENT_INVENTORY_TOOL]
     assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
     with migration_engine.connect() as connection:
@@ -3045,7 +3035,8 @@ def test_synthesis_failure_uses_safe_fallback_and_replay_does_no_work(
         ).one()
     assert reservation.status == "completed"
     # The final hold is prior usage plus this timed-out synthesis call's ceiling.
-    assert reservation.total_tokens == reservation.reserved_tokens == 534
+    assert reservation.total_tokens == 12
+    assert reservation.reserved_tokens >= reservation.total_tokens
 
 
 def test_concurrent_idempotent_operational_submissions_execute_once(
@@ -3103,7 +3094,7 @@ def test_concurrent_idempotent_operational_submissions_execute_once(
         results = [first.result(timeout=10), second.result(timeout=10)]
 
     assert results[0].assistant_message.id == results[1].assistant_message.id
-    assert len(provider.requests) == 2
+    assert len(provider.requests) == 1
     assert source.calls == [CURRENT_INVENTORY_TOOL]
     assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
     with migration_engine.connect() as connection:

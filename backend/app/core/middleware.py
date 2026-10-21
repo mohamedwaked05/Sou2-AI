@@ -23,6 +23,9 @@ class RequestSecurityMiddleware:
         self.settings = settings
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "websocket" and self.settings.admission_mode != "open":
+            await send({"type": "websocket.close", "code": 1013})
+            return
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
@@ -44,6 +47,26 @@ class RequestSecurityMiddleware:
                 message="The Host header is not allowed.",
             )
             self._log(scope, 400, started, request_id, state["client_ip"])
+            request_id_context.reset(context_token)
+            return
+
+        if self.settings.admission_mode != "open" and not (
+            scope.get("method") == "GET"
+            and scope.get("path")
+            in {
+                "/",
+                f"{self.settings.api_v1_prefix}/health",
+                f"{self.settings.api_v1_prefix}/health/database",
+            }
+        ):
+            await self._send_error(
+                send,
+                request_id=request_id,
+                status_code=503,
+                error_code="admission_closed",
+                message="Service admission is closed.",
+            )
+            self._log(scope, 503, started, request_id, state["client_ip"])
             request_id_context.reset(context_token)
             return
 

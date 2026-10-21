@@ -10,7 +10,13 @@ from rq import Queue, Retry
 from rq.job import JobStatus
 from sqlalchemy import delete, select
 
+from app.core.admission import require_open_admission
 from app.core.config import Settings, get_settings
+from app.core.runtime import (
+    job_contract,
+    preserve_incompatible_failed_job,
+    validate_worker_job,
+)
 from app.core.security import utc_now
 from app.database.models import (
     Business,
@@ -60,6 +66,7 @@ def document_job_id(document_id: uuid.UUID) -> str:
 
 
 def enqueue_document(document_id: uuid.UUID, settings: Settings) -> None:
+    require_open_admission(settings)
     queue = Queue(
         settings.knowledge_queue_name, connection=Redis.from_url(settings.redis_url)
     )
@@ -74,6 +81,7 @@ def enqueue_document(document_id: uuid.UUID, settings: Settings) -> None:
     if existing is not None:
         if existing.get_status(refresh=True) in active_statuses:
             return
+        preserve_incompatible_failed_job(existing, settings, "knowledge")
         existing.delete()
     queue.enqueue(
         process_document,
@@ -81,11 +89,13 @@ def enqueue_document(document_id: uuid.UUID, settings: Settings) -> None:
         job_id=job_id,
         job_timeout=settings.knowledge_worker_timeout_seconds,
         retry=Retry(max=2, interval=[2, 8]),
+        meta={"runtime_contract": job_contract(settings, "knowledge")},
     )
 
 
 def process_document(document_id: str) -> None:
     settings = get_settings()
+    validate_worker_job(settings, "knowledge")
     identifier = uuid.UUID(document_id)
     with get_session_factory()() as session:
         document = session.scalar(

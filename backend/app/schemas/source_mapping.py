@@ -7,6 +7,8 @@ from typing import Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
+from app.schemas.owner_chat_state import ConversationContextKind, ProductPresentation
+
 
 class MappingContract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -39,10 +41,18 @@ class DiscoveredObject(MappingContract):
 
 
 class DiscoveredRelationship(MappingContract):
-    source_object_id: str
-    source_columns: tuple[str, ...]
-    target_object_id: str
-    target_columns: tuple[str, ...]
+    source_object_id: str = Field(pattern=r"^o[0-9]{1,3}$")
+    source_columns: tuple[str, ...] = Field(min_length=1, max_length=64)
+    target_object_id: str = Field(pattern=r"^o[0-9]{1,3}$")
+    target_columns: tuple[str, ...] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def complete_pairs(self):
+        if len(self.source_columns) != len(self.target_columns) or len(
+            set(self.target_columns)
+        ) != len(self.target_columns):
+            raise ValueError("Relationship components must be complete, ordered pairs.")
+        return self
 
 
 class SchemaDiscovery(MappingContract):
@@ -56,6 +66,14 @@ class SchemaDiscovery(MappingContract):
     def bounded_metadata(self) -> SchemaDiscovery:
         if len({item.object_id for item in self.objects}) != len(self.objects):
             raise ValueError("Duplicate catalogue objects.")
+        objects = {o.object_id: {c.name for c in o.columns} for o in self.objects}
+        for relation in self.relationships:
+            if not set(relation.source_columns) <= objects.get(
+                relation.source_object_id, set()
+            ) or not set(relation.target_columns) <= objects.get(
+                relation.target_object_id, set()
+            ):
+                raise ValueError("Relationship columns are outside approved metadata.")
         if sum(len(item.columns) for item in self.objects) > 128:
             raise ValueError("Catalogue metadata exceeds the column bound.")
         if len(self.model_dump_json().encode("utf-8")) > 24_000:
@@ -88,9 +106,15 @@ class IdentifierMapping(MappingContract):
     kind: Literal["barcode", "alternate_id"]
 
 
+class ProductRowScope(MappingContract):
+    column: str = Field(min_length=1, max_length=128)
+    value: str | int
+
+
 class ProductMapping(MappingContract):
     contract_version: Literal[1] = 1
     capability: Literal["products"]
+    row_scopes: tuple[ProductRowScope, ...] = Field(default=(), max_length=4)
     object_id: str = Field(pattern=r"^o[0-9]{1,3}$")
     key_columns: tuple[str, ...] = Field(min_length=1, max_length=4)
     name_columns: tuple[str, ...] = Field(min_length=1, max_length=3)
@@ -137,6 +161,9 @@ class MappingReview(MappingContract):
 
 
 class CatalogueRequest(MappingContract):
+    browse: Literal[True] | None = None
+    category: str | None = Field(default=None, min_length=1, max_length=255)
+    continuation: str | None = Field(default=None, min_length=1, max_length=4096)
     query: str | None = Field(default=None, min_length=1, max_length=128)
     external_product_id: str | None = Field(default=None, min_length=1, max_length=4096)
     mapping_version: int | None = Field(default=None, ge=1)
@@ -144,8 +171,21 @@ class CatalogueRequest(MappingContract):
 
     @model_validator(mode="after")
     def one_selector(self) -> CatalogueRequest:
-        if (self.query is None) == (self.external_product_id is None):
-            raise ValueError("Specify a search or an explicit product identifier.")
+        if (
+            sum(
+                (
+                    self.query is not None,
+                    self.external_product_id is not None,
+                    bool(self.browse),
+                )
+            )
+            != 1
+        ):
+            raise ValueError("Specify a search, browse, or an explicit identifier.")
+        if self.external_product_id is not None and (
+            self.continuation or self.category
+        ):
+            raise ValueError("Exact selection cannot include discovery filters.")
         if self.external_product_id is not None and self.mapping_version is None:
             raise ValueError("Explicit selection requires the offered mapping version.")
         return self
@@ -160,7 +200,26 @@ class CatalogueProduct(MappingContract):
     stock: None = None
 
 
+class CatalogueCoverage(MappingContract):
+    approval_type: Literal["full", "partial"] = "full"
+    approval_id: uuid.UUID | None = None
+    approval_version: int | None = None
+    excluded_records: int = 0
+    total_records: int | None = None
+    valid_records: int | None = None
+    expires_at: AwareDatetime | None = None
+    disclosure: str | None = None
+
+
 class CatalogueResult(MappingContract):
+    matched_records: int | None = Field(default=None, ge=0)
+    coverage: CatalogueCoverage | None = None
+    deferred_operation: dict[str, object] | None = None
+    pagination_scope: str | None = None
+    key_size: int = Field(default=1, ge=1, le=4)
+    discovery_request: CatalogueRequest | None = None
+    continuation: str | None = None
+    search_semantics: str = "literal"
     mapping_version: int = Field(ge=1)
     status: Literal["resolved", "ambiguous", "not_found"]
     items: tuple[CatalogueProduct, ...] = Field(max_length=50)
@@ -171,7 +230,13 @@ class CatalogueResult(MappingContract):
 class PendingCatalogueClarification(MappingContract):
     """Scoped source choices; the planner cannot create selection identifiers."""
 
+    deferred_operation: dict[str, object] | None = None
+    coverage: CatalogueCoverage | None = None
+    continuation: str | None = None
+    discovery_request: CatalogueRequest | None = None
     operation: Literal["product_search"] = "product_search"
+    state_kind: ConversationContextKind = "clarification"
+    presentation: ProductPresentation | None = None
     business_id: uuid.UUID
     user_id: uuid.UUID
     conversation_id: uuid.UUID
@@ -189,7 +254,9 @@ class PendingCatalogueClarification(MappingContract):
     def validate_choices(self) -> PendingCatalogueClarification:
         identifiers = [item.external_product_id for item in self.candidates]
         if len(set(identifiers)) != len(identifiers) or (
-            len(identifiers) < 2 and not self.truncated
+            len(identifiers) < 2
+            and not self.truncated
+            and self.state_kind == "clarification"
         ):
             raise ValueError("A catalogue clarification requires ambiguous choices.")
         return self

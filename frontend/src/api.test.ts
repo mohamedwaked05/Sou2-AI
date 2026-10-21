@@ -160,3 +160,64 @@ describe("owner-chat error messages", () => {
     ).toBe("Try later.");
   });
 });
+
+describe("chat deadlines and replay identities", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    resetApiSessionForTests();
+  });
+
+  it("preserves business, conversation, content and turn key through one auth retry", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(response({ error: { code: "not_authenticated" } }, 401))
+      .mockResolvedValueOnce(response({ access_token: "refreshed" }))
+      .mockResolvedValueOnce(response({ replayed: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    await api.sendConversationMessage(
+      "business-A",
+      "conversation-A",
+      "Draft",
+      "stable-key",
+    );
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/v1/businesses/business-A/conversations/conversation-A/messages",
+    );
+    expect(fetchMock.mock.calls[2][0]).toBe(fetchMock.mock.calls[0][0]);
+    expect(fetchMock.mock.calls[2][1].body).toBe(fetchMock.mock.calls[0][1].body);
+    expect(JSON.parse(fetchMock.mock.calls[2][1].body)).toEqual({
+      content: "Draft",
+      idempotency_key: "stable-key",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("bounds a lost response, aborts the connection and makes no automatic turn retry", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn<typeof fetch>(() => new Promise<Response>(() => {}));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = api.send("A", "Draft", "same-key");
+    const rejected = expect(result).rejects.toMatchObject({ code: "request_timeout" });
+    await vi.advanceTimersByTimeAsync(360_000);
+    await rejected;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);
+  });
+
+  it("includes stalled response body parsing within the request deadline", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => new Promise(() => {}),
+      }),
+    );
+    const result = api.conversationMessages("A", "first");
+    const rejected = expect(result).rejects.toMatchObject({ code: "request_timeout" });
+    await vi.advanceTimersByTimeAsync(30_000);
+    await rejected;
+  });
+});

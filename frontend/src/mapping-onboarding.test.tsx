@@ -66,6 +66,30 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+it("keeps independent capability review available without inheriting catalogue approval", async () => {
+  const workspace = vi.spyOn(api, "operationalWorkspace");
+  render(
+    <MappingOnboarding
+      businessId="business-1"
+      source={{
+        ...source,
+        catalogue_coverage: {
+          approval_type: "partial",
+          excluded_records: 10,
+          total_records: 9353,
+          valid_records: 9343,
+        },
+      }}
+      onRefresh={vi.fn()}
+    />,
+  );
+  expect(await screen.findByText(/Catalogue exclusions do not/))
+    .toBeVisible();
+  expect(screen.queryByRole("region", { name: "Operational mapping review" }))
+    .toBeNull();
+  expect(workspace).not.toHaveBeenCalled();
+});
+
 it("requires explicit semantic review and renders untrusted metadata as text", async () => {
   vi.mocked(api.mappingReviews).mockResolvedValue([review]);
   const approve = vi
@@ -79,7 +103,7 @@ it("requires explicit semantic review and renders untrusted metadata as text", a
     name: "Validate and approve mapping",
   });
   expect(button).toBeDisabled();
-  expect(await screen.findByText(/<img src=x/)).toBeInTheDocument();
+  expect((await screen.findAllByText(/<img src=x/)).length).toBeGreaterThan(0);
   expect(container.querySelector("img")).toBeNull();
   expect(screen.getByText(/Stock is unknown/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole("checkbox"));
@@ -93,6 +117,59 @@ it("requires explicit semantic review and renders untrusted metadata as text", a
     ),
   );
   expect(refresh).toHaveBeenCalledOnce();
+});
+
+it("explains incomplete category keys and preserves approved history for review", async () => {
+  const failed: MappingReview = {
+    ...review,
+    id: "revision-2",
+    version: 2,
+    status: "failed",
+    proposal: null,
+    failure_code: "mapping_category_join_not_unique",
+  };
+  const approved: MappingReview = {
+    ...review,
+    status: "approved",
+    approved_mapping: mapping,
+  };
+  vi.mocked(api.mappingReviews).mockResolvedValue([failed, approved]);
+  render(
+    <MappingOnboarding businessId="business-1" source={source} onRefresh={vi.fn()} />,
+  );
+  expect(await screen.findByText(/does not cover a complete unique key/)).toBeVisible();
+  expect(
+    screen.queryByRole("button", { name: "Validate and approve mapping" }),
+  ).toBeNull();
+  fireEvent.change(screen.getByLabelText("Mapping history"), {
+    target: { value: "revision-1" },
+  });
+  expect(screen.getByText(/Owner-approved version/)).toBeVisible();
+  expect(screen.getByText(/Identity: ref/)).toBeVisible();
+});
+
+it("edits display fields without JSON and requires renewed semantic confirmation", async () => {
+  vi.mocked(api.mappingReviews).mockResolvedValue([review]);
+  const approve = vi
+    .spyOn(api, "approveMapping")
+    .mockResolvedValue({ ...review, status: "approved", approved_mapping: mapping });
+  render(
+    <MappingOnboarding businessId="business-1" source={source} onRefresh={vi.fn()} />,
+  );
+  const sku = await screen.findByLabelText("SKU column (optional)");
+  fireEvent.click(screen.getByRole("checkbox"));
+  const button = screen.getByRole("button", { name: "Validate and approve mapping" });
+  expect(button).toBeEnabled();
+  fireEvent.change(sku, { target: { value: "ref" } });
+  expect(button).toBeDisabled();
+  fireEvent.click(screen.getByRole("checkbox"));
+  fireEvent.click(button);
+  await waitFor(() =>
+    expect(approve).toHaveBeenCalledWith("business-1", "source-1", "revision-1", {
+      ...mapping,
+      sku_column: "ref",
+    }),
+  );
 });
 
 it("reuses the proposal key after a lost response", async () => {

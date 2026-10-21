@@ -14,16 +14,23 @@ services:
   worker:
     build:
       context: ./backend
-    command: rq worker --with-scheduler --url ${REDIS_URL:-redis://redis:6379/0} ${KNOWLEDGE_QUEUE_NAME:-knowledge} ${CUSTOMER_MESSAGE_QUEUE_NAME:-customer-messages}
+    command: rq worker --with-scheduler --url redis://redis:6379/0 --worker-class app.worker.runtime.PrivacySafeWorker ${KNOWLEDGE_QUEUE_NAME:-knowledge} ${CUSTOMER_MESSAGE_QUEUE_NAME:-customer-messages}
     environment:
       REDIS_URL: redis://redis:6379/0
       KNOWLEDGE_STORAGE_ROOT: /app/data/knowledge
       CUSTOMER_MESSAGE_QUEUE_NAME: ${CUSTOMER_MESSAGE_QUEUE_NAME:-customer-messages}
-      OWNER_CHAT_PROVIDER: ${OWNER_CHAT_PROVIDER:-mock}
+      ENVIRONMENT: ${ENVIRONMENT:?Set ENVIRONMENT explicitly for worker release}
+      KNOWLEDGE_QUEUE_NAME: ${KNOWLEDGE_QUEUE_NAME:-knowledge}
+      OWNER_CHAT_PROVIDER: ${OWNER_CHAT_PROVIDER:?Set OWNER_CHAT_PROVIDER explicitly}
+      CONVERSATION_SUMMARY_PROVIDER: ${CONVERSATION_SUMMARY_PROVIDER:?Set CONVERSATION_SUMMARY_PROVIDER explicitly}
+      CUSTOMER_CHAT_PROVIDER: ${CUSTOMER_CHAT_PROVIDER:?Set CUSTOMER_CHAT_PROVIDER explicitly}
+      SOURCE_MAPPING_PROVIDER: ${SOURCE_MAPPING_PROVIDER:?Set SOURCE_MAPPING_PROVIDER explicitly}
+      WORKER_EXPECTED_SOURCE_VERSION: ${WORKER_EXPECTED_SOURCE_VERSION:?Set the verified API application source fingerprint}
+      OWNER_CHAT_GENERATION_LEASE_SECONDS: ${OWNER_CHAT_GENERATION_LEASE_SECONDS:-150}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GEMINI_CHAT_MODEL: ${GEMINI_CHAT_MODEL:-gemini-3-flash-preview}
+      GEMINI_CHAT_MODEL: ${GEMINI_CHAT_MODEL:?Set the approved Gemini model explicitly}
       GEMINI_REQUEST_TIMEOUT_SECONDS: ${GEMINI_REQUEST_TIMEOUT_SECONDS:-120}
-      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-qwen2.5:7b}
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-}
       OLLAMA_REQUEST_TIMEOUT_SECONDS: ${OLLAMA_REQUEST_TIMEOUT_SECONDS:-120}
       WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN:-}
       META_APP_SECRET: ${META_APP_SECRET:-}

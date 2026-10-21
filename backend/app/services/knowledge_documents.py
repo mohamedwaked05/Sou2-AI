@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.admission import require_open_admission
 from app.core.config import Settings
 from app.core.exceptions import ApplicationError
 from app.core.security import utc_now
@@ -101,6 +102,7 @@ def upload(
     settings: Settings,
     replaces: uuid.UUID | None = None,
 ) -> KnowledgeDocument:
+    require_open_admission(settings)
     _active(session, user, business_id)
     filename = _filename(file.filename)
     temporary, size, digest = _read_upload(file, settings)
@@ -250,6 +252,7 @@ def retry(
     document_id: uuid.UUID,
     settings: Settings,
 ) -> KnowledgeDocument:
+    require_open_admission(settings)
     _active(session, user, business_id)
     document = _document(session, business_id, document_id, True)
     if (

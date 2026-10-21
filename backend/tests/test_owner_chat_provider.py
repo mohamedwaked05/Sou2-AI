@@ -1007,7 +1007,7 @@ def test_gemini_provider_selection_requires_key_only_when_selected() -> None:
     )
 
     assert isinstance(provider, GeminiOwnerChatProvider)
-    assert provider.model == "gemini-3-flash-preview"
+    assert provider.model == "gemini-3.1-flash-lite"
 
 
 @pytest.fixture(params=["mock", "ollama", "gemini"])
@@ -2050,10 +2050,16 @@ def test_gemini_invalid_json_or_schema_is_safe(
     assert raised.value.reason == reason
     assert "test-key-not-production" not in repr(raised.value)
     assert "private provider body" not in repr(raised.value)
+    assert raised.value.upstream_http_status == 200
+    failure_diagnostic = logged[-1]
+    assert str(failure_diagnostic[0]).startswith("gemini_failure mode=%s reason=%s")
+    assert failure_diagnostic[1:3] == ("grounded", reason)
+    assert "test-key-not-production" not in repr(logged)
+    assert "private provider body" not in repr(logged)
     if reason == "invalid_json":
-        assert logged == []
-    else:
         assert len(logged) == 1
+    else:
+        assert len(logged) == 2
         diagnostic = logged[0]
         assert diagnostic[0] == (
             "owner_chat_provider schema_validation_failed reason=%s fingerprint=%s"
@@ -2373,7 +2379,7 @@ def test_gemini_planner_branches_require_only_relevant_fields():
     [
         ("gemini-3.1-flash-lite", "operational", "MINIMAL"),
         ("gemini-3.1-flash-lite", "operational_synthesis", "LOW"),
-        ("gemini-3.1-flash-lite", "conversation", "LOW"),
+        ("gemini-3.1-flash-lite", "conversation", "MINIMAL"),
         ("gemini-3.1-flash-lite", "category_resolution", "MINIMAL"),
         ("gemini-3.1-flash-lite", "preference_resolution", "LOW"),
         ("gemini-3-flash-preview", "category_resolution", "LOW"),
@@ -2438,12 +2444,18 @@ def test_pending_preference_transition_contract_is_scoped_to_preference(operatio
     )
     for branch in branches:
         properties = branch["properties"]
-        assert ("pending_request" in properties) == (operation == "preference")
         if operation:
             assert "pending_reply" in branch["required"]
-            assert ("cancel" in properties["pending_reply"]["enum"]) == (
-                operation == "preference"
-            )
+            transitions = set(properties["pending_reply"]["enum"])
+            evidenced = bool(transitions & {"cancel", "replace", "unrelated"})
+            assert ("pending_request" in properties) == evidenced
+            assert ("pending_request" in branch["required"]) == evidenced
+            if "cancel" in transitions:
+                assert operation == "preference"
+                assert properties["decision"]["enum"] == ["final"]
+                assert properties["semantic_operation"]["enum"] == ["conversation"]
+        else:
+            assert "pending_request" not in properties
     if operation == "preference":
         result = provider.generate(request)
         assert result.pending_reply == "cancel"

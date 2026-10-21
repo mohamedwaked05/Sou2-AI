@@ -299,10 +299,12 @@ def test_summary_advances_complete_turns_once_and_preserves_originals(
     )
     assert summary.summarized_through_sequence_number == 4
     assert summary.summary_version == 1
-    assert summary.content == (
-        "owner: owner fact 1 | assistant: assistant claim 1 | "
-        "owner: owner fact 2 | assistant: assistant claim 2"
-    )
+    assert json.loads(summary.content)["entries"] == [
+        "owner: owner fact 1",
+        "assistant: assistant claim 1",
+        "owner: owner fact 2",
+        "assistant: assistant claim 2",
+    ]
     assert (
         set(
             db_session.scalars(
@@ -407,7 +409,15 @@ def test_summary_failure_preserves_valid_checkpoint(
     summary = OwnerConversationSummary(
         business_id=business_id,
         conversation_id=conversation.id,
-        content="Previously valid memory.",
+        content=json.dumps(
+            {
+                "format": "recent_entries_v2",
+                "older_entries_omitted": False,
+                "entries": ["owner: Previously valid memory."],
+            }
+        ),
+        provider_identifier="mock",
+        model_identifier="deterministic-v2",
         summarized_through_sequence_number=4,
         summary_version=1,
         last_charged_through_sequence_number=4,
@@ -419,7 +429,9 @@ def test_summary_failure_preserves_valid_checkpoint(
     db_session.expire_all()
     persisted = db_session.get(OwnerConversationSummary, summary.id)
     assert persisted is not None
-    assert persisted.content == "Previously valid memory."
+    assert json.loads(persisted.content)["entries"] == [
+        "owner: Previously valid memory."
+    ]
     assert persisted.summarized_through_sequence_number == 4
     assert persisted.summary_version == 1
     assert persisted.generation_state == ConversationSummaryState.FAILED
@@ -572,7 +584,12 @@ def test_summary_provider_adapters_use_bounded_structured_offline_requests(
                 json={
                     "message": {
                         "role": "assistant",
-                        "content": '{"summary":"Owner requests weekly plans."}',
+                        "content": json.dumps(
+                            {
+                                "summary": "Owner requests weekly plans.",
+                                "retained_message_count": 2,
+                            }
+                        ),
                     },
                     "prompt_eval_count": 12,
                     "eval_count": 5,
@@ -587,7 +604,14 @@ def test_summary_provider_adapters_use_bounded_structured_offline_requests(
                         "finishReason": "STOP",
                         "content": {
                             "parts": [
-                                {"text": '{"summary":"Owner requests weekly plans."}'}
+                                {
+                                    "text": json.dumps(
+                                        {
+                                            "summary": "Owner requests weekly plans.",
+                                            "retained_message_count": 2,
+                                        }
+                                    )
+                                }
                             ]
                         },
                     }

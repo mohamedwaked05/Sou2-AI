@@ -94,8 +94,20 @@ class OperationalMappingProfile:
             raise MappingProfileError("Gross profit requires revenue support.")
         if "net_profit" in supported and "gross_profit" not in supported:
             raise MappingProfileError("Net profit requires gross profit support.")
-        if set(self.required_capabilities) != set(OPERATIONAL_CAPABILITIES):
+        capabilities = set(self.required_capabilities)
+        if (
+            not capabilities
+            or len(capabilities) != len(self.required_capabilities)
+            or not capabilities <= set(OPERATIONAL_CAPABILITIES)
+        ):
             raise MappingProfileError("Operational capability mapping is incomplete.")
+        if (
+            "restocking_recommendations" in capabilities
+            and "inventory" not in capabilities
+        ) or ("best_sellers" in capabilities and "sales_summaries" not in capabilities):
+            raise MappingProfileError(
+                "Operational capability dependencies are incomplete."
+            )
         if set(self.source_location_types) != {"branch", "warehouse"} or any(
             not values or any(not value.strip() for value in values)
             for values in self.source_location_types.values()

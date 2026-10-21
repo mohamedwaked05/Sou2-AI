@@ -4,6 +4,8 @@ import os
 from collections.abc import Generator
 
 os.environ.setdefault("ENVIRONMENT", "testing")
+os.environ.setdefault("CONVERSATION_SUMMARY_PROVIDER", "mock")
+os.environ.setdefault("CUSTOMER_CHAT_PROVIDER", "mock")
 os.environ.setdefault("TRUSTED_HOSTS", "localhost,127.0.0.1,testserver")
 
 import pytest

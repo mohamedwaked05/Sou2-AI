@@ -51,8 +51,11 @@ async def application_error_handler(
 
 async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """Log unexpected failures and avoid leaking details outside development."""
-    logger.exception(
-        "Unhandled request exception request_id=%s", request.state.request_id
+    logger.error(
+        "Unhandled request exception request_id=%s exception_type=%s",
+        request.state.request_id,
+        type(exc).__name__,
+        extra={"event": "request_failed", "exception_type": type(exc).__name__},
     )
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

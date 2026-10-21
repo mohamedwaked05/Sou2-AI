@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from datetime import date, datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime
 from types import MappingProxyType
 from typing import Any, Literal
 
@@ -27,7 +28,8 @@ from app.database.models import (
     ToolCallStatus,
     User,
 )
-from app.integrations.discovery import SourceMappingError
+from app.integrations.discovery import SourceConnection, SourceMappingError
+from app.integrations.mapped_operational import MappedOperationalSource
 from app.integrations.mapped_products import MappedProductSource
 from app.integrations.operational import (
     OperationalDataInvalid,
@@ -49,6 +51,7 @@ from app.schemas.operational import (
     LocationResolutionQuery,
     MetricCapabilityResult,
     OperationalMetric,
+    ProductDiscoveryResult,
     ProductResolution,
     ProductResolutionQuery,
     RestockingQuery,
@@ -57,7 +60,17 @@ from app.schemas.operational import (
     SalesQuery,
     SalesSummary,
 )
-from app.schemas.source_mapping import CatalogueRequest, CatalogueResult
+from app.schemas.operational_mapping import (
+    OperationalPlannerRead,
+    OperationalRead,
+    OperationalReport,
+    OperationalToolRead,
+)
+from app.schemas.source_mapping import (
+    CatalogueProduct,
+    CatalogueRequest,
+    CatalogueResult,
+)
 from app.services.businesses import load_full_access_business
 from app.tools.catalogue import execute_product_search
 from app.utils.argument_hashing import hash_tool_arguments
@@ -125,20 +138,15 @@ class CurrentInventoryPlannerInput(BaseModel):
         return normalized
 
 
-class ProductSearchPlannerInput(BaseModel):
-    """Search phrases only; approved selection scope is supplied by the backend."""
+class ProductSearchPlannerInput(CatalogueRequest):
+    """Planner discovery selectors; source IDs/cursors are backend-only."""
 
-    model_config = ConfigDict(extra="forbid")
-    query: str = Field(min_length=1, max_length=128)
-    limit: int = Field(default=20, ge=1, le=MAX_TOOL_RESULT_ROWS)
+    external_product_id: None = None
+    mapping_version: None = None
+    continuation: None = None
 
-    @field_validator("query")
-    @classmethod
-    def strip_query(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("Product searches cannot be blank.")
-        return value
+    semantic_query: str | None = Field(default=None, min_length=1, max_length=255)
+    search_queries: tuple[str, ...] = Field(default=(), max_length=6)
 
 
 class BestSellingProductsToolInput(BestSellersQuery):
@@ -164,10 +172,11 @@ class RestockingRecommendationsToolInput(RestockingQuery):
 class ToolExecutionError(Exception):
     """Safe, normalized failure from the centralized executor."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, reason: str | None = None) -> None:
         if code not in SAFE_TOOL_ERROR_CODES:
             code = "adapter_failure"
         self.code = code
+        self.reason = reason
         super().__init__(code)
 
 
@@ -189,14 +198,16 @@ class OperationalToolDefinition:
     timeout_seconds: int
     executor: ToolExecutor
     provider_input_schema: type[BaseModel] | None = None
+    approved_operations: tuple[str, ...] | None = None
 
     def provider_schema(self) -> dict[str, Any]:
+        schema = (self.provider_input_schema or self.input_schema).model_json_schema()
+        if self.approved_operations is not None:
+            schema["properties"]["capability"]["enum"] = list(self.approved_operations)
         return {
             "name": self.name,
             "description": self.description,
-            "input_schema": (
-                self.provider_input_schema or self.input_schema
-            ).model_json_schema(),
+            "input_schema": schema,
         }
 
 
@@ -209,12 +220,78 @@ class OperationalToolResult:
     source_updated_at: datetime | None = None
     schema_fingerprint: str | None = None
     source_fingerprint: str | None = None
+    source_result: BaseModel | None = None
+    mapping_version: int | None = None
 
 
-def _product_search(source: MappedProductSource, query: BaseModel) -> BaseModel:
-    assert isinstance(source, MappedProductSource)
+@dataclass(frozen=True)
+class CatalogueSourceScope:
+    mapping_version: int
+    schema_fingerprint: str
+    source_fingerprint: str
+
+
+def _mapped_operational_report(source, query):
+    assert isinstance(source, MappedOperationalSource)
+    assert isinstance(query, OperationalToolRead)
+    product_id = query.product_id
+    if product_id is not None and (
+        query.reference != "selected"
+        or query.catalogue_revision != source.mapping.catalogue_revision
+    ):
+        raise SourceMappingError("mapping_selection_stale")
+    if query.reference == "selected" and product_id is None:
+        raise SourceMappingError("product_selection_required")
+    if query.product_identity is not None:
+        from app.integrations.mapped_products import encode_product_key
+
+        if product_id is not None or query.product_query is not None:
+            raise SourceMappingError("invalid_product_identifier")
+        product_id = encode_product_key(query.product_identity)
+    if query.product_query is not None:
+        catalogue = (
+            source.resolution_catalogue
+            if getattr(source, "independent", False)
+            else source.catalogue
+        )
+        if catalogue is None:
+            raise SourceMappingError("catalogue_resolution_unapproved")
+        found = catalogue.search(CatalogueRequest(query=query.product_query))
+        if found.status != "resolved":
+            deferred = OperationalPlannerRead.model_validate(
+                query.model_dump(exclude={"product_id", "catalogue_revision"})
+            ).model_dump(mode="json", exclude_none=True)
+            return found.model_copy(update={"deferred_operation": deferred})
+        product_id = found.items[0].external_product_id
+    if query.capability == "prices" and product_id is None:
+        raise SourceMappingError("product_selection_required")
+    fields = query.model_dump(
+        exclude={
+            "product_query",
+            "product_identity",
+            "reference",
+            "product_id",
+            "catalogue_revision",
+        }
+    )
+    return source.read(
+        OperationalRead(
+            **fields,
+            product_id=product_id,
+            catalogue_revision=source.mapping.catalogue_revision,
+            mapping_revision=source.revision,
+            as_of=datetime.now(UTC) if query.capability == "prices" else None,
+        )
+    )
+
+
+def _product_search(
+    source: MappedProductSource | OperationalDataSource, query: BaseModel
+) -> BaseModel:
     assert isinstance(query, CatalogueRequest)
-    return execute_product_search(source, query)
+    if isinstance(source, MappedProductSource):
+        return execute_product_search(source, query)
+    return source.search_products(query)
 
 
 def _inventory(source: OperationalDataSource, query: BaseModel) -> BaseModel:
@@ -360,6 +437,23 @@ def build_operational_tool_registry(
 
     definitions = (
         OperationalToolDefinition(
+            name="operational_report",
+            description=(
+                "Read approved mapped stock, availability, current prices, sales, "
+                "revenue, refunds, best sellers or restocking. Use explicit aware "
+                "start/end instants for reports. Product names go in product_query, "
+                "never an invented identifier. Missing semantics are unsupported. "
+                "No profit or cash-flow inference."
+            ),
+            input_schema=OperationalToolRead,
+            provider_input_schema=OperationalPlannerRead,
+            output_schema=(OperationalReport, CatalogueResult),
+            capability="mapped_operations",
+            result_limit=MAX_TOOL_RESULT_ROWS,
+            timeout_seconds=timeout_seconds,
+            executor=_mapped_operational_report,
+        ),
+        OperationalToolDefinition(
             name=PRODUCT_SEARCH_TOOL,
             description=(
                 "Search the approved product catalogue by name, key, SKU or alternate "
@@ -481,6 +575,69 @@ class OperationalToolExecutor:
     def available_definitions(
         self, user: User, business_id: uuid.UUID
     ) -> tuple[OperationalToolDefinition, ...]:
+        definitions = list(self._primary_definitions(user, business_id))
+        secret = self._settings.tool_call_audit_hmac_secret
+        if secret is None or not secret.get_secret_value().strip():
+            return ()
+        from app.integrations.operational_quality import (
+            FAMILY_TOOLS,
+            evaluate_operational,
+        )
+        from app.services.capabilities import approved_adapter
+
+        try:
+            business = load_full_access_business(self._session, user, business_id)
+            if business.status is not BusinessStatus.ACTIVE:
+                return ()
+        except ApplicationError:
+            return ()
+        operations = set()
+        mapped_deadline = self._settings.operational_query_timeout_seconds
+        for family, names in FAMILY_TOOLS.items():
+            try:
+                source = self._capability_source(business_id, family)
+                if source is None:
+                    continue
+                adapter = approved_adapter(
+                    self._session, self._profiles, source, names[0]
+                )
+                if not self._adapter_timeout_is_acceptable(adapter):
+                    continue
+                with adapter.catalogue.connector.connection(
+                    consistent=True
+                ) as connection:
+                    quality = evaluate_operational(
+                        adapter, connection, diagnostics=False, fingerprint=False
+                    )
+                if not quality.invalid:
+                    mapped_deadline = max(
+                        mapped_deadline, self._adapter_timeout_limit(adapter)
+                    )
+                    operations.update(
+                        n for n in names if n in adapter.mapping.capabilities
+                    )
+            except SourceMappingError, ToolExecutionError:
+                continue
+        if operations:
+            existing = next(
+                (d for d in definitions if d.name == "operational_report"), None
+            )
+            if existing and existing.approved_operations is not None:
+                operations.update(existing.approved_operations)
+            if existing is None or existing.approved_operations is not None:
+                definitions = [d for d in definitions if d.name != "operational_report"]
+                definitions.append(
+                    replace(
+                        self.registry["operational_report"],
+                        approved_operations=tuple(sorted(operations)),
+                        timeout_seconds=mapped_deadline,
+                    )
+                )
+        return tuple(definitions)
+
+    def _primary_definitions(
+        self, user: User, business_id: uuid.UUID
+    ) -> tuple[OperationalToolDefinition, ...]:
         """Return tools only after a safe live source health preflight."""
 
         secret = self._settings.tool_call_audit_hmac_secret
@@ -498,23 +655,42 @@ class OperationalToolExecutor:
                 return ()
             capabilities = self._source_capabilities(source)
             if source.mapping_profile_key == "discovered_products":
+                from app.services.operational_mapping import (
+                    latest_operational_approval,
+                    operational_source,
+                )
                 from app.services.source_mapping import mapped_source
 
-                adapter = mapped_source(self._session, self._profiles, source)
-                if not self._adapter_timeout_is_acceptable(adapter):
-                    self._session.rollback()
+                if source.status is not OperationalDataSourceStatus.ACTIVE:
                     return ()
-                expected_updated = source.updated_at
-                self._session.commit()
-                with adapter.connector.connection() as connection:
-                    adapter.connector.assert_schema(adapter.discovery, connection)
-                self._session.refresh(source)
-                if (
-                    source.status is not OperationalDataSourceStatus.ACTIVE
-                    or source.updated_at != expected_updated
-                ):
-                    return ()
-                return (self.registry[PRODUCT_SEARCH_TOOL],)
+                definitions = []
+                try:
+                    adapter = mapped_source(self._session, self._profiles, source)
+                    if not self._adapter_timeout_is_acceptable(adapter):
+                        return ()
+                    adapter.validate_results()
+                    definitions.append(
+                        replace(
+                            self.registry[PRODUCT_SEARCH_TOOL],
+                            timeout_seconds=self._adapter_timeout_limit(adapter),
+                        )
+                    )
+                except SourceMappingError:
+                    pass
+                if latest_operational_approval(self._session, source):
+                    try:
+                        operational = operational_source(
+                            self._session, self._profiles, source
+                        )
+                        definitions.append(
+                            replace(
+                                self.registry["operational_report"],
+                                approved_operations=operational.mapping.capabilities,
+                            )
+                        )
+                    except SourceMappingError:
+                        pass
+                return tuple(definitions)
             adapter = self._profiles.resolve(source.connection_profile_key)
             if not self._adapter_timeout_is_acceptable(adapter):
                 self._session.rollback()
@@ -531,7 +707,6 @@ class OperationalToolExecutor:
                 definition
                 for definition in self.registry.values()
                 if definition.capability in capabilities
-                and definition.name != PRODUCT_SEARCH_TOOL
             )
         except Exception as exc:
             _logger.warning(
@@ -738,6 +913,7 @@ class OperationalToolExecutor:
         source_id = None
         source_updated_at = None
         error_code: str | None = None
+        failure_reason: str | None = None
         audit_status = ToolCallStatus.ERROR
         try:
             business = load_full_access_business(self._session, user, business_id)
@@ -773,15 +949,38 @@ class OperationalToolExecutor:
             source = self._active_source(business_id)
             if source is None:
                 raise ToolExecutionError("integration_unavailable")
+            if definition.name == "operational_report":
+                from app.services.capabilities import capability_family
+
+                independent_source = self._capability_source(
+                    business_id, capability_family(query.capability, query.rank_by)
+                )
+                if independent_source is not None:
+                    source = independent_source
             capabilities = self._source_capabilities(source)
             if definition.capability not in capabilities:
+                raise ToolExecutionError("capability_unavailable")
+            if (
+                definition.name == PRODUCT_SEARCH_TOOL
+                and source.status is not OperationalDataSourceStatus.ACTIVE
+            ):
                 raise ToolExecutionError("capability_unavailable")
             source_id = source.id
             source_updated_at = source.updated_at
             is_catalogue = source.mapping_profile_key == "discovered_products"
-            if definition.name == PRODUCT_SEARCH_TOOL:
-                if not is_catalogue:
-                    raise ToolExecutionError("capability_unavailable")
+            if is_catalogue and definition.name == "operational_report":
+                from app.services.operational_mapping import operational_source
+
+                adapter = operational_source(
+                    self._session,
+                    self._profiles,
+                    source,
+                    query.capability,
+                    query.rank_by,
+                )
+                schema_fingerprint = adapter.catalogue.discovery.schema_fingerprint
+                source_fingerprint = adapter.catalogue.discovery.source_fingerprint
+            elif definition.name == PRODUCT_SEARCH_TOOL and is_catalogue:
                 from app.services.source_mapping import mapped_source
 
                 adapter = mapped_source(self._session, self._profiles, source)
@@ -789,6 +988,18 @@ class OperationalToolExecutor:
                 source_fingerprint = adapter.discovery.source_fingerprint
             else:
                 adapter = self._profiles.resolve(source.connection_profile_key)
+            if definition.name == PRODUCT_SEARCH_TOOL:
+                scope = self.catalogue_scope(source)
+                schema_fingerprint = scope.schema_fingerprint
+                source_fingerprint = scope.source_fingerprint
+                if query.mapping_version is not None and (
+                    query.mapping_version != scope.mapping_version
+                ):
+                    raise ToolExecutionError("integration_unavailable")
+            if is_catalogue:
+                definition = replace(
+                    definition, timeout_seconds=self._adapter_timeout_limit(adapter)
+                )
             if not self._adapter_timeout_is_acceptable(
                 adapter, maximum_seconds=definition.timeout_seconds
             ):
@@ -817,6 +1028,33 @@ class OperationalToolExecutor:
                     )
                 else:
                     result = definition.executor(adapter, query)
+            source_result = result
+            if definition.name == PRODUCT_SEARCH_TOOL and not is_catalogue:
+                if not isinstance(result, ProductDiscoveryResult):
+                    raise ToolExecutionError("adapter_failure")
+                result = CatalogueResult(
+                    mapping_version=scope.mapping_version,
+                    continuation=result.continuation,
+                    pagination_scope=result.pagination_scope,
+                    discovery_request=result.discovery_request,
+                    status=(
+                        "not_found"
+                        if not result.items
+                        else "resolved"
+                        if len(result.items) == 1 and not result.metadata.is_truncated
+                        else "ambiguous"
+                    ),
+                    items=tuple(
+                        CatalogueProduct(
+                            external_product_id=item.external_product_id,
+                            names=(item.name,),
+                            sku=item.sku,
+                            categories=(item.category,) if item.category else (),
+                        )
+                        for item in result.items
+                    ),
+                    truncated=result.metadata.is_truncated,
+                )
             elapsed = time.monotonic() - started
             if elapsed > definition.timeout_seconds:
                 raise ToolExecutionError("timeout")
@@ -834,20 +1072,65 @@ class OperationalToolExecutor:
                 self._session.refresh(current)
             if (
                 current is None
-                or current.status is not OperationalDataSourceStatus.ACTIVE
-                or current.updated_at != source_updated_at
+                or (
+                    current.status is not OperationalDataSourceStatus.ACTIVE
+                    and not getattr(adapter, "independent", False)
+                )
+                or current.status is OperationalDataSourceStatus.DISABLED
+                or (
+                    current.updated_at != source_updated_at
+                    and not getattr(adapter, "independent", False)
+                )
             ):
                 raise ToolExecutionError("integration_unavailable")
             if is_catalogue:
                 from app.services.source_mapping import latest_approved
 
                 revision = latest_approved(self._session, current)
-                if (
+                if not getattr(adapter, "independent", False) and (
                     revision is None
-                    or revision.version != adapter.revision_version
+                    or revision.version
+                    != (
+                        adapter.mapping.catalogue_revision
+                        if isinstance(adapter, MappedOperationalSource)
+                        else adapter.revision_version
+                    )
                     or revision.schema_fingerprint != schema_fingerprint
                 ):
                     raise ToolExecutionError("integration_unavailable")
+                if isinstance(adapter, MappedOperationalSource):
+                    if getattr(adapter, "independent", False):
+                        from app.services.capabilities import (
+                            latest_event as capability_event,
+                        )
+
+                        current_event = capability_event(
+                            self._session, current, adapter.capability_family
+                        )
+                        if (
+                            current_event is None
+                            or current_event.id != adapter.capability_approval_id
+                            or current_event.approval_type == "revoked"
+                            or current_event.expires_at <= datetime.now(UTC)
+                        ):
+                            raise ToolExecutionError("integration_unavailable")
+                    else:
+                        from app.services.operational_mapping import (
+                            latest_operational_approval,
+                        )
+
+                        current_ops = latest_operational_approval(
+                            self._session, current
+                        )
+                        if (
+                            current_ops is None
+                            or current_ops.version != adapter.revision
+                        ):
+                            raise ToolExecutionError("integration_unavailable")
+            elif definition.name == PRODUCT_SEARCH_TOOL and (
+                self.catalogue_scope(current) != scope
+            ):
+                raise ToolExecutionError("integration_unavailable")
             audit_status = ToolCallStatus.SUCCESS
         except ToolExecutionError as exc:
             error_code = exc.code
@@ -873,6 +1156,18 @@ class OperationalToolExecutor:
         except MappingProfileError:
             error_code = "integration_unavailable"
         except SourceMappingError as exc:
+            if definition and definition.name == "operational_report":
+                failure_reason = (
+                    "resolution"
+                    if exc.code == "catalogue_resolution_unapproved"
+                    else "unapproved"
+                    if exc.code.endswith("approval_required")
+                    else "revoked"
+                    if exc.code.endswith("approval_revoked")
+                    else "reader"
+                    if exc.code.startswith("source_")
+                    else "validation"
+                )
             error_code = (
                 "invalid_arguments"
                 if exc.code
@@ -880,6 +1175,8 @@ class OperationalToolExecutor:
                     "mapping_selection_stale",
                     "invalid_product_identifier",
                     "empty_product_search",
+                    "invalid_catalogue_continuation",
+                    "category_discovery_unsupported",
                 }
                 else "integration_unavailable"
             )
@@ -913,7 +1210,9 @@ class OperationalToolExecutor:
             raise ToolExecutionError("audit_unavailable") from None
 
         if error_code is not None or result is None:
-            raise ToolExecutionError(error_code or "adapter_failure")
+            raise ToolExecutionError(
+                error_code or "adapter_failure", reason=failure_reason
+            )
         return OperationalToolResult(
             tool_name=audit_name,
             output=result,
@@ -922,6 +1221,12 @@ class OperationalToolExecutor:
             source_updated_at=source_updated_at,
             schema_fingerprint=schema_fingerprint,
             source_fingerprint=source_fingerprint,
+            source_result=source_result,
+            mapping_version=getattr(
+                result,
+                "mapping_version",
+                getattr(result, "mapping_revision", source.mapping_profile_version),
+            ),
         )
 
     def reject(
@@ -976,12 +1281,111 @@ class OperationalToolExecutor:
     def _active_source(
         self, business_id: uuid.UUID
     ) -> OperationalDataSourceConfig | None:
-        return self._session.scalar(
+        source = self._session.scalar(
             select(OperationalDataSourceConfig).where(
                 OperationalDataSourceConfig.business_id == business_id,
                 OperationalDataSourceConfig.status
                 == OperationalDataSourceStatus.ACTIVE,
             )
+        )
+        if source is not None:
+            return source
+        from app.services.capabilities import active_capability_tools
+
+        for candidate in self._managed_sources(business_id):
+            if active_capability_tools(self._session, self._profiles, candidate):
+                return candidate
+        return None
+
+    def _managed_sources(self, business_id: uuid.UUID):
+        return self._session.scalars(
+            select(OperationalDataSourceConfig)
+            .where(
+                OperationalDataSourceConfig.business_id == business_id,
+                OperationalDataSourceConfig.mapping_profile_key
+                == "discovered_products",
+                OperationalDataSourceConfig.status
+                != OperationalDataSourceStatus.DISABLED,
+            )
+            .order_by(
+                OperationalDataSourceConfig.created_at, OperationalDataSourceConfig.id
+            )
+            .limit(10)
+        ).all()
+
+    def _capability_source(self, business_id: uuid.UUID, family: str):
+        from app.services.capabilities import latest_event as capability_event
+
+        candidates = []
+        for source in self._managed_sources(business_id):
+            event = capability_event(self._session, source, family)
+            if (
+                event
+                and event.approval_type == "full"
+                and event.expires_at > datetime.now(UTC)
+            ):
+                candidates.append(source)
+        if len(candidates) > 1:
+            selected = next(
+                (
+                    r
+                    for r in candidates
+                    if r.status is OperationalDataSourceStatus.ACTIVE
+                ),
+                None,
+            )
+            if selected is None:
+                raise ToolExecutionError("capability_unavailable")
+            return selected
+        return candidates[0] if candidates else None
+
+    def catalogue_scope(
+        self, source: OperationalDataSourceConfig
+    ) -> CatalogueSourceScope:
+        """Versioned source authority shared by reads and conversation validation."""
+        if "products" not in self._source_capabilities(source):
+            raise ToolExecutionError("capability_unavailable")
+        if source.mapping_profile_key == "discovered_products":
+            from app.services.source_mapping import mapped_source
+
+            adapter = mapped_source(self._session, self._profiles, source)
+            if getattr(adapter, "quality_policy", None) is not None:
+                # Cached conversation choices carry the same strict source boundary.
+                adapter.validate_results()
+            return CatalogueSourceScope(
+                adapter.revision_version,
+                adapter.discovery.schema_fingerprint,
+                adapter.discovery.source_fingerprint,
+            )
+        # Fixed operational adapters have a versioned schema contract rather than
+        # a discovered schema. The source stamp separately invalidates edits.
+        mapping = self._profiles.get_mapping(
+            source.mapping_profile_key, source.mapping_profile_version
+        )
+        schema = json.dumps(
+            {
+                "adapter": source.adapter_type,
+                "mapping": mapping.key,
+                "version": mapping.version,
+                "capabilities": mapping.required_capabilities,
+                "quantity": mapping.quantity_interpretation,
+                "timezone": mapping.source_timezone,
+                "currency": mapping.currency,
+            },
+            sort_keys=True,
+        ).encode()
+        identity = json.dumps(
+            {
+                "source": str(source.id),
+                "business": str(source.business_id),
+                "connection_profile": source.connection_profile_key,
+            },
+            sort_keys=True,
+        ).encode()
+        return CatalogueSourceScope(
+            mapping.version,
+            hashlib.sha256(schema).hexdigest(),
+            hashlib.sha256(identity).hexdigest(),
         )
 
     def _source_capabilities(
@@ -991,11 +1395,22 @@ class OperationalToolExecutor:
             from app.services.source_mapping import connector_for, latest_approved
 
             connector_for(self._profiles, source)
+            from app.services.capabilities import active_capability_tools
+            from app.services.operational_mapping import latest_operational_approval
+
+            if not latest_approved(self._session, source):
+                return (
+                    frozenset({"mapped_operations"})
+                    if active_capability_tools(self._session, self._profiles, source)
+                    else frozenset()
+                )
             return (
-                frozenset({"products"})
-                if latest_approved(self._session, source)
-                else frozenset()
+                frozenset({"products", "mapped_operations"})
+                if latest_operational_approval(self._session, source)
+                or active_capability_tools(self._session, self._profiles, source)
+                else frozenset({"products"})
             )
+
         profile = self._profiles.get_profile(source.connection_profile_key)
         mapping = self._profiles.get_mapping(
             source.mapping_profile_key, source.mapping_profile_version
@@ -1003,6 +1418,7 @@ class OperationalToolExecutor:
         if (
             profile is None
             or mapping is None
+            or (profile.business_ids and source.business_id not in profile.business_ids)
             or profile.adapter_type != source.adapter_type
             or profile.mapping_profile_key != source.mapping_profile_key
             or profile.mapping_profile_version != source.mapping_profile_version
@@ -1010,6 +1426,20 @@ class OperationalToolExecutor:
             raise ToolExecutionError("integration_unavailable")
         mapping.validate_definition()
         return frozenset(mapping.required_capabilities)
+
+    def _adapter_timeout_limit(self, adapter: OperationalDataSource) -> int:
+        """Use only a typed, operator-managed connection's reviewed deadline."""
+        connector = (
+            getattr(getattr(adapter, "catalogue", None), "connector", None)
+            if isinstance(adapter, MappedOperationalSource)
+            else getattr(adapter, "connector", None)
+            if isinstance(adapter, MappedProductSource)
+            else None
+        )
+        config = getattr(connector, "config", None)
+        if isinstance(config, SourceConnection):
+            return config.query_timeout_seconds
+        return self._settings.operational_query_timeout_seconds
 
     def _adapter_timeout_is_acceptable(
         self,
@@ -1021,7 +1451,7 @@ class OperationalToolExecutor:
             enforced = adapter.enforced_query_timeout_seconds
         except Exception:
             return False
-        maximum = maximum_seconds or self._settings.operational_query_timeout_seconds
+        maximum = maximum_seconds or self._adapter_timeout_limit(adapter)
         return (
             isinstance(enforced, int)
             and not isinstance(enforced, bool)
@@ -1037,6 +1467,36 @@ class OperationalToolExecutor:
         if source is None:
             raise ToolExecutionError("integration_unavailable")
         self._source_capabilities(source)
+        if source.mapping_profile_key == "discovered_products":
+            from app.services.operational_mapping import operational_source
+
+            try:
+                from app.services.capabilities import approved_adapter
+                from app.services.capabilities import latest_event as capability_event
+
+                if capability_event(self._session, source, "financial"):
+                    mapping = approved_adapter(
+                        self._session, self._profiles, source, "revenue"
+                    ).mapping
+                elif capability_event(self._session, source, "sales"):
+                    mapping = approved_adapter(
+                        self._session, self._profiles, source, "sales"
+                    ).mapping
+                else:
+                    mapping = operational_source(
+                        self._session, self._profiles, source
+                    ).mapping
+            except SourceMappingError as exc:
+                raise ToolExecutionError("integration_unavailable") from exc
+            metrics = tuple(
+                name
+                for name, supported in (
+                    ("revenue", mapping.revenue),
+                    ("sales_count", mapping.sales),
+                )
+                if supported
+            )
+            return mapping.timezone, metrics
         mapping = self._profiles.get_mapping(
             source.mapping_profile_key, source.mapping_profile_version
         )

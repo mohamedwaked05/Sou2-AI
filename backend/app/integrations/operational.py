@@ -13,6 +13,7 @@ from app.schemas.operational import (
     LocationCandidate,
     LocationResolution,
     LocationResolutionQuery,
+    ProductDiscoveryResult,
     ProductResolution,
     ProductResolutionQuery,
     RestockingReadQuery,
@@ -20,6 +21,7 @@ from app.schemas.operational import (
     SalesQuery,
     SalesSummary,
 )
+from app.schemas.source_mapping import CatalogueRequest
 
 
 class OperationalIntegrationError(Exception):
@@ -50,6 +52,8 @@ class OperationalDataSource(Protocol):
         ...
 
     def resolve_product(self, query: ProductResolutionQuery) -> ProductResolution: ...
+
+    def search_products(self, query: CatalogueRequest) -> ProductDiscoveryResult: ...
 
     def resolve_category(self, query: ProductResolutionQuery) -> CategoryResolution: ...
 

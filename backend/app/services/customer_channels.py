@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.channels.meta import MetaWhatsAppAdapter
 from app.channels.profiles import ChannelProfileRegistry, ChannelProfileUnavailable
+from app.core.admission import require_open_admission
 from app.core.exceptions import ApplicationError
 from app.core.security import utc_now
 from app.database.models import (
@@ -426,6 +427,7 @@ def create_manual_reply(
     conversation_id: uuid.UUID,
     content: str,
 ) -> CustomerMessageResponse:
+    require_open_admission()
     business = load_full_access_business(session, user, business_id)
     if business.status is not BusinessStatus.ACTIVE:
         raise _error("business_not_active", status.HTTP_403_FORBIDDEN)

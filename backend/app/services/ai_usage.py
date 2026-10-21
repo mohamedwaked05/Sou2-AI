@@ -8,7 +8,7 @@ from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from fastapi import status
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
@@ -133,6 +133,22 @@ def reserve_conversation_summary_usage(
     max_output_tokens: int,
     lease_seconds: int,
 ) -> AIUsageReservationClaim:
+    current = session.scalar(
+        select(OwnerConversationSummary)
+        .where(
+            OwnerConversationSummary.id == summary.id,
+            OwnerConversationSummary.business_id == summary.business_id,
+            OwnerConversationSummary.generation_claim_token == claim_token,
+            OwnerConversationSummary.generation_state == "processing",
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if current is None or current.generation_claim_expires_at <= session.scalar(
+        select(func.clock_timestamp())
+    ):
+        session.rollback()
+        raise RuntimeError("summary_claim_not_active")
     business = session.get(Business, summary.business_id)
     if business is None:
         raise RuntimeError("Summary business is unavailable.")
@@ -195,6 +211,24 @@ def reserve_customer_message_usage(
     return AIUsageReservationClaim(id=row.reservation_id, reset_at=row.reset_at)
 
 
+def summary_attempt_has_usage(
+    session: Session, summary: OwnerConversationSummary
+) -> bool:
+    """Inspect one scoped attempt through the controlled accounting interface."""
+    return session.execute(
+        text(
+            "SELECT public.sou2ai_summary_attempt_has_usage("
+            ":summary_id, :business_id, :conversation_id, :attempt)"
+        ),
+        {
+            "summary_id": summary.id,
+            "business_id": summary.business_id,
+            "conversation_id": summary.conversation_id,
+            "attempt": summary.generation_attempts,
+        },
+    ).scalar_one()
+
+
 def reconcile_ai_usage(
     session: Session,
     reservation_id: uuid.UUID,
@@ -204,8 +238,41 @@ def reconcile_ai_usage(
     provider_identifier: str | None = None,
     model_identifier: str | None = None,
     commit: bool = True,
+    require_new: bool = False,
+    finalization_deadline: datetime | None = None,
 ) -> bool:
     """Finalize one leased reservation exactly once."""
+    if require_new:
+        # Runtime has no accounting-table permissions. The definer function
+        # retains this row lock until response/accounting commit or rollback.
+        reservation = session.execute(
+            text(
+                "SELECT * FROM public.sou2ai_lock_active_ai_usage_reservation("
+                ":reservation_id, :finalization_deadline)"
+            ),
+            {
+                "reservation_id": reservation_id,
+                "finalization_deadline": finalization_deadline,
+            },
+        ).one_or_none()
+        now = session.scalar(select(func.clock_timestamp()))
+        if (
+            reservation is None
+            or reservation.lease_expires_at <= now
+            or reservation.window_end <= now
+            or (finalization_deadline is not None and finalization_deadline <= now)
+        ):
+            logger.warning(
+                "ai_budget_reconciliation_rejected reservation_id=%s "
+                "reason=reservation_not_active",
+                reservation_id,
+                extra={
+                    "event": "ai_budget_reconciliation_rejected",
+                    "reason": "reservation_not_active",
+                    "reservation_id": str(reservation_id),
+                },
+            )
+            raise RuntimeError("ai_usage_reservation_not_active")
     row = session.execute(
         text(
             "SELECT * FROM public.sou2ai_reconcile_ai_usage("
@@ -222,9 +289,39 @@ def reconcile_ai_usage(
             "outcome": outcome,
         },
     ).one()
+    reconciled = bool(row.reconciled)
+    if require_new and reconciled:
+        # The SQL function can wait on the daily accounting lock. The caller
+        # rolls back response and accounting together if that wait expired it.
+        now = session.scalar(select(func.clock_timestamp()))
+        if (
+            reservation.lease_expires_at <= now
+            or reservation.window_end <= now
+            or (finalization_deadline is not None and finalization_deadline <= now)
+        ):
+            logger.warning(
+                "ai_budget_reconciliation_rejected reservation_id=%s "
+                "reason=finalization_deadline_expired",
+                reservation_id,
+            )
+            raise RuntimeError("ai_usage_finalization_deadline_expired")
+    if not reconciled:
+        logger.warning(
+            "ai_budget_reconciliation_rejected reservation_id=%s outcome=%s "
+            "reason=already_finalized",
+            reservation_id,
+            outcome,
+            extra={
+                "event": "ai_budget_reconciliation_rejected",
+                "reason": "already_finalized",
+                "reservation_id": str(reservation_id),
+                "outcome": outcome,
+            },
+        )
+        if require_new:
+            raise RuntimeError("ai_usage_reconciliation_not_applied")
     if commit:
         session.commit()
-    reconciled = bool(row.reconciled)
     if reconciled:
         usage_source = (
             "unknown"

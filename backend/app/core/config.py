@@ -2,6 +2,7 @@
 
 import ipaddress
 import re
+from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 from urllib.parse import urlsplit
@@ -92,6 +93,16 @@ def normalize_cors_origin(value: str) -> tuple[str, str]:
 
 
 class Settings(BaseSettings):
+    catalogue_max_invalid_percent: Decimal = Field(
+        default=Decimal("1.0"),
+        ge=0,
+        le=5,
+        allow_inf_nan=False,
+        max_digits=5,
+        decimal_places=4,
+    )
+    catalogue_quality_report_ttl_seconds: int = Field(default=900, ge=60, le=3600)
+    catalogue_partial_approval_ttl_seconds: int = Field(default=86400, ge=60, le=86400)
     """Runtime configuration for the Sou2AI API."""
 
     model_config = SettingsConfigDict(
@@ -100,11 +111,13 @@ class Settings(BaseSettings):
         case_sensitive=False,
         enable_decoding=False,
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     app_name: str = "Sou2AI API"
     app_version: str = "0.1.0"
     environment: str = "development"
+    admission_mode: Literal["closed", "open"] = "closed"
     debug: bool = True
     api_v1_prefix: str = "/api/v1"
     host: str = "127.0.0.1"
@@ -128,17 +141,20 @@ class Settings(BaseSettings):
     redis_url: str = "redis://127.0.0.1:6379/0"
     knowledge_queue_name: str = "knowledge"
     customer_message_queue_name: str = "customer-messages"
+    worker_expected_source_version: str | None = None
     knowledge_worker_timeout_seconds: int = Field(default=120, ge=1, le=120)
     api_docs_enabled: bool | None = None
     hsts_enabled: bool = False
     trusted_https_termination: bool = False
     log_level: str = "INFO"
     owner_chat_provider: Literal["mock", "ollama", "gemini"] = "mock"
+    conversation_summary_provider: Literal["mock", "ollama", "gemini"] | None = None
+    customer_chat_provider: Literal["mock", "ollama", "gemini"] | None = None
     development_owner_chat_minute_limit: int | None = Field(default=None, ge=3, le=120)
     development_owner_chat_hour_limit: int | None = Field(default=None, ge=20, le=2000)
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_chat_model: str = "qwen2.5:7b"
-    gemini_chat_model: str = "gemini-3-flash-preview"
+    gemini_chat_model: str = "gemini-3.1-flash-lite"
     gemini_request_timeout_seconds: int = Field(default=120, ge=1)
     gemini_api_key: SecretStr | None = None
     ollama_embedding_model: str = "bge-m3"
@@ -296,10 +312,37 @@ class Settings(BaseSettings):
                 "OWNER_CHAT_GENERATION_LEASE_SECONDS must exceed "
                 "the selected owner-chat provider timeout."
             )
-        if (
-            self.owner_chat_provider == "gemini"
-            or self.source_mapping_provider == "gemini"
-        ) and (
+        generation_providers = (
+            self.owner_chat_provider,
+            self.conversation_summary_provider,
+            self.customer_chat_provider,
+            self.source_mapping_provider,
+        )
+        if self.environment.casefold() not in {"development", "testing"}:
+            if "mock" in generation_providers:
+                raise ValueError("Mock providers require development or testing.")
+            if (
+                self.conversation_summary_provider is None
+                or self.customer_chat_provider is None
+            ):
+                raise ValueError("Worker generation providers must be explicit.")
+        for provider, lease in (
+            (
+                self.conversation_summary_provider,
+                self.owner_chat_generation_lease_seconds,
+            ),
+            (self.customer_chat_provider, self.customer_generation_lease_seconds),
+        ):
+            timeout = (
+                self.ollama_request_timeout_seconds
+                if provider == "ollama"
+                else self.gemini_request_timeout_seconds
+            )
+            if provider in {"ollama", "gemini"} and lease <= timeout:
+                raise ValueError(
+                    "Worker generation lease must exceed provider timeout."
+                )
+        if "gemini" in generation_providers and (
             self.gemini_api_key is None
             or not self.gemini_api_key.get_secret_value().strip()
         ):

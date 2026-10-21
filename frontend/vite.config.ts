@@ -10,6 +10,9 @@ export default defineConfig({
       "/api": {
         target: "http://127.0.0.1:8000",
         changeOrigin: false,
+        // Allow supported 300-second turns and finalization before client expiry.
+        proxyTimeout: 360_000,
+        timeout: 390_000,
       },
     },
   },

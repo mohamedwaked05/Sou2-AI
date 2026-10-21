@@ -11,8 +11,13 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
-from app.agent.mapping_provider import MAPPING_MAX_OUTPUT_TOKENS, MappingProvider
+from app.agent.mapping_provider import (
+    MAPPING_MAX_OUTPUT_TOKENS,
+    MappingProvider,
+    complete_category_joins,
+)
 from app.agent.owner_chat_provider import OwnerChatProviderError
+from app.core.admission import require_open_admission
 from app.core.config import get_settings
 from app.core.exceptions import ApplicationError
 from app.database.models import (
@@ -122,11 +127,20 @@ def mapped_source(
             or connector.source_fingerprint != discovery.source_fingerprint
         ):
             raise SourceMappingError("mapping_schema_changed")
+        products = ProductMapping.model_validate(revision.approved_mapping)
+        profile = registry.get_profile(source.connection_profile_key)
+        if len(profile.business_ids) > 1 and not products.row_scopes:
+            raise SourceMappingError("mapping_catalogue_partition_required")
+        from app.services.catalogue_quality import approved_coverage
+
+        policy, coverage = approved_coverage(session, source, revision)
         return MappedProductSource(
             connector,
             discovery,
-            ProductMapping.model_validate(revision.approved_mapping),
+            products,
             revision.version,
+            quality_policy=policy,
+            coverage=coverage,
         )
     except ValidationError:
         raise SourceMappingError("mapping_record_invalid") from None
@@ -157,6 +171,7 @@ def discover_source(
     source_id: uuid.UUID,
     registry: ConnectionProfileRegistry,
 ) -> SchemaDiscovery:
+    require_open_admission()
     source = _source(session, user, business_id, source_id)
     connector = connector_for(registry, source)
     session.commit()
@@ -207,6 +222,7 @@ def propose_mapping(
     registry: ConnectionProfileRegistry,
     provider: MappingProvider,
 ) -> MappingReview:
+    require_open_admission()
     source = _source(session, user, business_id, source_id, lock=True)
     connector = connector_for(registry, source)
     existing = _existing_request(session, source, key)
@@ -229,6 +245,14 @@ def propose_mapping(
     existing = _existing_request(session, source, key)
     if existing is not None:
         return _replay(session, existing)
+    prior = latest_approved(session, source)
+    approved = (
+        ProductMapping.model_validate(prior.approved_mapping)
+        if prior is not None
+        and prior.schema_fingerprint == discovery.schema_fingerprint
+        and prior.discovery.get("source_fingerprint") == discovery.source_fingerprint
+        else None
+    )
     version = (
         session.scalar(
             select(func.max(SourceMappingRevision.version)).where(
@@ -276,9 +300,13 @@ def propose_mapping(
         raise
     try:
         result = provider.propose(discovery)
-        if result.proposal.mapping is not None:
-            validate_mapping(result.proposal.mapping, discovery)
+        # Retain rejected proposals too; otherwise the failed join is unauditable.
         revision.proposal = result.proposal.model_dump(mode="json")
+        proposal, notes = complete_category_joins(result.proposal, discovery, approved)
+        revision.validation_notes = list(notes)
+        if proposal.mapping is not None:
+            validate_mapping(proposal.mapping, discovery)
+        revision.proposal = proposal.model_dump(mode="json")
         revision.status = "review"
         reconcile_ai_usage(
             session,
@@ -363,6 +391,7 @@ def approve_mapping(
     body: MappingApproveRequest,
     registry: ConnectionProfileRegistry,
 ) -> MappingReview:
+    require_open_admission()
     source = _source(session, user, business_id, source_id)
     revision = session.scalar(
         select(SourceMappingRevision).where(
@@ -421,6 +450,32 @@ def approve_mapping(
     return _review(revision)
 
 
+def reject_mapping(session, user, business_id, source_id, revision_id):
+    require_open_admission()
+    source = _source(session, user, business_id, source_id, lock=True)
+    revision = session.scalar(
+        select(SourceMappingRevision)
+        .where(
+            SourceMappingRevision.id == revision_id,
+            SourceMappingRevision.source_id == source.id,
+            SourceMappingRevision.business_id == business_id,
+        )
+        .with_for_update()
+    )
+    if revision is None:
+        raise mapping_error("mapping_revision_not_found", 404)
+    if revision.status != "review":
+        raise mapping_error("mapping_review_required")
+    revision.status = "failed"
+    revision.failure_code = "mapping_rejected_by_owner"
+    revision.validation_notes = [
+        *revision.validation_notes,
+        f"Rejected by owner {user.id} at {datetime.now(UTC).isoformat()}.",
+    ]
+    session.commit()
+    return _review(revision)
+
+
 def validate_mapped_source(
     session: Session,
     user: User,
@@ -428,6 +483,7 @@ def validate_mapped_source(
     source_id: uuid.UUID,
     registry: ConnectionProfileRegistry,
 ) -> DataSourceResponse:
+    require_open_admission()
     from app.services.data_sources import _response
 
     source = _source(session, user, business_id, source_id)
@@ -439,11 +495,13 @@ def validate_mapped_source(
     session.commit()
     failure = None
     try:
-        current = adapter.connector.discover()
-        if (
-            current.source_fingerprint != adapter.discovery.source_fingerprint
-            or current.schema_fingerprint != adapter.discovery.schema_fingerprint
-        ):
+        from app.integrations.catalogue_quality import catalogue_dependencies
+
+        expected = catalogue_dependencies(adapter.mapping, adapter.discovery)
+        current = adapter.connector.discover(
+            object_ids={o.object_id for o in expected.objects}
+        )
+        if current != expected:
             raise SourceMappingError("mapping_schema_changed")
         adapter.validate_results()
     except SourceMappingError as exc:
@@ -506,6 +564,8 @@ def search_catalogue(
             "empty_product_search",
             "invalid_product_identifier",
             "mapping_selection_stale",
+            "invalid_catalogue_continuation",
+            "category_discovery_unsupported",
         }:
             source.status = OperationalDataSourceStatus.UNHEALTHY
             source.last_validated_at = datetime.now(UTC)

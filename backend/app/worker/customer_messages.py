@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import uuid
-from datetime import timedelta
+from dataclasses import replace
+from datetime import datetime, timedelta
 
 from redis import Redis
 from rq import Queue
 from rq.job import JobStatus
 from sqlalchemy import func, select, text
+from sqlalchemy.orm import Session
 
 from app.agent.owner_chat_provider import (
     OwnerChatProvider,
@@ -22,14 +25,22 @@ from app.agent.owner_chat_provider import (
     ProviderSource,
     ProviderWorkingDay,
     ProviderWorkingShift,
+    TokenUsage,
     get_owner_chat_provider,
 )
 from app.channels.contracts import ChannelError, MessagingChannelAdapter
 from app.channels.meta import MetaWhatsAppAdapter
 from app.channels.privacy import CustomerIdentityUnavailable, decrypt_identity
 from app.channels.profiles import ChannelProfileRegistry, ChannelProfileUnavailable
+from app.core.admission import require_open_admission
 from app.core.config import Settings, get_settings
 from app.core.exceptions import ApplicationError
+from app.core.runtime import (
+    job_contract,
+    preserve_incompatible_failed_job,
+    validate_worker_job,
+    worker_provider_settings,
+)
 from app.core.security import utc_now
 from app.database.models import (
     Business,
@@ -74,6 +85,86 @@ BUSINESS_QUESTION_PATTERN = re.compile(
     r"open|hours|address|location|return|refund|warranty|menu|products?)\b|"
     r"توصيل|السعر|قديش|بكرا|العنوان"
 )
+logger = logging.getLogger(__name__)
+
+
+class CustomerClaimLost(RuntimeError):
+    """A stale result must not change a persisted customer claim."""
+
+
+def _locked_customer_claim(
+    session: Session,
+    identifier: uuid.UUID,
+    business_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    status: CustomerMessageStatus,
+    deadline: datetime,
+    *,
+    require_unexpired=True,
+) -> CustomerMessage:
+    message = session.scalar(
+        select(CustomerMessage)
+        .where(
+            CustomerMessage.id == identifier,
+            CustomerMessage.business_id == business_id,
+            CustomerMessage.conversation_id == conversation_id,
+            CustomerMessage.status == status,
+            CustomerMessage.claim_expires_at == deadline,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if message is None or (
+        require_unexpired and deadline <= session.scalar(select(func.clock_timestamp()))
+    ):
+        raise CustomerClaimLost("customer_claim_lost")
+    return message
+
+
+def _fail_customer_generation(
+    session: Session,
+    identifier: uuid.UUID,
+    business_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    deadline: datetime,
+    reservation_id: uuid.UUID | None,
+    usage: TokenUsage | None,
+    outcome: str,
+    provider_identifier: str | None,
+    model_identifier: str | None,
+    failure_code: str,
+) -> None:
+    # Match recovery/success lock order: message first, reservation second.
+    try:
+        message = _locked_customer_claim(
+            session,
+            identifier,
+            business_id,
+            conversation_id,
+            CustomerMessageStatus.PROCESSING,
+            deadline,
+            require_unexpired=False,
+        )
+    except CustomerClaimLost:
+        message = None
+        logger.warning(
+            "customer_late_result message_id=%s reason=claim_replaced", identifier
+        )
+    if reservation_id is not None:
+        reconcile_ai_usage(
+            session,
+            reservation_id,
+            usage=usage,
+            outcome=outcome,
+            provider_identifier=provider_identifier,
+            model_identifier=model_identifier,
+            commit=False,
+        )
+    if message is not None:
+        message.status = CustomerMessageStatus.FAILED
+        message.failure_code = failure_code
+        message.claim_expires_at = None
+    session.commit()
 
 
 def _queue(settings: Settings) -> Queue:
@@ -86,6 +177,7 @@ def _queue(settings: Settings) -> Queue:
 def _enqueue_once(
     job_id: str, function: object, identifier: uuid.UUID, settings: Settings
 ) -> None:
+    require_open_admission(settings)
     queue = _queue(settings)
     existing = queue.fetch_job(job_id)
     if existing is not None and existing.get_status(refresh=True) in {
@@ -96,12 +188,14 @@ def _enqueue_once(
     }:
         return
     if existing is not None:
+        preserve_incompatible_failed_job(existing, settings, "customer")
         existing.delete()
     queue.enqueue(
         function,
         str(identifier),
         job_id=job_id,
         job_timeout=settings.customer_generation_lease_seconds,
+        meta={"runtime_contract": job_contract(settings, "customer")},
     )
 
 
@@ -114,6 +208,7 @@ def enqueue_inbound_message(message_id: uuid.UUID, settings: Settings) -> None:
 def enqueue_outbound_message(
     message_id: uuid.UUID, settings: Settings | None = None, *, delay_seconds: int = 0
 ) -> None:
+    require_open_admission(settings)
     resolved = settings or get_settings()
     queue = _queue(resolved)
     job_id = (
@@ -133,6 +228,7 @@ def enqueue_outbound_message(
     }:
         return
     if existing is not None:
+        preserve_incompatible_failed_job(existing, resolved, "outbound")
         existing.delete()
     if delay_seconds > 0:
         queue.enqueue_in(
@@ -141,6 +237,7 @@ def enqueue_outbound_message(
             str(message_id),
             job_id=job_id,
             job_timeout=resolved.whatsapp_request_timeout_seconds + 5,
+            meta={"runtime_contract": job_contract(resolved, "outbound")},
         )
     else:
         queue.enqueue(
@@ -148,6 +245,7 @@ def enqueue_outbound_message(
             str(message_id),
             job_id=job_id,
             job_timeout=resolved.whatsapp_request_timeout_seconds + 5,
+            meta={"runtime_contract": job_contract(resolved, "outbound")},
         )
 
 
@@ -155,6 +253,7 @@ def recover_expired_customer_message_claims(
     settings_override: Settings | None = None, *, batch_size: int = 50
 ) -> int:
     """Bounded, idempotent recovery for jobs lost after their state commit."""
+    require_open_admission(settings_override)
     now = utc_now()
     recovered = 0
     with get_session_factory()() as session:
@@ -259,6 +358,14 @@ def _static_reply(content: str, kind: str) -> str:
 
 
 def _persist_reply(session, inbound: CustomerMessage, content: str) -> CustomerMessage:
+    inbound = _locked_customer_claim(
+        session,
+        inbound.id,
+        inbound.business_id,
+        inbound.conversation_id,
+        CustomerMessageStatus.PROCESSING,
+        inbound.claim_expires_at,
+    )
     reply = CustomerMessage(
         id=uuid.uuid4(),
         business_id=inbound.business_id,
@@ -271,6 +378,7 @@ def _persist_reply(session, inbound: CustomerMessage, content: str) -> CustomerM
     )
     session.add(reply)
     inbound.status = CustomerMessageStatus.COMPLETED
+    inbound.claim_expires_at = None
     inbound.failure_code = None
     delivery = session.scalar(
         select(InboundWebhookDelivery).where(
@@ -488,12 +596,15 @@ def process_inbound_message(
     settings_override: Settings | None = None,
 ) -> None:
     settings = settings_override or get_settings()
+    validate_worker_job(settings, "customer")
     recover_expired_customer_message_claims(settings, batch_size=25)
     identifier = uuid.UUID(message_id)
     reservation_id: uuid.UUID | None = None
     generation_started = False
     result: OwnerChatResult | None = None
-    resolved_provider = provider or get_owner_chat_provider(settings)
+    resolved_provider = provider or get_owner_chat_provider(
+        worker_provider_settings(settings, "customer")
+    )
     with get_session_factory()() as session:
         message = session.scalar(
             select(CustomerMessage)
@@ -509,7 +620,13 @@ def process_inbound_message(
             else None
         )
         business = session.get(Business, message.business_id)
-        if not conversation or not connection or not business:
+        if (
+            not conversation
+            or not connection
+            or not business
+            or conversation.business_id != message.business_id
+            or connection.business_id != message.business_id
+        ):
             message.status = CustomerMessageStatus.FAILED
             message.failure_code = "customer.context_unavailable"
             message.claim_expires_at = None
@@ -518,6 +635,11 @@ def process_inbound_message(
         message.status = CustomerMessageStatus.PROCESSING
         message.claim_expires_at = utc_now() + timedelta(
             seconds=settings.customer_generation_lease_seconds
+        )
+        claim_deadline = message.claim_expires_at
+        scope_business_id, scope_conversation_id = (
+            message.business_id,
+            message.conversation_id,
         )
         session.commit()
 
@@ -559,8 +681,6 @@ def process_inbound_message(
             settings,
         )
         if not _customer_evidence_supports(request, message.content):
-            message.status = CustomerMessageStatus.COMPLETED
-            message.claim_expires_at = None
             reply = _persist_reply(
                 session, message, _static_reply(message.content, "missing")
             )
@@ -574,6 +694,14 @@ def process_inbound_message(
             return
 
         try:
+            message = _locked_customer_claim(
+                session,
+                identifier,
+                scope_business_id,
+                scope_conversation_id,
+                CustomerMessageStatus.PROCESSING,
+                claim_deadline,
+            )
             claim = reserve_customer_message_usage(
                 session,
                 message=message,
@@ -582,9 +710,26 @@ def process_inbound_message(
                 lease_seconds=settings.customer_generation_lease_seconds,
             )
             reservation_id = claim.id
+            now = session.scalar(select(func.clock_timestamp()))
+            remaining = min(
+                (claim_deadline - now).total_seconds(),
+                (claim.reset_at - now).total_seconds(),
+            )
+            if remaining <= 0:
+                raise CustomerClaimLost("customer_claim_expired_before_dispatch")
+            request = replace(request, provider_timeout_seconds=remaining)
+            session.rollback()
             generation_started = True
             result = resolved_provider.generate(request)
             reply_text = _validate_customer_result(result, request, message.content)
+            message = _locked_customer_claim(
+                session,
+                identifier,
+                scope_business_id,
+                scope_conversation_id,
+                CustomerMessageStatus.PROCESSING,
+                claim_deadline,
+            )
             reply = CustomerMessage(
                 id=uuid.uuid4(),
                 business_id=message.business_id,
@@ -606,6 +751,8 @@ def process_inbound_message(
                 provider_identifier=result.provider_identifier,
                 model_identifier=result.model_identifier,
                 commit=False,
+                require_new=True,
+                finalization_deadline=claim_deadline,
             )
             delivery = session.scalar(
                 select(InboundWebhookDelivery).where(
@@ -617,53 +764,72 @@ def process_inbound_message(
                 delivery.status = "PROCESSED"
                 delivery.processed_at = utc_now()
             session.commit()
-            enqueue_outbound_message(reply.id, settings)
         except OwnerChatProviderError as exc:
-            if reservation_id is not None:
-                reconcile_ai_usage(
-                    session,
-                    reservation_id,
-                    usage=exc.usage,
-                    outcome=(
-                        "reported_failure"
-                        if exc.usage is not None
-                        else "uncertain"
-                        if exc.usage_uncertain
-                        else "release"
-                    ),
-                    provider_identifier=exc.provider_identifier,
-                    model_identifier=exc.model_identifier,
-                    commit=False,
+            session.rollback()
+            logger.warning(
+                "customer_provider_failed message_id=%s reason=%s",
+                identifier,
+                exc.reason,
+            )
+            _fail_customer_generation(
+                session,
+                identifier,
+                scope_business_id,
+                scope_conversation_id,
+                claim_deadline,
+                reservation_id,
+                exc.usage,
+                "reported_failure"
+                if exc.usage is not None
+                else "uncertain"
+                if exc.usage_uncertain
+                else "release",
+                exc.provider_identifier,
+                exc.model_identifier,
+                "customer.provider_failure",
+            )
+        except Exception as exc:
+            session.rollback()
+            safe_reasons = {
+                "customer_provider_proposed_knowledge",
+                "customer_provider_invalid_citations",
+                "customer_provider_missing_citation",
+                "customer_provider_empty_reply",
+            }
+            reason = (
+                str(exc)
+                if isinstance(exc, ValueError) and str(exc) in safe_reasons
+                else (
+                    exc.error_code
+                    if isinstance(exc, ApplicationError)
+                    else "customer_generation_failed"
                 )
-            message.status = CustomerMessageStatus.FAILED
-            message.failure_code = "customer.provider_failure"
-            message.claim_expires_at = None
-            session.commit()
-        except ApplicationError, ValueError:
-            if reservation_id is not None:
-                reconcile_ai_usage(
-                    session,
-                    reservation_id,
-                    usage=result.usage if result is not None else None,
-                    outcome=(
-                        "reported_failure"
-                        if result is not None and result.usage is not None
-                        else "uncertain"
-                        if generation_started
-                        else "release"
-                    ),
-                    provider_identifier=result.provider_identifier
-                    if result is not None
-                    else None,
-                    model_identifier=result.model_identifier
-                    if result is not None
-                    else None,
-                    commit=False,
-                )
-            message.status = CustomerMessageStatus.FAILED
-            message.failure_code = "customer.generation_failed"
-            message.claim_expires_at = None
-            session.commit()
+            )
+            logger.warning(
+                "customer_generation_failed message_id=%s exception_type=%s reason=%s",
+                identifier,
+                type(exc).__name__,
+                reason,
+            )
+            _fail_customer_generation(
+                session,
+                identifier,
+                scope_business_id,
+                scope_conversation_id,
+                claim_deadline,
+                reservation_id,
+                result.usage if result is not None else None,
+                "reported_failure"
+                if result is not None and result.usage is not None
+                else "uncertain"
+                if generation_started
+                else "release",
+                result.provider_identifier if result is not None else None,
+                result.model_identifier if result is not None else None,
+                "customer.generation_failed",
+            )
+        else:
+            enqueue_outbound_message(reply.id, settings)
 
 
 def process_outbound_message(
@@ -672,6 +838,7 @@ def process_outbound_message(
     settings_override: Settings | None = None,
 ) -> None:
     settings = settings_override or get_settings()
+    validate_worker_job(settings, "outbound")
     recover_expired_customer_message_claims(settings, batch_size=25)
     identifier = uuid.UUID(message_id)
     retry_delay: int | None = None
@@ -724,11 +891,32 @@ def process_outbound_message(
             message.claim_expires_at = utc_now() + timedelta(
                 seconds=settings.whatsapp_request_timeout_seconds + 5
             )
+            claim_deadline = message.claim_expires_at
+            scope_business_id, scope_conversation_id = (
+                message.business_id,
+                message.conversation_id,
+            )
             session.commit()
             try:
                 result = resolved_adapter.send_text(recipient, message.content)
             except ChannelError as exc:
-                message = session.get(CustomerMessage, identifier)
+                try:
+                    message = _locked_customer_claim(
+                        session,
+                        identifier,
+                        scope_business_id,
+                        scope_conversation_id,
+                        CustomerMessageStatus.SENDING,
+                        claim_deadline,
+                    )
+                except CustomerClaimLost:
+                    session.rollback()
+                    logger.warning(
+                        "customer_outbound_late_result message_id=%s "
+                        "reason=claim_expired",
+                        identifier,
+                    )
+                    return
                 if (
                     exc.retryable
                     and message is not None
@@ -745,7 +933,23 @@ def process_outbound_message(
                     message.claim_expires_at = None
                 session.commit()
             else:
-                message = session.get(CustomerMessage, identifier)
+                try:
+                    message = _locked_customer_claim(
+                        session,
+                        identifier,
+                        scope_business_id,
+                        scope_conversation_id,
+                        CustomerMessageStatus.SENDING,
+                        claim_deadline,
+                    )
+                except CustomerClaimLost:
+                    session.rollback()
+                    logger.warning(
+                        "customer_outbound_late_result message_id=%s "
+                        "reason=delivery_uncertain",
+                        identifier,
+                    )
+                    return
                 if message is not None:
                     message.status = CustomerMessageStatus.SENT
                     message.claim_expires_at = None

@@ -6,6 +6,7 @@ from urllib.parse import quote
 
 import resend
 
+from app.core.admission import require_open_admission
 from app.core.config import Settings, get_settings
 
 
@@ -26,6 +27,7 @@ class ResendEmailService:
         self.settings = settings
 
     def _send(self, *, recipient: str, subject: str, html: str) -> None:
+        require_open_admission(self.settings)
         api_key = self.settings.resend_api_key
         if api_key is None or not api_key.get_secret_value():
             raise EmailDeliveryError("Transactional email is not configured.")
