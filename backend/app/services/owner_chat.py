@@ -2239,6 +2239,21 @@ def _validated_provider_arguments(
     try:
         encoded = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
         validated = input_schema.model_validate_json(encoded, strict=True)
+    except ValidationError as exc:
+        _logger.info(
+            "owner_chat_tool_arguments_invalid tool=%s errors=%s",
+            tool_name,
+            tuple(
+                (
+                    error["loc"][0]
+                    if error["loc"] and error["loc"][0] in input_schema.model_fields
+                    else "unknown_field",
+                    error["type"],
+                )
+                for error in exc.errors(include_input=False, include_context=False)[:6]
+            ),
+        )
+        return None
     except TypeError, ValueError:
         return None
     return validated.model_dump(mode="json", exclude_none=True)
@@ -2478,7 +2493,7 @@ def _provider_retry_delay(
 ) -> float | None:
     if (
         budget is None
-        or budget.retries >= 1
+        or budget.retries >= 2
         or budget.calls >= MAX_OPERATIONAL_PROVIDER_CALLS
         or failure.provider_identifier != "gemini"
         or failure.upstream_http_status not in {429, 500, 502, 503, 504}
@@ -2486,7 +2501,10 @@ def _provider_retry_delay(
         or failure.reason not in {"rate_limited", "server_error"}
     ):
         return None
-    delay = max(random.uniform(0.5, 1.0), failure.retry_after_seconds or 0)
+    delay = max(
+        (2**budget.retries) * random.uniform(0.5, 1.0),
+        failure.retry_after_seconds or 0,
+    )
     timeout_seconds = getattr(
         provider, "timeout_seconds", budget.settings.gemini_request_timeout_seconds
     )
@@ -5399,18 +5417,25 @@ def _run_operational_loop(
         if (
             source is not None
             and {definition.name for definition in definitions} == {PRODUCT_SEARCH_TOOL}
-            and result.semantic_operation
-            not in {PRODUCT_SEARCH_TOOL, "conversation", "knowledge"}
+            and (
+                result.semantic_operation
+                not in {PRODUCT_SEARCH_TOOL, "conversation", "knowledge"}
+                or _is_product_quantity_request(request.messages[-1].content)
+            )
         ):
-            operation = {
-                "product_price": "prices",
-                "sales_summary": "sales",
-                "best_selling_products": "best_sellers",
-                "restocking": "restocking",
-                "inventory_product": "stock",
-                "inventory_category": "stock",
-                "inventory_list": "stock",
-            }.get(result.semantic_operation)
+            operation = (
+                "stock"
+                if _is_product_quantity_request(request.messages[-1].content)
+                else {
+                    "product_price": "prices",
+                    "sales_summary": "sales",
+                    "best_selling_products": "best_sellers",
+                    "restocking": "restocking",
+                    "inventory_product": "stock",
+                    "inventory_category": "stock",
+                    "inventory_list": "stock",
+                }.get(result.semantic_operation)
+            )
             if pending_catalogue is not None:
                 owner.operational_clarification = pending_catalogue.model_dump(
                     mode="json"

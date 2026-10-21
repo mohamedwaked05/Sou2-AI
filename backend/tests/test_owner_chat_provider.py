@@ -817,10 +817,73 @@ def test_category_resolution_returns_only_validated_candidate_references(
         if adapter == "ollama"
         else captured["generationConfig"]["responseJsonSchema"]
     )
-    assert (
-        schema
-        == owner_chat_provider._CategoryResolutionStructuredResult.model_json_schema()
+    expected = (
+        owner_chat_provider._CategoryResolutionStructuredResult.model_json_schema()
     )
+    if adapter == "gemini":
+        expected["properties"]["candidate_references"].update(
+            maxItems=2,
+            items={"type": "string", "enum": ["category-7", "category-8"]},
+        )
+    assert schema == expected
+
+
+def test_gemini_relevance_schema_limits_choices_to_real_opaque_references():
+    request = replace(
+        category_resolution_request(),
+        catalogue_relevance=True,
+        category_candidates=tuple(
+            ProviderCategoryCandidate(
+                external_category_id=str(index), label=f"NESCAFE GOLD {index}"
+            )
+            for index in range(25)
+        ),
+    )
+    provider = gemini_provider(gemini_successful_transport({}))
+    payload = provider._request_payload(request)
+    choices = payload["generationConfig"]["responseJsonSchema"]["properties"][
+        "candidate_references"
+    ]
+    assert choices["items"]["enum"] == [str(index) for index in range(25)]
+    assert "NESCAFE GOLD 0" not in choices["items"]["enum"]
+    assert choices["maxItems"] == 20
+    assert "never product labels" in payload["systemInstruction"]["parts"][0]["text"]
+
+
+def test_gemini_empty_relevance_candidates_allow_only_an_empty_selection():
+    provider = gemini_provider(gemini_successful_transport({}))
+    request = replace(category_resolution_request(), category_candidates=())
+    schema = provider._request_payload(request)["generationConfig"][
+        "responseJsonSchema"
+    ]
+    choices = schema["properties"]["candidate_references"]
+    assert choices["maxItems"] == 0 and "enum" not in choices["items"]
+
+
+def test_gemini_search_contract_requires_a_query_or_explicit_browse():
+    from app.tools.operational import build_operational_tool_registry
+
+    tool = build_operational_tool_registry(timeout_seconds=2)["product_search"]
+    request = replace(
+        operational_request(), tools=(ProviderToolDefinition(**tool.provider_schema()),)
+    )
+    provider = gemini_provider(gemini_successful_transport({}))
+    schema = provider._request_payload(request)["generationConfig"][
+        "responseJsonSchema"
+    ]
+    branch = next(
+        branch
+        for branch in schema["anyOf"]
+        if branch["properties"].get("tool_name", {}).get("enum") == ["product_search"]
+    )
+    selectors = branch["properties"]["arguments"]["anyOf"]
+    query, browse = selectors
+    assert query["required"] == ["query"]
+    assert query["properties"]["query"]["type"] == "string"
+    assert query["properties"]["browse"] == {"type": "null"}
+    assert browse["required"] == ["browse"]
+    assert browse["properties"]["browse"] == {"enum": [True]}
+    assert browse["properties"]["query"] == {"type": "null"}
 
 
 def test_incomplete_typed_preference_plan_is_an_interpreted_intent() -> None:
@@ -2299,6 +2362,13 @@ def test_gemini_wire_tool_branches_use_registry_arguments_and_bounded_sales():
             )
             assert monthly["properties"]["start_date"] == {"type": "null"}
             assert explicit["properties"]["date_range"] == {"type": "null"}
+        elif tool.name == "product_search":
+            expected = owner_chat_provider._compact_planner_schema(tool.input_schema)
+            assert {k: v for k, v in args.items() if k != "anyOf"} == expected
+            assert [option["required"] for option in args["anyOf"]] == [
+                ["query"],
+                ["browse"],
+            ]
         else:
             assert args == owner_chat_provider._compact_planner_schema(
                 tool.input_schema

@@ -645,6 +645,25 @@ def test_stock_unavailable_then_acknowledgement_uses_provider_conversation(
     assert "business_profile" not in instructions
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "how much we have of PEPSI 330ML",
+        "how much do we have",
+        "how many Pepsi do we have",
+    ],
+)
+def test_explicit_quantity_cannot_fall_back_to_catalogue_when_stock_is_unapproved(
+    flow, question
+):
+    flow.owner.content = question
+    provider, calls = offline_provider(plan("PEPSI"))
+    result, usage = run(flow, provider)
+    assert "Inventory access has not been approved" in result.reply
+    assert flow.reads == [] and len(calls) == 1
+    assert usage.total_tokens == 180
+
+
 def selected_context(flow):
     return owner_chat._SelectedCatalogueProduct(
         business_id=flow.business_id,
@@ -1450,7 +1469,7 @@ def test_retry_is_bounded_and_never_weakens_accounting(flow, monkeypatch, block)
         )
     ):
         owner_chat._validated_generation(provider, request, budget)
-    count = 2 if block == "second_failure" else 1
+    count = 3 if block == "second_failure" else 1
     assert len(dispatches) == len(events) == count
     assert budget.usage.total_tokens == count * (
         provider.estimate_input_tokens(request) + 512
@@ -1534,7 +1553,9 @@ def test_retry_charge_survives_operational_plan_and_catalogue_result(flow, monke
     assert result.usage == budget.usage
 
 
-def test_only_one_retry_is_available_across_the_entire_turn(flow, monkeypatch):
+def test_retry_and_success_share_the_three_call_limit_across_the_entire_turn(
+    flow, monkeypatch
+):
     budget, _ = usage_budget(flow, monkeypatch)
     provider, _ = offline_provider(
         {"reply": "Safe", "requires_business_knowledge": False}
@@ -1562,6 +1583,42 @@ def test_only_one_retry_is_available_across_the_entire_turn(flow, monkeypatch):
     with pytest.raises(OwnerChatProviderUnavailable):
         owner_chat._validated_generation(provider, request, budget)
     assert len(attempts) == budget.calls == 3 and budget.retries == 1
+    assert (
+        budget.usage.total_tokens
+        == 2 * (provider.estimate_input_tokens(request) + 512) + 180
+    )
+
+
+def test_two_transient_failures_back_off_exponentially_with_jitter(flow, monkeypatch):
+    budget, events = usage_budget(flow, monkeypatch)
+    delays = []
+    monkeypatch.setattr(owner_chat.time, "sleep", delays.append)
+    monkeypatch.setattr(owner_chat.random, "uniform", lambda low, high: 0.75)
+    provider, _ = offline_provider(
+        {"reply": "Recovered", "requires_business_knowledge": False}
+    )
+    successful_transport = provider.transport
+    attempts = []
+
+    def respond(request):
+        attempts.append(request)
+        if len(attempts) <= 2:
+            return httpx.Response(503, json={"error": {"status": "UNAVAILABLE"}})
+        return successful_transport.handle_request(request)
+
+    provider.transport = httpx.MockTransport(respond)
+    request = OwnerChatRequest(
+        profile=PROFILE,
+        knowledge=(),
+        messages=(ProviderMessage("owner", "hi"),),
+        requested_at=NOW,
+        mode="conversation",
+    )
+    result = owner_chat._validated_generation(provider, request, budget)
+    assert result.reply == "Recovered"
+    assert delays == [0.75, 1.5]
+    assert len(attempts) == len(events) == budget.calls == 3
+    assert budget.retries == 2
     assert (
         budget.usage.total_tokens
         == 2 * (provider.estimate_input_tokens(request) + 512) + 180
@@ -1795,6 +1852,33 @@ def test_relevance_failure_does_not_return_unfiltered_products(flow):
             None,
         )
     assert caught.value.reason == "relevance"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"query": "water", "browse": True},
+        {"semantic_query": "drinkable water", "search_queries": ["water"]},
+        {"query": 7},
+        {"private-token-key": "private-token-value"},
+    ],
+)
+def test_invalid_search_arguments_are_rejected_without_logging_values(
+    flow, caplog, arguments
+):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="app.services.owner_chat"):
+        assert (
+            owner_chat._validated_provider_arguments(
+                flow.executor, "product_search", arguments
+            )
+            is None
+        )
+    assert "owner_chat_tool_arguments_invalid" in caplog.text
+    assert "private-token-key" not in caplog.text
+    assert "private-token-value" not in caplog.text
+    assert "drinkable water" not in caplog.text
 
 
 def test_operational_planner_receives_bounded_completed_context(flow, monkeypatch):

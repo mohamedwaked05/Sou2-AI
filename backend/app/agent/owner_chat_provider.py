@@ -1702,6 +1702,24 @@ def _gemini_operational_response_schema(request: OwnerChatRequest) -> dict[str, 
     for tool in request.tools:
         arguments = _compact_planner_schema(tool.input_schema)
         properties = arguments.get("properties", {})
+        if tool.name == "product_search" and {"query", "browse"} <= properties.keys():
+            # Match CatalogueRequest.one_selector on the wire as well as locally.
+            arguments["anyOf"] = [
+                {
+                    "required": ["query"],
+                    "properties": {
+                        "query": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "browse": {"type": "null"},
+                    },
+                },
+                {
+                    "required": ["browse"],
+                    "properties": {
+                        "browse": {"enum": [True]},
+                        "query": {"type": "null"},
+                    },
+                },
+            ]
         if {"metric", "date_range", "start_date", "end_date"} <= properties.keys():
             # Define the fields once; anyOf requires a metric and one bounded period.
             properties["metric"] = next(
@@ -1842,7 +1860,9 @@ def _category_resolution_instructions(request: OwnerChatRequest) -> str:
             "supplied references, most relevant first, at most 20. Use status matched "
             "for one, ambiguous for multiple relevant products (these are discovery "
             "results, not a required choice), no_match for none. No SQL, tool calls "
-            "or invented products. Candidates follow:\n"
+            "or invented products. candidate_references must contain only the exact "
+            "external_category_id strings supplied below, never product labels. "
+            "Candidates follow:\n"
             f"{json.dumps(candidates, ensure_ascii=False, separators=(',', ':'))}"
         )
     return (
@@ -3329,6 +3349,17 @@ class GeminiOwnerChatProvider:
 
     def _request_payload(self, request: OwnerChatRequest) -> dict[str, Any]:
         if request.mode == "category_resolution":
+            schema = _CategoryResolutionStructuredResult.model_json_schema()
+            references = schema["properties"]["candidate_references"]
+            references["maxItems"] = min(
+                len(request.category_candidates),
+                20 if request.catalogue_relevance else len(request.category_candidates),
+            )
+            if request.category_candidates:
+                references["items"]["enum"] = [
+                    candidate.external_category_id
+                    for candidate in request.category_candidates
+                ]
             return {
                 "systemInstruction": {
                     "parts": [{"text": _category_resolution_instructions(request)}]
@@ -3342,9 +3373,7 @@ class GeminiOwnerChatProvider:
                 "generationConfig": {
                     "maxOutputTokens": request.max_output_tokens,
                     "responseMimeType": "application/json",
-                    "responseJsonSchema": (
-                        _CategoryResolutionStructuredResult.model_json_schema()
-                    ),
+                    "responseJsonSchema": schema,
                     "thinkingConfig": self._thinking_config(category_resolution=True),
                 },
             }
