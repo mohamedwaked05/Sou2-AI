@@ -390,18 +390,28 @@ it("discards late history from another business with the same conversation ID", 
   expect(screen.getByRole("textbox")).toBeEnabled();
 });
 
-it("uses a fresh turn key after a terminal chat rate limit", async () => {
-  const post = vi
-    .spyOn(api, "sendConversationMessage")
-    .mockRejectedValueOnce(
-      new ApiError(429, "owner_chat_rate_limited", "Try later.", 12),
-    )
-    .mockResolvedValueOnce({});
-  workspace();
-  await send("sho fi 3endak anwe3 roz");
-  expect(await screen.findByRole("alert")).toHaveTextContent("Try again in 12 seconds");
-  const firstKey = post.mock.calls[0][3];
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
-  expect(post.mock.calls[1][3]).not.toBe(firstKey);
-});
+it.each(["owner_chat_rate_limited", "assistant_unavailable"])(
+  "uses a fresh turn key after terminal %s",
+  async (code) => {
+    const post = vi
+      .spyOn(api, "sendConversationMessage")
+      .mockRejectedValueOnce(
+        new ApiError(
+          code === "owner_chat_rate_limited" ? 429 : 503,
+          code,
+          "Try later.",
+          12,
+        ),
+      )
+      .mockResolvedValueOnce({});
+    workspace();
+    await send("sho fi 3endak anwe3 roz");
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      code === "owner_chat_rate_limited" ? "Try again in 12 seconds" : "Try later.",
+    );
+    const firstKey = post.mock.calls[0][3];
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+    expect(post.mock.calls[1][3]).not.toBe(firstKey);
+  },
+);

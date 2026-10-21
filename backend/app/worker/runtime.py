@@ -42,6 +42,19 @@ class PrivacySafeWorker(Worker):
         )
         return super().work(*args, **kwargs)
 
+    def heartbeat(self, timeout=None, pipeline=None):
+        # Redis TTLs keep advancing while a development host is asleep. RQ's
+        # heartbeat alone recreates an expired hash with only last_heartbeat.
+        # Refresh the running worker's own RQ identity and in-memory state in the
+        # same transaction as its heartbeat; retain job fields and all history.
+        if pipeline is None:
+            with self.connection.pipeline() as transaction:
+                self.heartbeat(timeout, pipeline=transaction)
+                transaction.execute()
+            return
+        super().heartbeat(timeout, pipeline=pipeline)
+        pipeline.hset(self.key, mapping={**self.serialize(), "state": self.get_state()})
+
     def handle_exception(self, job, *exc_info):
         self.log.error(
             "worker_job_failed job_id=%s exception_type=%s",

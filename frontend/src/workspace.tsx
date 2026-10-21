@@ -879,6 +879,7 @@ function ChatPage({
           "assistant_invalid_response",
           "assistant_transport_failure",
           "assistant_rate_limited",
+          "assistant_unavailable",
           "owner_chat_rate_limited",
         ].includes(caught.code) &&
         pendingTurns.get(scope)?.key === key

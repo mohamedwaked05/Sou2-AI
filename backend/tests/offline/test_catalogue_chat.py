@@ -1720,7 +1720,7 @@ def test_user_errors_distinguish_failure_without_provider_details(failure, code)
         ("rice varieties", "rice", "BASMATI RICE", "RICE FACE CREAM"),
         ("sho 3endak shi eshrabo", "water", "RIM WATER", "FABRIC SOFTENER WATER"),
         ("sho fi 3endak anwe3 roz", "rice", "LONG GRAIN RICE", "RICE SOAP"),
-        ("?? ???? ?? ?????", "water", "AQUAFINA WATER", "WATER SOAP"),
+        ("شو عندك شي اشربه", "water", "AQUAFINA WATER", "WATER SOAP"),
         ("just the drinkable ones", "water", "RIM WATER", "TUNA WATER"),
         ("sparkling", "sparkling", "RIM SPARKLING WATER", "AIR WICK SPARKLING CITRUS"),
     ],
