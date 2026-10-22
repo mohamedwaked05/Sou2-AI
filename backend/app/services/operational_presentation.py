@@ -332,6 +332,14 @@ def render_operational(view: OperationalPresentation, safe: SafeField) -> str:
             + coverage_note
         )
         if not output.items:
+            if output.search_semantics == "semantic":
+                return text(
+                    "No matching catalogue products were verified in the retrieved "
+                    "candidates. "
+                    "Try a product type or brand. Stock and prices are unknown.",
+                    "لم يتم التحقق من منتجات مطابقة ضمن نتائج الكتالوج المسترجعة. "
+                    "حدد نوع المنتج أو العلامة التجارية. المخزون والأسعار غير معروفة.",
+                )
             return (
                 coverage_note.strip()
                 + (" " if coverage_note else "")

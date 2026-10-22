@@ -4781,7 +4781,23 @@ def _search_relevant_catalogue(
             request,
             mode="category_resolution",
             catalogue_relevance=True,
-            messages=(ProviderMessage("owner", str(intent)),),
+            messages=(
+                ProviderMessage(
+                    "owner",
+                    json.dumps(
+                        {
+                            "current_request": request.messages[-1].content,
+                            "preceding_owner_requests": [
+                                message.content
+                                for message in request.messages[:-1]
+                                if message.role == "owner"
+                            ][-2:],
+                            "proposed_interpretation": str(intent),
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            ),
             tools=(),
             tool_results=(),
             pending_clarification=None,

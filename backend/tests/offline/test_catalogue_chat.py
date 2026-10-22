@@ -1852,14 +1852,23 @@ def test_semantic_candidates_are_filtered_before_display(
     request = OwnerChatRequest(
         profile=PROFILE,
         knowledge=(),
-        messages=(ProviderMessage("owner", question),),
+        messages=(
+            ProviderMessage("owner", "rice varieties"),
+            ProviderMessage("assistant", "Earlier rice catalogue rows"),
+            ProviderMessage("owner", question),
+        ),
         requested_at=NOW,
     )
+    interpretation = "rice drinks" if question == "something to drink" else question
     result, usage = owner_chat._search_relevant_catalogue(
         flow.executor,
         flow.user,
         flow.business_id,
-        {"query": term, "semantic_query": question, "search_queries": [term, term]},
+        {
+            "query": term,
+            "semantic_query": interpretation,
+            "search_queries": [term, term],
+        },
         provider,
         request,
         None,
@@ -1872,6 +1881,28 @@ def test_semantic_candidates_are_filtered_before_display(
     assert usage.total_tokens == 180
     assert "not keyword overlap" in calls[0]["systemInstruction"]["parts"][0]["text"]
     assert "good" not in calls[0]["systemInstruction"]["parts"][0]["text"]
+    assert (
+        "proposed_interpretation is advisory"
+        in calls[0]["systemInstruction"]["parts"][0]["text"]
+    )
+    supplied = json.loads(calls[0]["contents"][0]["parts"][0]["text"])
+    assert supplied == {
+        "current_request": question,
+        "preceding_owner_requests": ["rice varieties"],
+        "proposed_interpretation": interpretation,
+    }
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+def test_empty_semantic_selection_does_not_claim_matches_exceed_display_limit(
+    truncated,
+):
+    output = catalogue().model_copy(
+        update={"search_semantics": "semantic", "truncated": truncated}
+    )
+    reply = owner_chat._catalogue_reply(output)
+    assert "No matching catalogue products were verified" in reply
+    assert "display limit" not in reply and "Stock and prices are unknown" in reply
 
 
 @pytest.mark.parametrize("browse", [False, None])
