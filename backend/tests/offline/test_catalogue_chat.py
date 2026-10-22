@@ -1553,6 +1553,49 @@ def test_retry_charge_survives_operational_plan_and_catalogue_result(flow, monke
     assert result.usage == budget.usage
 
 
+@pytest.mark.parametrize("failures", [{1, 2}, {1, 3}, {2, 3}])
+def test_two_transient_retries_leave_room_for_mandatory_catalogue_filter(
+    flow, monkeypatch, failures
+):
+    budget, events = usage_budget(flow, monkeypatch)
+    lookup = plan()
+    lookup["arguments"]["semantic_query"] = "Pepsi drinks"
+    provider, successful_calls = offline_provider(
+        lookup, {"status": "ambiguous", "candidate_references": ["0", "1"]}
+    )
+    success = provider.transport
+    attempts = []
+
+    def respond(request):
+        attempts.append(request)
+        if len(attempts) in failures:
+            return httpx.Response(503)
+        return success.handle_request(request)
+
+    provider.transport = httpx.MockTransport(respond)
+    result, usage = run(flow, provider, budget)
+    assert "PEPSI MINI" in result.reply and "PEPSI DIET MINI" in result.reply
+    assert len(attempts) == len(events) == budget.calls == 4
+    assert len(successful_calls) == 2 and budget.retries == 2
+    assert usage == budget.usage == result.usage
+    assert usage.total_tokens > 2 * 512 + 2 * 180
+    assert events[-1][0] == "resize"
+    assert events[-1][1]["max_output_tokens"] > 2 * 512
+    # The final filter's allowance cannot turn into another planning loop or
+    # another retry, even after an otherwise successful catalogue result.
+    request = OwnerChatRequest(
+        profile=PROFILE,
+        knowledge=(),
+        messages=(ProviderMessage("owner", "Pepsi drinks"),),
+        requested_at=NOW,
+        mode="category_resolution",
+        catalogue_relevance=True,
+    )
+    with pytest.raises(OwnerChatProviderInvalidResponse) as caught:
+        owner_chat._validated_generation(provider, request, budget)
+    assert caught.value.reason == "provider_call_limit" and len(attempts) == 4
+
+
 def test_retry_and_success_share_the_three_call_limit_across_the_entire_turn(
     flow, monkeypatch
 ):

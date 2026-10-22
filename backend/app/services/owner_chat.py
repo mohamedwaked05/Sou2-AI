@@ -287,9 +287,19 @@ class _OperationalUsageBudget:
                 reason="turn_deadline", usage=self.usage, usage_uncertain=False
             )
 
+    def call_limit(self, request: OwnerChatRequest, *, retrying: bool = False) -> int:
+        # A catalogue turn needs both a planner and a relevance decision. Keep
+        # room for the final decision after the existing bounded retries.
+        final_filter_retry = (
+            request.mode == "category_resolution"
+            and request.catalogue_relevance
+            and (self.retries > 0 or retrying)
+        )
+        return MAX_OPERATIONAL_PROVIDER_CALLS + int(final_filter_retry)
+
     def admit(self, provider: OwnerChatProvider, request: OwnerChatRequest) -> None:
         self.ensure_active()
-        if self.calls >= MAX_OPERATIONAL_PROVIDER_CALLS:
+        if self.calls >= self.call_limit(request):
             raise OwnerChatProviderInvalidResponse(
                 reason="provider_call_limit", usage=self.usage, usage_uncertain=False
             )
@@ -2480,7 +2490,7 @@ def _validated_generation(
                 budget.usage = _add_usage(
                     budget.usage, _provider_failure_usage(provider, request, exc)
                 )
-            delay = _provider_retry_delay(provider, exc, budget)
+            delay = _provider_retry_delay(provider, exc, budget, request)
             if delay is None:
                 raise
             budget.retries += 1
@@ -2504,11 +2514,12 @@ def _provider_retry_delay(
     provider: OwnerChatProvider,
     failure: OwnerChatProviderError,
     budget: _OperationalUsageBudget | None,
+    request: OwnerChatRequest,
 ) -> float | None:
     if (
         budget is None
         or budget.retries >= 2
-        or budget.calls >= MAX_OPERATIONAL_PROVIDER_CALLS
+        or budget.calls >= budget.call_limit(request, retrying=True)
         or failure.provider_identifier != "gemini"
         or failure.upstream_http_status not in {429, 500, 502, 503, 504}
         or not isinstance(failure, OwnerChatProviderUnavailable)
