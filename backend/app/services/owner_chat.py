@@ -4974,6 +4974,42 @@ def _run_operational_loop(
             )
             if (
                 isinstance(exc, OwnerChatProviderInvalidResponse)
+                and exc.reason == "schema_validation_failed"
+                and not definitions
+                and getattr(source, "mapping_profile_key", None)
+                == "discovered_products"
+            ):
+                from app.services.catalogue_quality import (
+                    latest_event as catalogue_event,
+                )
+
+                event = catalogue_event(session, source)
+                if (
+                    event is not None
+                    and event.approval_type == "partial"
+                    and event.expires_at <= utc_now()
+                ):
+                    recovered_usage = (
+                        budget.usage
+                        if budget is not None
+                        else _add_usage(
+                            aggregate_usage,
+                            _provider_failure_usage(provider, request, exc),
+                        )
+                    )
+                    unavailable = _catalogue_lookup_unavailable(
+                        request.messages[-1].content,
+                        prepared.business.default_language,
+                        approval_expired=True,
+                    )
+                    return replace(
+                        unavailable,
+                        usage=recovered_usage,
+                        provider_identifier=exc.provider_identifier,
+                        model_identifier=exc.model_identifier,
+                    ), recovered_usage
+            if (
+                isinstance(exc, OwnerChatProviderInvalidResponse)
                 and exc.usage is not None
                 and exc.usage.authoritative
                 and (request.pending_clarification or {}).get("operation")

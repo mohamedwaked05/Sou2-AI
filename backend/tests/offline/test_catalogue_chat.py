@@ -1986,3 +1986,56 @@ def test_semantic_search_reports_expired_catalogue_approval_without_a_source_rea
     assert "catalogue-only approval" in result.reply
     assert "Specify a product" not in result.reply
     assert flow.reads == [] and len(calls) == 1 and usage.total_tokens == 180
+
+
+@pytest.mark.parametrize("use_budget", [False, True])
+@pytest.mark.parametrize("reported_usage", [False, True])
+@pytest.mark.parametrize("condition", ["expired", "current", "registered_tools"])
+def test_rejected_plan_reports_only_verified_expired_approval_and_keeps_usage(
+    flow, monkeypatch, use_budget, condition, reported_usage
+):
+    from app.services import catalogue_quality
+
+    if condition != "registered_tools":
+        flow.definitions = ()
+    monkeypatch.setattr(
+        catalogue_quality,
+        "latest_event",
+        lambda *_args: SimpleNamespace(
+            approval_type="partial",
+            expires_at=NOW + timedelta(seconds=60 if condition == "current" else -1),
+        ),
+    )
+    provider, calls = offline_provider(
+        {
+            "decision": "final",
+            "semantic_operation": "product_search",
+            "entity_kind": "product",
+            "entity_query": "water",
+            "reply": "Unvalidated products must never be shown.",
+        }
+    )
+    monkeypatch.setattr(provider, "estimate_input_tokens", lambda _request: 17)
+    if not reported_usage:
+        original = provider.transport
+
+        def unreported(request):
+            response = original.handle_request(request)
+            body = response.json()
+            body.pop("usageMetadata", None)
+            return httpx.Response(200, json=body)
+
+        provider.transport = httpx.MockTransport(unreported)
+    charge = 180 if reported_usage else 17 + 512
+    budget, events = usage_budget(flow, monkeypatch) if use_budget else (None, [])
+    if condition == "expired":
+        result, usage = run(flow, provider, budget)
+        assert "Catalogue approval has expired" in result.reply
+        assert "Unvalidated products" not in result.reply
+        assert usage.total_tokens == result.usage.total_tokens == charge
+    else:
+        with pytest.raises(OwnerChatProviderInvalidResponse):
+            run(flow, provider, budget)
+    assert flow.reads == [] and len(calls) == 1
+    if use_budget:
+        assert budget.usage.total_tokens == charge and budget.calls == len(events) == 1
