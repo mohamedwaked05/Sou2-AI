@@ -2522,7 +2522,11 @@ def _provider_retry_delay(
     timeout_seconds = getattr(
         provider, "timeout_seconds", budget.settings.gemini_request_timeout_seconds
     )
-    if delay > 5 or budget.remaining_seconds() <= delay + timeout_seconds + 1:
+    # Dispatch already caps the provider timeout to the remaining turn lease.
+    # Leave a useful retry window plus finalization time instead of demanding
+    # the full configured timeout after a later stage's transient failure.
+    retry_window = min(timeout_seconds, 10)
+    if delay > 5 or budget.remaining_seconds() <= delay + retry_window + 1:
         return None
     return delay
 

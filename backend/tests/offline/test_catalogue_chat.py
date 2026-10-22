@@ -1625,6 +1625,51 @@ def test_two_transient_failures_back_off_exponentially_with_jitter(flow, monkeyp
     )
 
 
+@pytest.mark.parametrize("seconds,attempt_count", [(30, 2), (10, 1)])
+def test_late_stage_retry_uses_remaining_lease_without_requiring_full_timeout(
+    flow, monkeypatch, seconds, attempt_count
+):
+    budget, events = usage_budget(flow, monkeypatch)
+    budget.deadline = NOW + timedelta(seconds=seconds)
+    budget.calls = 1  # The planner has already used one of the three calls.
+    monkeypatch.setattr(owner_chat.random, "uniform", lambda *_: 0.75)
+    provider, _ = offline_provider(
+        {"reply": "Recovered", "requires_business_knowledge": False}
+    )
+    provider.timeout_seconds = 120
+    success = provider.transport
+    attempts = []
+
+    def respond(request):
+        attempts.append(request)
+        return (
+            httpx.Response(503)
+            if len(attempts) == 1
+            else success.handle_request(request)
+        )
+
+    provider.transport = httpx.MockTransport(respond)
+    request = OwnerChatRequest(
+        profile=PROFILE,
+        knowledge=(),
+        messages=(ProviderMessage("owner", "hi"),),
+        requested_at=NOW,
+        mode="conversation",
+    )
+    if attempt_count == 2:
+        assert (
+            owner_chat._validated_generation(provider, request, budget).reply
+            == "Recovered"
+        )
+        assert budget.retries == 1 and budget.calls == 3
+        assert budget.usage.total_tokens > 180
+    else:
+        with pytest.raises(OwnerChatProviderUnavailable):
+            owner_chat._validated_generation(provider, request, budget)
+        assert budget.retries == 0 and budget.calls == 2
+    assert len(attempts) == len(events) == attempt_count
+
+
 def test_dispatch_timeout_is_capped_to_remaining_claim(flow, monkeypatch):
     budget, _ = usage_budget(flow, monkeypatch)
     budget.deadline = NOW + timedelta(seconds=7)
