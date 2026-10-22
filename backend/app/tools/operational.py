@@ -141,12 +141,20 @@ class CurrentInventoryPlannerInput(BaseModel):
 class ProductSearchPlannerInput(CatalogueRequest):
     """Planner discovery selectors; source IDs/cursors are backend-only."""
 
+    browse: bool | None = None
     external_product_id: None = None
     mapping_version: None = None
     continuation: None = None
 
     semantic_query: str | None = Field(default=None, min_length=1, max_length=255)
     search_queries: tuple[str, ...] = Field(default=(), max_length=6)
+
+    @field_validator("browse")
+    @classmethod
+    def omit_disabled_browse(cls, value: bool | None) -> bool | None:
+        # A planner's explicit false means no browse selector. The inherited
+        # one-selector rule still requires a query, and execution stays strict.
+        return None if value is False else value
 
 
 class BestSellingProductsToolInput(BestSellersQuery):

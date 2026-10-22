@@ -1829,6 +1829,24 @@ def test_semantic_candidates_are_filtered_before_display(
     assert "good" not in calls[0]["systemInstruction"]["parts"][0]["text"]
 
 
+@pytest.mark.parametrize("browse", [False, None])
+def test_query_with_disabled_browse_is_canonicalized_before_execution(flow, browse):
+    arguments = owner_chat._validated_provider_arguments(
+        flow.executor,
+        "product_search",
+        {"query": "water", "semantic_query": "drinking water", "browse": browse},
+    )
+    assert arguments is not None and "browse" not in arguments
+    assert arguments["query"] == "water"
+    assert arguments["semantic_query"] == "drinking water"
+    # The executable API still accepts only a query OR an explicit true browse.
+    from app.schemas.source_mapping import CatalogueRequest
+
+    CatalogueRequest.model_validate({"query": arguments["query"]})
+    with pytest.raises(ValueError):
+        CatalogueRequest.model_validate({"query": "water", "browse": False})
+
+
 def test_relevance_failure_does_not_return_unfiltered_products(flow):
     provider, _ = offline_provider(
         {"status": "matched", "candidate_references": ["invented"]}
@@ -1858,6 +1876,9 @@ def test_relevance_failure_does_not_return_unfiltered_products(flow):
     "arguments",
     [
         {"query": "water", "browse": True},
+        {"browse": False},
+        {"query": "water", "browse": "false"},
+        {"query": "water", "browse": 0},
         {"semantic_query": "drinkable water", "search_queries": ["water"]},
         {"query": 7},
         {"private-token-key": "private-token-value"},

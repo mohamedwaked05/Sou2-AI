@@ -1461,7 +1461,8 @@ def _operational_instructions(
         "union of candidates that the backend will check for semantic relevance. "
         "Use broad product nouns, not request words such as brands, products, "
         "varieties or drinkable. Resolve Arabizi to the product concept. "
-        "browse=true is only for an explicit all-products request. Category filters "
+        "browse=true is only for an explicit all-products request; omit browse "
+        "when supplying a query. Category filters "
         "use approved source labels. Never invent a source category. "
         "Use preceding messages only to interpret a follow-up, including filtering, "
         "prices and quantities. Carry the original product concept and all current "
@@ -1703,13 +1704,14 @@ def _gemini_operational_response_schema(request: OwnerChatRequest) -> dict[str, 
         arguments = _compact_planner_schema(tool.input_schema)
         properties = arguments.get("properties", {})
         if tool.name == "product_search" and {"query", "browse"} <= properties.keys():
-            # Match CatalogueRequest.one_selector on the wire as well as locally.
+            # A disabled browse is canonicalized to an omitted selector; queries
+            # and an enabled browse remain mutually exclusive at execution.
             arguments["anyOf"] = [
                 {
                     "required": ["query"],
                     "properties": {
                         "query": {"type": "string", "minLength": 1, "maxLength": 128},
-                        "browse": {"type": "null"},
+                        "browse": {"enum": [False, None]},
                     },
                 },
                 {
@@ -2974,9 +2976,10 @@ class GeminiOwnerChatProvider:
         category_resolution: bool = False,
         conversation: bool = False,
     ) -> dict[str, Any]:
-        if (
-            planner or category_resolution or conversation
-        ) and self.model in {"gemini-3.1-flash-lite", "gemini-3.5-flash-lite"}:
+        if (planner or category_resolution or conversation) and self.model in {
+            "gemini-3.1-flash-lite",
+            "gemini-3.5-flash-lite",
+        }:
             # Bound reasoning in short structured replies after MAX_TOKENS failures.
             # Preserve the existing token reservation and reject truncated output.
             return {"thinkingLevel": "MINIMAL", "includeThoughts": False}

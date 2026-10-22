@@ -880,7 +880,7 @@ def test_gemini_search_contract_requires_a_query_or_explicit_browse():
     query, browse = selectors
     assert query["required"] == ["query"]
     assert query["properties"]["query"]["type"] == "string"
-    assert query["properties"]["browse"] == {"type": "null"}
+    assert query["properties"]["browse"] == {"enum": [False, None]}
     assert browse["required"] == ["browse"]
     assert browse["properties"]["browse"] == {"enum": [True]}
     assert browse["properties"]["query"] == {"type": "null"}
