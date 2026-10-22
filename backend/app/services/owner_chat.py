@@ -1002,7 +1002,21 @@ def _literal_catalogue_query(value: str) -> str | None:
     return query
 
 
-def _catalogue_lookup_unavailable(message: str, language: str) -> OwnerChatResult:
+def _catalogue_lookup_unavailable(
+    message: str, language: str, *, approval_expired: bool = False
+) -> OwnerChatResult:
+    if approval_expired:
+        return OwnerChatResult(
+            reply=(
+                "انتهت صلاحية موافقة الكتالوج. جدّد موافقة الكتالوج فقط في مصادر "
+                "البيانات قبل البحث عن المنتجات. المخزون والأسعار غير معروفين."
+                if _fallback_language(message, language)
+                in {"arabic", "lebanese_arabic", "mixed"}
+                else "Catalogue approval has expired. Renew catalogue-only approval "
+                "in Data Sources before searching products. "
+                "Stock and prices are unknown."
+            )
+        )
     if _fallback_language(message, language) in {"arabic", "lebanese_arabic", "mixed"}:
         return OwnerChatResult(
             reply=(
@@ -5465,6 +5479,27 @@ def _run_operational_loop(
             and result.semantic_operation == PRODUCT_SEARCH_TOOL
             and command is None
         ):
+            if not any(tool.name == PRODUCT_SEARCH_TOOL for tool in definitions):
+                from app.services.catalogue_quality import (
+                    latest_event as catalogue_event,
+                )
+
+                event = catalogue_event(session, source)
+                unavailable = _catalogue_lookup_unavailable(
+                    request.messages[-1].content,
+                    prepared.business.default_language,
+                    approval_expired=(
+                        event is not None
+                        and event.approval_type == "partial"
+                        and event.expires_at <= utc_now()
+                    ),
+                )
+                return replace(
+                    unavailable,
+                    usage=aggregate_usage,
+                    provider_identifier=result.provider_identifier,
+                    model_identifier=result.model_identifier,
+                ), aggregate_usage
             return OwnerChatResult(
                 reply=render_capability_gap(
                     "product_reference",
@@ -7219,9 +7254,24 @@ def _generate_claimed_turn(
                 else ()
             )
             if not available and (is_live_operational or catalogue_lookup):
+                source = executor._active_source(business_id) if executor else None
+                catalogue_expired = False
+                if source is not None and catalogue_lookup:
+                    from app.services.catalogue_quality import (
+                        latest_event as catalogue_event,
+                    )
+
+                    event = catalogue_event(session, source)
+                    catalogue_expired = (
+                        event is not None
+                        and event.approval_type == "partial"
+                        and event.expires_at <= utc_now()
+                    )
                 live_result = (
                     _catalogue_lookup_unavailable(
-                        owner_message.content, business.default_language
+                        owner_message.content,
+                        business.default_language,
+                        approval_expired=catalogue_expired,
                     )
                     if catalogue_lookup
                     else OwnerChatResult(
@@ -7230,6 +7280,38 @@ def _generate_claimed_turn(
                         )
                     )
                 )
+                if (
+                    getattr(source, "mapping_profile_key", None)
+                    == "discovered_products"
+                ):
+                    families = {
+                        "inventory": ("stock", "inventory"),
+                        "sales": ("sales", "sales"),
+                        "revenue": ("revenue", "financial"),
+                    }
+                    concepts = _query_concepts(owner_message.content) & families.keys()
+                    if len(concepts) == 1:
+                        from app.services.capabilities import (
+                            latest_event as capability_event,
+                        )
+
+                        operation, family = families[next(iter(concepts))]
+                        event = capability_event(session, source, family)
+                        reason = (
+                            "unapproved"
+                            if event is None or event.approval_type != "full"
+                            else "validation"
+                            if event.expires_at <= utc_now()
+                            else "unavailable"
+                        )
+                        live_result = OwnerChatResult(
+                            reply=_capability_unavailable_reply(
+                                operation,
+                                reason,
+                                owner_message.content,
+                                business.default_language,
+                            )
+                        )
                 _persist_result(
                     session, business_id, claim, live_result, None, None, ()
                 )

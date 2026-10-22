@@ -1896,3 +1896,93 @@ def test_operational_planner_receives_bounded_completed_context(flow, monkeypatc
         flow.definitions,
     )
     assert built.request.messages == history[-5:]
+
+
+@pytest.mark.parametrize(
+    "question,family,label",
+    [
+        ("how much we have of PEPSI 330ML", "inventory", "Inventory"),
+        ("sales", "sales", "Sales"),
+        ("latest revenue", "financial", "Financial reporting"),
+    ],
+)
+@pytest.mark.parametrize("approval", ["missing", "expired", "revoked", "valid"])
+def test_empty_tool_registry_preserves_the_specific_capability_gate(
+    flow, monkeypatch, question, family, label, approval
+):
+    from app.services import capabilities
+
+    flow.owner.content = question
+    business = SimpleNamespace(id=flow.business_id, default_language="en")
+    original_get = flow.session.get
+    monkeypatch.setattr(
+        flow.session,
+        "get",
+        lambda model, key: business if model is Business else original_get(model, key),
+    )
+    flow.executor.available_definitions = lambda *_args: ()
+    monkeypatch.setattr(
+        owner_chat, "OperationalToolExecutor", lambda *_args: flow.executor
+    )
+
+    def event(session, source, requested_family):
+        assert source is flow.source and requested_family == family
+        if approval == "missing":
+            return None
+        return SimpleNamespace(
+            approval_type="revoked" if approval == "revoked" else "full",
+            expires_at=NOW + timedelta(seconds=-1 if approval == "expired" else 60),
+        )
+
+    monkeypatch.setattr(capabilities, "latest_event", event)
+    saved = []
+    monkeypatch.setattr(owner_chat, "_persist_result", lambda *args: saved.append(args))
+    provider, calls = offline_provider()
+    assert owner_chat._generate_claimed_turn(
+        flow.session,
+        flow.business_id,
+        flow.claim,
+        flow.user,
+        provider,
+        Settings(_env_file=None),
+        object(),
+    )
+    answer = saved[0][3].reply
+    assert label in answer
+    assert (
+        "has not been approved"
+        if approval in {"missing", "revoked"}
+        else "needs revalidation or renewed approval"
+        if approval == "expired"
+        else "is currently unavailable"
+    ) in answer
+    assert calls == flow.reads == []
+    assert saved[0][4:6] == (None, None)
+
+
+def test_semantic_search_reports_expired_catalogue_approval_without_a_source_read(
+    flow, monkeypatch
+):
+    from app.services import catalogue_quality
+
+    flow.definitions = ()
+    flow.owner.content = "drinkable water"
+    monkeypatch.setattr(
+        catalogue_quality,
+        "latest_event",
+        lambda *_args: SimpleNamespace(
+            approval_type="partial", expires_at=NOW - timedelta(seconds=1)
+        ),
+    )
+    provider, calls = offline_provider(
+        {
+            "decision": "final",
+            "semantic_operation": "product_search",
+            "reply": "Here are water products.",
+        }
+    )
+    result, usage = run(flow, provider)
+    assert "Catalogue approval has expired" in result.reply
+    assert "catalogue-only approval" in result.reply
+    assert "Specify a product" not in result.reply
+    assert flow.reads == [] and len(calls) == 1 and usage.total_tokens == 180
