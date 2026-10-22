@@ -1058,10 +1058,20 @@ class _CategoryResolutionStructuredResult(BaseModel):
     candidate_references: list[str] = []
 
     @model_validator(mode="after")
-    def validate_references(self) -> _CategoryResolutionStructuredResult:
+    def validate_references(
+        self, info: ValidationInfo
+    ) -> _CategoryResolutionStructuredResult:
         count = len(self.candidate_references)
         if len(set(self.candidate_references)) != count:
-            raise _structured_validation_error("category_duplicate_references")
+            if not (info.context or {}).get("catalogue_relevance"):
+                raise _structured_validation_error("category_duplicate_references")
+            # Repeating a read-only product reference adds no new selection.
+            # Keep ordinary category choices strict and validate all remaining
+            # references against the supplied candidates in the service.
+            self.candidate_references = list(dict.fromkeys(self.candidate_references))
+            count = len(self.candidate_references)
+            if self.status == "ambiguous" and count == 1:
+                self.status = "matched"
         if (
             (self.status == "matched" and count != 1)
             or (self.status == "ambiguous" and count < 2)
@@ -2454,7 +2464,10 @@ class OllamaOwnerChatProvider:
                 elif request.mode == "category_resolution":
                     category_result = (
                         _CategoryResolutionStructuredResult.model_validate_json(
-                            envelope.message.content
+                            envelope.message.content,
+                            context={
+                                "catalogue_relevance": request.catalogue_relevance
+                            },
                         )
                     )
                     reply = ""
@@ -3076,6 +3089,7 @@ class GeminiOwnerChatProvider:
                     response_payload,
                     response_model,
                     validation_context={
+                        "catalogue_relevance": request.catalogue_relevance,
                         "operational_contract": request.mode == "operational",
                         "pending_operation": (request.pending_clarification or {}).get(
                             "operation"

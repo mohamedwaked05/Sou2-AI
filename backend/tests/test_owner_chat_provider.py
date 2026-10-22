@@ -518,6 +518,42 @@ def test_category_model_validator_branches_have_stable_reason_codes(
     assert raised.value.errors(include_input=False)[0]["type"] == reason
 
 
+@pytest.mark.parametrize(
+    "status,references,expected_status,expected",
+    [
+        ("ambiguous", ["0", "0", "1"], "ambiguous", ["0", "1"]),
+        ("ambiguous", ["0", "0"], "matched", ["0"]),
+        ("matched", ["0", "0"], "matched", ["0"]),
+    ],
+)
+def test_read_only_relevance_deduplicates_without_changing_selected_products(
+    status, references, expected_status, expected
+):
+    result = owner_chat_provider._CategoryResolutionStructuredResult.model_validate(
+        {"status": status, "candidate_references": references},
+        context={"catalogue_relevance": True},
+    )
+    assert result.status == expected_status and result.candidate_references == expected
+    with pytest.raises(ValidationError):
+        owner_chat_provider._CategoryResolutionStructuredResult.model_validate(
+            {"status": "no_match", "candidate_references": references},
+            context={"catalogue_relevance": True},
+        )
+
+
+def test_gemini_applies_reference_canonicalization_only_to_catalogue_relevance():
+    payload = {
+        "status": "ambiguous",
+        "candidate_references": ["category-7", "category-7", "category-8"],
+    }
+    provider = gemini_provider(gemini_successful_transport(payload))
+    request = replace(category_resolution_request(), catalogue_relevance=True)
+    result = provider.generate(request)
+    assert result.category_candidate_references == ("category-7", "category-8")
+    with pytest.raises(OwnerChatProviderInvalidResponse):
+        provider.generate(replace(request, catalogue_relevance=False))
+
+
 def test_legacy_typed_preference_plan_is_structurally_normalized() -> None:
     structured = owner_chat_provider._OperationalStructuredResult.model_validate(
         {

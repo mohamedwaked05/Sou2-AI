@@ -1976,9 +1976,10 @@ def test_query_with_disabled_browse_is_canonicalized_before_execution(flow, brow
         CatalogueRequest.model_validate({"query": "water", "browse": False})
 
 
-def test_relevance_failure_does_not_return_unfiltered_products(flow):
+@pytest.mark.parametrize("references", [["invented"], ["invented", "invented"]])
+def test_relevance_failure_does_not_return_unfiltered_products(flow, references):
     provider, _ = offline_provider(
-        {"status": "matched", "candidate_references": ["invented"]}
+        {"status": "matched", "candidate_references": references}
     )
     request = OwnerChatRequest(
         profile=PROFILE,
