@@ -2976,7 +2976,7 @@ class GeminiOwnerChatProvider:
     ) -> dict[str, Any]:
         if (
             planner or category_resolution or conversation
-        ) and self.model == "gemini-3.1-flash-lite":
+        ) and self.model in {"gemini-3.1-flash-lite", "gemini-3.5-flash-lite"}:
             # Bound reasoning in short structured replies after MAX_TOKENS failures.
             # Preserve the existing token reservation and reject truncated output.
             return {"thinkingLevel": "MINIMAL", "includeThoughts": False}
