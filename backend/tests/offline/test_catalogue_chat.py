@@ -653,15 +653,24 @@ def test_stock_unavailable_then_acknowledgement_uses_provider_conversation(
         "how many Pepsi do we have",
     ],
 )
+@pytest.mark.parametrize("reference", [None, "offered", "selected"])
 def test_explicit_quantity_cannot_fall_back_to_catalogue_when_stock_is_unapproved(
-    flow, question
+    flow, question, reference
 ):
+    proposal = plan("PEPSI")
+    if reference is not None:
+        pending_list(flow)
+        proposal["pending_reply"] = "unresolved"
+        proposal["product_presentation"] = {
+            "intent": "details" if reference == "selected" else "discovery",
+            "reference": reference,
+        }
     flow.owner.content = question
-    provider, calls = offline_provider(plan("PEPSI"))
+    provider, calls = offline_provider(proposal)
     result, usage = run(flow, provider)
     assert "Inventory access has not been approved" in result.reply
-    assert flow.reads == [] and len(calls) == 1
-    assert usage.total_tokens == 180
+    assert flow.reads == [] and calls == []
+    assert usage.total_tokens == 0
 
 
 def selected_context(flow):

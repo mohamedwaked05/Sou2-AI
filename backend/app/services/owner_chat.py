@@ -4996,6 +4996,27 @@ def _run_operational_loop(
             reporting_timezone=reporting_timezone,
             pending_sales_clarification=pending_sales,
         )
+        if (
+            source is not None
+            and {definition.name for definition in definitions} == {PRODUCT_SEARCH_TOOL}
+            and _is_product_quantity_request(request.messages[-1].content)
+        ):
+            # The backend already knows this source exposes catalogue only. A
+            # model or cached presentation cannot grant inventory access.
+            if pending_catalogue is not None:
+                owner.operational_clarification = pending_catalogue.model_dump(
+                    mode="json"
+                )
+            usage = TokenUsage(0, 0, 0, authoritative=True)
+            return OwnerChatResult(
+                reply=_capability_unavailable_reply(
+                    "stock",
+                    "unapproved",
+                    request.messages[-1].content,
+                    prepared.business.default_language,
+                ),
+                usage=usage,
+            ), usage
         try:
             result = _validated_generation(provider, request, budget)
         except OwnerChatProviderError as exc:
@@ -5077,6 +5098,7 @@ def _run_operational_loop(
                 and exc.usage is not None
                 and exc.usage.authoritative
                 and (pending_product is not None or pending_catalogue is not None)
+                and not _is_product_quantity_request(request.messages[-1].content)
             ):
                 # The rejected plan cannot execute. Known returned usage is still
                 # charged, while the source-backed question remains answerable.
@@ -5142,9 +5164,17 @@ def _run_operational_loop(
                     )
         catalogue_arguments = None
         presentation = result.product_presentation
-        identifier_followup = _catalogue_identifier_followup(
-            request.messages[-1].content
-        ) or (presentation is not None and presentation.reference == "selected")
+        # Cached catalogue presentation must never answer an operational request
+        # before its capability routing and approval checks below.
+        catalogue_context_reply_allowed = result.semantic_operation in {
+            PRODUCT_SEARCH_TOOL,
+            "conversation",
+            "knowledge",
+        } and not _is_product_quantity_request(request.messages[-1].content)
+        identifier_followup = catalogue_context_reply_allowed and (
+            _catalogue_identifier_followup(request.messages[-1].content)
+            or (presentation is not None and presentation.reference == "selected")
+        )
         if identifier_followup and source is not None:
             plural = bool(
                 re.search(
@@ -5236,11 +5266,14 @@ def _run_operational_loop(
                     or _legacy_catalogue_presentation(request.messages[-1].content)
                 ).identifiers,
             )
-        required_catalogue_choice = (request.pending_clarification or {}).get(
-            "operation"
-        ) == PRODUCT_SEARCH_TOOL
+        required_catalogue_choice = catalogue_context_reply_allowed and (
+            (request.pending_clarification or {}).get("operation")
+            == PRODUCT_SEARCH_TOOL
+        )
         offered_reference = (
-            presentation is not None and presentation.reference == "offered"
+            catalogue_context_reply_allowed
+            and presentation is not None
+            and presentation.reference == "offered"
         )
         if offered_reference and (
             (result.tool_name is not None and result.tool_name not in executor.registry)
