@@ -118,7 +118,6 @@ def test_plural_search_is_a_numbered_catalogue_list(message):
     assert "1. PEPSI MINI\n2. PEPSI DIET MINI" in reply
     assert "Which catalogue product" not in reply
     assert "ID:" not in reply and "SKU:" not in reply and "Family1" not in reply
-    assert "does not confirm availability" in reply or "لا يؤكد توفره" in reply
     assert (
         "Stock and prices are unknown" in reply
         or "المخزون والأسعار غير معروفة" in reply
@@ -321,6 +320,7 @@ def flow(monkeypatch):
     user = SimpleNamespace(id=user_id)
     source = SimpleNamespace(
         id=source_id,
+        business_id=business_id,
         updated_at=NOW,
         mapping_profile_key="discovered_products",
     )
@@ -596,13 +596,6 @@ def test_stock_unavailable_then_acknowledgement_uses_provider_conversation(
     flow, monkeypatch, message
 ):
     provider, calls = offline_provider(
-        {
-            "decision": "unavailable",
-            "semantic_operation": "inventory_product",
-            "entity_kind": "product",
-            "entity_query": "Pepsi",
-            "reply": "999 in stock",
-        },
         {"decision": "final", "semantic_operation": "conversation"},
         {
             "reply": "Understood. I can help with catalogue lookup.",
@@ -635,8 +628,8 @@ def test_stock_unavailable_then_acknowledgement_uses_provider_conversation(
     monkeypatch.setattr(owner_chat, "_build_conversation_request", prepare_conversation)
     reply, usage = run(flow, provider)
     assert reply.reply == "Understood. I can help with catalogue lookup."
-    assert flow.reads == [] and len(calls) == 3
-    assert stock_usage.total_tokens == 180 and usage.total_tokens == 360
+    assert flow.reads == [] and len(calls) == 2
+    assert stock_usage.total_tokens == 0 and usage.total_tokens == 360
     instructions = calls[-1]["systemInstruction"]["parts"][0]["text"]
     assert "Do not infer frustration, anger, confusion" in instructions
     assert "without explicit evidence" in instructions
@@ -651,6 +644,7 @@ def test_stock_unavailable_then_acknowledgement_uses_provider_conversation(
         "how much we have of PEPSI 330ML",
         "how much do we have",
         "how many Pepsi do we have",
+        "How many Pepsi Diet Mini units are in stock?",
     ],
 )
 @pytest.mark.parametrize("reference", [None, "offered", "selected"])
@@ -1872,12 +1866,30 @@ def test_user_errors_distinguish_failure_without_provider_details(failure, code)
         ),
         ("sugar products", "sugar", "HARVEST SUGAR 5KG", "TOAST SUGAR FREE"),
         ("rice varieties", "rice", "BASMATI RICE", "RICE FACE CREAM"),
+        (
+            "What juice brands do you have?",
+            "juice",
+            "Acme Orange Juice",
+            "Sparky Juiced Mango Energy Drink",
+        ),
+        (
+            "Do you have any sugar-free drinks?",
+            "sugar free",
+            "Sparky Energy Drink Sugar Free",
+            "DIET CRANBERRY 1.89L",
+        ),
         ("sho 3endak shi eshrabo", "water", "RIM WATER", "FABRIC SOFTENER WATER"),
         ("sho fi 3endak anwe3 roz", "rice", "LONG GRAIN RICE", "RICE SOAP"),
         ("sho fi 3endak anwe3 roz", "roz", "YAMAMA BASMATI RICE", "MAGI ROZ"),
         ("شو عندك شي اشربه", "water", "AQUAFINA WATER", "WATER SOAP"),
         ("just the drinkable ones", "water", "RIM WATER", "TUNA WATER"),
         ("sparkling", "sparkling", "RIM SPARKLING WATER", "AIR WICK SPARKLING CITRUS"),
+        (
+            "Only the unflavored ones.",
+            "sparkling",
+            "Acme Sparkling Water",
+            "Acme Sparkling Water Flower",
+        ),
     ],
 )
 def test_semantic_candidates_are_filtered_before_display(
@@ -1943,6 +1955,8 @@ def test_semantic_candidates_are_filtered_before_display(
         "current_request": question,
         "preceding_owner_requests": ["rice varieties"],
         "proposed_interpretation": interpretation,
+        "active_product_filters": None,
+        "filter_requests": [question],
     }
 
 
@@ -2039,6 +2053,9 @@ def test_operational_planner_receives_bounded_completed_context(flow, monkeypatc
     )
     monkeypatch.setattr(owner_chat, "_provider_profile", lambda *_: PROFILE)
     monkeypatch.setattr(owner_chat, "_provider_context", lambda *_: (None, history))
+    flow.session.scalars = lambda _: SimpleNamespace(
+        all=lambda: [SimpleNamespace(content=m.content) for m in reversed(history[:-1])]
+    )
     built = REAL_BUILD_OPERATIONAL_REQUEST(
         flow.session,
         flow.business_id,
@@ -2046,7 +2063,7 @@ def test_operational_planner_receives_bounded_completed_context(flow, monkeypatc
         Settings(_env_file=None),
         flow.definitions,
     )
-    assert built.request.messages == history[-5:]
+    assert built.request.messages == history
 
 
 @pytest.mark.parametrize(
@@ -2190,3 +2207,467 @@ def test_rejected_plan_reports_only_verified_expired_approval_and_keeps_usage(
     assert flow.reads == [] and len(calls) == 1
     if use_budget:
         assert budget.usage.total_tokens == charge and budget.calls == len(events) == 1
+
+
+@pytest.mark.parametrize(
+    "brands",
+    [
+        ("Acme", "River"),
+        ("Invented",),
+        ("cme",),
+        ("Acme", "Invented"),
+        ("Acme", "Water"),
+        ("Water",),
+    ],
+)
+def test_brand_summaries_require_source_name_evidence(flow, brands):
+    from app.schemas.owner_chat_state import ProductPresentation
+
+    rows = catalogue(
+        product("a", "Acme Sparkling Water 330ML"),
+        product("b", "River Sparkling Water 500ML"),
+    )
+    flow.executor.execute = lambda **_: OperationalToolResult(
+        tool_name="product_search",
+        output=rows,
+        latency_ms=0,
+        source_id=flow.source.id,
+        source_updated_at=NOW,
+        schema_fingerprint="a" * 64,
+        source_fingerprint="b" * 64,
+    )
+    provider, calls = offline_provider(
+        {
+            "status": "ambiguous",
+            "candidate_references": ["0", "1"],
+            "brand_labels": list(brands),
+            "product_type_terms": ["sparkling water"],
+        }
+    )
+    request = OwnerChatRequest(
+        profile=PROFILE,
+        knowledge=(),
+        requested_at=NOW,
+        messages=(ProviderMessage("owner", "What water brands do you have?"),),
+        catalogue_brands=True,
+    )
+
+    def search():
+        return owner_chat._search_relevant_catalogue(
+            flow.executor,
+            flow.user,
+            flow.business_id,
+            {"query": "water", "semantic_query": "drinking water brands"},
+            provider,
+            request,
+            None,
+        )
+
+    expected = tuple(label for label in brands if label in {"Acme", "River"})
+    if not expected:
+        from app.tools.operational import ToolExecutionError
+
+        with pytest.raises(ToolExecutionError, match="provider_failure"):
+            search()
+        return
+    result, _ = search()
+    reply = owner_chat._catalogue_reply(
+        result.output,
+        presentation=ProductPresentation(intent="discovery", group_by="brands"),
+    )
+    assert "Catalogue brands: " + ", ".join(expected) + "." in reply
+    assert "Invented" not in reply
+    assert result.output.truncated == (len(expected) < len(brands))
+    assert "330ML" not in reply and "500ML" not in reply
+    assert result.output.semantic_query == "drinking water brands"
+    assert calls[0]["generationConfig"]["temperature"] == 0
+    instructions = calls[0]["systemInstruction"]["parts"][0]["text"]
+    assert "never generic product types" in instructions
+    assert "no identifiable brand" in instructions
+    assert "never list its aliases as separate brands" in instructions
+
+
+@pytest.mark.parametrize("requested_type", ["juice", "fruit juice"])
+def test_primary_juice_source_labels_override_incorrect_relevance_selection(
+    flow, requested_type
+):
+    rows = catalogue(
+        product("a", "Acme Orange Juice"),
+        product("b", "Sparky Juiced Mango Energy Drink Can"),
+        product("c", "River Lemon Juice Substitute 1000ML"),
+        product("d", "River Lemon Juice SUB 1000ML"),
+        product("e", "Sub Zero Orange Juice"),
+    )
+    flow.executor.execute = lambda **_: OperationalToolResult(
+        tool_name="product_search",
+        output=rows,
+        latency_ms=0,
+        source_id=flow.source.id,
+        source_updated_at=NOW,
+        schema_fingerprint="a" * 64,
+        source_fingerprint="b" * 64,
+    )
+    provider, _ = offline_provider(
+        {
+            "candidate_references": ["0", "1", "2", "3", "4"],
+            "brand_filter": None,
+            "brand_labels": ["Acme", "Sparky", "River", "Sub Zero"],
+            "product_type_terms": [requested_type],
+        }
+    )
+    request = OwnerChatRequest(
+        profile=PROFILE,
+        knowledge=(),
+        requested_at=NOW,
+        messages=(ProviderMessage("owner", "What juice brands do you have?"),),
+        catalogue_brands=True,
+    )
+    result, _ = owner_chat._search_relevant_catalogue(
+        flow.executor,
+        flow.user,
+        flow.business_id,
+        {"query": "juice", "semantic_query": "juice brands"},
+        provider,
+        request,
+        None,
+    )
+    assert result.output.items == (rows.items[0], rows.items[4])
+    assert result.output.brand_labels == ("Acme", "Sub Zero")
+    assert result.output.truncated
+
+
+@pytest.mark.parametrize(
+    "first,second",
+    [("Acme", "AC-ME"), ("Acme", "Ac me"), ("Café", "Ca-fé"), ("اكمي", "اك-مي")],
+)
+def test_source_brand_formatting_variants_are_one_distinct_brand(flow, first, second):
+    rows = catalogue(product("a", first + " Juice"), product("b", second + " Juice"))
+    flow.executor.execute = lambda **_: OperationalToolResult(
+        tool_name="product_search",
+        output=rows,
+        latency_ms=0,
+        source_id=flow.source.id,
+        source_updated_at=NOW,
+        schema_fingerprint="a" * 64,
+        source_fingerprint="b" * 64,
+    )
+    provider, _ = offline_provider(
+        {
+            "candidate_references": ["0", "1"],
+            "brand_filter": None,
+            "brand_labels": [first, second],
+            "product_type_terms": ["juice"],
+        }
+    )
+    request = OwnerChatRequest(
+        profile=PROFILE,
+        knowledge=(),
+        requested_at=NOW,
+        messages=(ProviderMessage("owner", "What juice brands do you have?"),),
+        catalogue_brands=True,
+    )
+    result, _ = owner_chat._search_relevant_catalogue(
+        flow.executor,
+        flow.user,
+        flow.business_id,
+        {"query": "juice", "semantic_query": "juice brands"},
+        provider,
+        request,
+        None,
+    )
+    assert result.output.brand_labels == (second,)
+    assert not result.output.truncated
+
+
+@pytest.mark.parametrize("brand", ["Acme", "acme", "cme", "Family1", None])
+def test_brand_refinement_rejects_unverified_brand_membership(flow, brand):
+    rows = catalogue(
+        product("a", "ACME WATER 500ML"),
+        product("b", "WATER 500ML"),
+        product("c", "BRACME WATER 500ML"),
+    )
+    flow.executor.execute = lambda **_: OperationalToolResult(
+        tool_name="product_search",
+        output=rows,
+        latency_ms=0,
+        source_id=flow.source.id,
+        source_updated_at=NOW,
+        schema_fingerprint="a" * 64,
+        source_fingerprint="b" * 64,
+    )
+    provider, calls = offline_provider(
+        {
+            "status": "ambiguous",
+            "candidate_references": ["0", "1", "2"],
+            "brand_filter": brand,
+        }
+    )
+    request = OwnerChatRequest(
+        profile=PROFILE,
+        knowledge=(),
+        requested_at=NOW,
+        messages=(ProviderMessage("owner", "Only show Acme products."),),
+    )
+    result, _ = owner_chat._search_relevant_catalogue(
+        flow.executor,
+        flow.user,
+        flow.business_id,
+        {"query": "Acme", "semantic_query": "Acme drinking water"},
+        provider,
+        request,
+        None,
+    )
+    expected = (
+        rows.items
+        if brand is None
+        else rows.items[:1]
+        if brand.lower() == "acme"
+        else ()
+    )
+    assert result.output.items == expected
+    assert result.output.status == (
+        "ambiguous" if brand is None else "resolved" if expected else "not_found"
+    )
+    assert (
+        "brand_filter" in calls[0]["generationConfig"]["responseJsonSchema"]["required"]
+    )
+
+
+def test_alternative_terms_are_not_crowded_out_of_semantic_candidates(flow):
+    reads = []
+
+    def execute(**kwargs):
+        term = kwargs["arguments"]["query"]
+        reads.append(term)
+        rows = catalogue(
+            *(product(f"{term}-{i}", f"{term} beverage {i}") for i in range(30))
+        )
+        return OperationalToolResult(
+            tool_name="product_search",
+            output=rows,
+            latency_ms=0,
+            source_id=flow.source.id,
+            source_updated_at=NOW,
+            schema_fingerprint="a" * 64,
+            source_fingerprint="b" * 64,
+        )
+
+    flow.executor.execute = execute
+    provider, calls = offline_provider(
+        {"status": "matched", "candidate_references": ["5"]}
+    )
+    request = OwnerChatRequest(
+        profile=PROFILE,
+        knowledge=(),
+        requested_at=NOW,
+        messages=(ProviderMessage("owner", "something to drink"),),
+    )
+    result, _ = owner_chat._search_relevant_catalogue(
+        flow.executor,
+        flow.user,
+        flow.business_id,
+        {
+            "query": "drink",
+            "semantic_query": "beverages",
+            "search_queries": ["juice", "water", "tea", "coffee", "soda"],
+        },
+        provider,
+        request,
+        None,
+    )
+    assert reads == ["drink", "juice", "water", "tea", "coffee", "soda"]
+    assert result.output.items[0].names == ("soda beverage 0",)
+    assert len(request.messages) == 1
+    assert (
+        len(
+            json.loads(
+                calls[0]["systemInstruction"]["parts"][0]["text"].split(
+                    "Candidates follow:\n"
+                )[1]
+            )
+        )
+        == 120
+    )
+
+
+def test_next_page_without_a_verified_cursor_needs_no_generation(flow):
+    pending_list(flow)
+    flow.owner.content = "Show me the next page."
+    provider, calls = offline_provider(plan("PEPSI"))
+    result, usage = run(flow, provider)
+    assert "no verified next page" in result.reply
+    assert calls == [] and flow.reads == [] and usage.total_tokens == 0
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "adde se3er Pepsi Diet Mini?",
+        "قديش سعر Pepsi؟",
+        "كم سعر Pepsi؟",
+        '"What is the recorded price of Pepsi Diet Mini?"',
+        "prices",
+    ],
+)
+def test_price_questions_cannot_be_misclassified_as_product_quantities(flow, question):
+    assert not owner_chat._is_product_quantity_request(question)
+    flow.owner.content = question
+    # A wrong provider plan cannot override a verified missing approval.
+    provider, calls = offline_provider(
+        {"decision": "final", "semantic_operation": "product_price"}
+    )
+    result, usage = run(flow, provider)
+    assert (
+        "Pricing access has not been approved" in result.reply
+        or "الأسعار" in result.reply
+    )
+    assert "Inventory" not in result.reply and "المخزون" not in result.reply
+    assert calls == [] and flow.reads == [] and usage.total_tokens == 0
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_unavailable_tool_does_not_erase_its_existing_family_approval(
+    flow, monkeypatch, expired
+):
+    from app.services import capabilities
+
+    event = SimpleNamespace(
+        approval_type="full", expires_at=NOW + timedelta(minutes=-1 if expired else 1)
+    )
+    monkeypatch.setattr(capabilities, "latest_event", lambda *_: event)
+    flow.owner.content = "How many Pepsi Diet Mini units are in stock?"
+    provider, calls = offline_provider(plan("Pepsi"))
+    result, usage = run(flow, provider)
+    assert "not been approved" not in result.reply
+    assert ("revalidation" if expired else "unavailable") in result.reply
+    assert calls == [] and usage.total_tokens == 0
+
+
+def test_unverified_brand_generation_does_not_blame_a_healthy_source(flow):
+    proposal = plan("Pepsi")
+    proposal["arguments"]["semantic_query"] = "Pepsi brand names"
+    proposal["product_presentation"] = {"intent": "discovery", "group_by": "brands"}
+    provider, calls = offline_provider(
+        proposal,
+        {
+            "status": "ambiguous",
+            "candidate_references": ["0", "1"],
+            "brand_labels": ["Invented"],
+        },
+    )
+    result, _ = run(flow, provider)
+    assert "couldn't verify" in result.reply
+    assert (
+        "source is not ready" not in result.reply and "Data Sources" not in result.reply
+    )
+    assert "Invented" not in result.reply and len(calls) == 2 and len(flow.reads) == 1
+
+
+@pytest.mark.parametrize(
+    "question,reference",
+    [
+        ("Only the unflavored ones.", "offered"),
+        ("Go back to the sparkling ones.", "current"),
+        ("Please return to the sparkling ones.", "current"),
+        ("ارجع للمياه الغازية", "current"),
+        ("erja3 lal sparkling water", "current"),
+    ],
+)
+@pytest.mark.parametrize("matched", [True, False])
+def test_refinement_filters_offered_rows_and_keeps_its_request_chain(
+    flow, matched, question, reference
+):
+    old = pending_list(flow).model_copy(
+        update={
+            "candidates": (
+                product("plain", "Acme Sparkling Water"),
+                product("lemon", "Acme Lemon Sparkling Water"),
+            ),
+            "semantic_query": "sparkling water",
+            "filter_requests": (
+                "Show me all sparkling water products.",
+                "Only Acme products.",
+            ),
+        }
+    )
+    flow.state.pending = old
+    flow.owner.content = question
+    proposal = plan("unflavored", pending_reply="unresolved")
+    proposal["arguments"]["semantic_query"] = "unflavored sparkling water"
+    proposal["product_presentation"] = {"intent": "discovery", "reference": reference}
+    provider, calls = offline_provider(
+        proposal,
+        {
+            "status": "matched" if matched else "no_match",
+            "candidate_references": ["0"] if matched else [],
+        },
+    )
+    result, _ = run(flow, provider)
+    pending = PendingCatalogueClarification.model_validate(
+        flow.owner.operational_clarification
+    )
+    assert len(calls) == 2 and len(flow.reads) == 1
+    assert pending.filter_requests == (
+        "Show me all sparkling water products.",
+        "Only Acme products.",
+        flow.owner.content,
+    )
+    assert pending.state_kind == "discovery"
+    if matched:
+        assert pending.candidates[0].external_product_id == "plain"
+        assert "Acme Sparkling Water" in result.reply and "Lemon" not in result.reply
+    else:
+        assert pending.candidates == ()
+        assert (
+            "No matching catalogue products were verified" in result.reply
+            or "لم يتم التحقق من منتجات مطابقة" in result.reply
+        )
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            PendingCatalogueClarification.model_validate(
+                {**pending.model_dump(), "state_kind": "clarification"}
+            )
+    supplied = json.loads(calls[-1]["contents"][0]["parts"][0]["text"])
+    assert supplied["filter_requests"] == list(pending.filter_requests)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("source_id", uuid.uuid4()),
+        ("user_id", uuid.uuid4()),
+        ("business_id", uuid.uuid4()),
+        ("mapping_version", 2),
+        ("schema_fingerprint", "c" * 64),
+        ("source_fingerprint", "d" * 64),
+        ("expires_at", NOW - timedelta(seconds=1)),
+    ],
+)
+def test_refinement_never_reuses_candidates_from_an_invalid_source_scope(
+    flow, field, value
+):
+    from app.tools.operational import ToolExecutionError
+
+    offered = pending_list(flow).model_copy(update={field: value})
+    provider, calls = offline_provider(
+        {"status": "matched", "candidate_references": ["0"]}
+    )
+    request = OwnerChatRequest(
+        profile=PROFILE,
+        knowledge=(),
+        requested_at=NOW,
+        messages=(ProviderMessage("owner", "Only the unflavored ones."),),
+    )
+    with pytest.raises(ToolExecutionError, match="integration_unavailable"):
+        owner_chat._search_relevant_catalogue(
+            flow.executor,
+            flow.user,
+            flow.business_id,
+            {"query": "unflavored", "semantic_query": "unflavored Pepsi drinks"},
+            provider,
+            request,
+            None,
+            offered=offered,
+        )
+    assert calls == []

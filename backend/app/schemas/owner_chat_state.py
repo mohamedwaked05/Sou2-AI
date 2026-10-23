@@ -50,6 +50,7 @@ class ProductPresentation(BaseModel):
     intent: Literal["discovery", "details", "selection", "ambiguous_followup"]
     reference: Literal["current", "offered", "selected"] = "current"
     identifiers: tuple[Literal["id", "sku"], ...] = Field(default=(), max_length=2)
+    group_by: Literal["products", "brands"] = "products"
 
     @model_validator(mode="after")
     def validate_reference(self) -> ProductPresentation:
@@ -78,3 +79,5 @@ class CatalogueFollowupContext(BaseModel):
     state_kind: Literal["discovery", "clarification", "invalid_or_expired"]
     candidates: tuple[OfferedProduct, ...] = Field(default=(), max_length=50)
     truncated: bool = False
+    semantic_query: str | None = Field(default=None, max_length=255)
+    filter_requests: tuple[str, ...] = Field(default=(), max_length=8)

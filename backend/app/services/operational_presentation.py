@@ -325,9 +325,8 @@ def render_operational(view: OperationalPresentation, safe: SafeField) -> str:
         coverage_note = ""
         caveat = (
             text(
-                "Catalogue presence does not confirm availability. Stock "
-                "and prices are unknown.",
-                "وجود المنتج في الكتالوج لا يؤكد توفره. المخزون والأسعار غير معروفة.",
+                "Stock and prices are unknown.",
+                "المخزون والأسعار غير معروفة.",
             )
             + coverage_note
         )
@@ -363,6 +362,29 @@ def render_operational(view: OperationalPresentation, safe: SafeField) -> str:
                 )
             )
         discovery = view.purpose is not None and view.purpose.intent == "discovery"
+        if (
+            view.purpose is not None
+            and view.purpose.group_by == "brands"
+            and output.brand_labels
+        ):
+            labels = list(
+                dict.fromkeys(
+                    safe_text(label, "", safe) for label in output.brand_labels
+                )
+            )
+            return (
+                text("Catalogue brands: ", "علامات الكتالوج: ")
+                + ", ".join(labels)
+                + ".\n"
+                + text(
+                    "Choose a brand to see its products.", "اختر علامة لعرض منتجاتها."
+                )
+                + (
+                    text(" This is a bounded selection.", " هذه نتائج محدودة.")
+                    if output.truncated
+                    else ""
+                )
+            )
         labels = product_labels(
             output.items, ids, safe, arabic=ar, categories=not discovery
         )
@@ -386,10 +408,6 @@ def render_operational(view: OperationalPresentation, safe: SafeField) -> str:
             ),
             labels,
             [
-                text(
-                    "Name a product for details, or narrow by brand or variant.",
-                    "اختر منتجاً باسمه أو بمعرّف ظاهر لعرض التفاصيل.",
-                ),
                 caveat,
                 text(
                     "Reply next for the next bounded page.",

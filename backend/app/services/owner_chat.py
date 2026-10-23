@@ -720,7 +720,13 @@ def _is_product_quantity_request(value: str) -> bool:
     text = _normalized_classifier_text(value).strip(" ?!.,")
     if not text:
         return False
+    if re.search(
+        r"\b(?:prices?|pricing|cost|se3er|si3r)\b|سعر|اسعار", text
+    ) and not re.search(r"\b(?:stock|inventory|units?)\b|مخزون", text):
+        return False
     patterns = (
+        r"\bhow many (?P<product>.+?) (?:units? )?are (?:in stock|available|left)\b",
+        r"\b(?:stock|inventory) (?:of|for) (?P<product>.+)$",
         r"\bhow many (?P<product>.+?) do we have(?: left| remaining)?\b",
         r"\bhow much (?:do we have|we have)(?: of (?P<product>.+))?$",
         r"\bdo we have (?P<product>.+?) (?:available|left|in stock)\b",
@@ -820,6 +826,10 @@ def _query_concepts(value: str) -> frozenset[str]:
             r"مخزون",
             r"\bmakhzou?n\b",
         ),
+        "prices": (
+            r"\b(?:prices?|pricing|se3er|si3r)\b",
+            r"سعر|اسعار",
+        ),
         "sales": (
             r"\b(?:sales?|selling|sellers?|sold)\b",
             r"مبيعات",
@@ -875,6 +885,7 @@ def _search_query_text(value: str) -> str:
         "opening_hours": "business opening hours schedule",
         "location": "business address location",
         "inventory": "current inventory stock availability",
+        "prices": "current product prices pricing",
         "sales": "current sales best selling items",
         "orders": "current customer orders",
         "revenue": "current revenue earnings",
@@ -1313,7 +1324,23 @@ def _build_operational_request(
     # History interprets short follow-ups; only the executor authorizes source IDs.
     # Completed turns only, with a small window to avoid reviving stale requests.
     _, messages = _provider_context(session, owner_message)
-    messages = messages[-5:]
+    # Summaries can checkpoint away an active filter. Keep a bounded verbatim
+    # owner history for language interpretation, without repeated SKU lists.
+    prior = session.scalars(
+        select(OwnerChatMessage)
+        .where(
+            OwnerChatMessage.conversation_id == owner_message.conversation_id,
+            OwnerChatMessage.sequence_number < owner_message.sequence_number,
+            OwnerChatMessage.role == ChatMessageRole.OWNER,
+            OwnerChatMessage.generation_state == ChatGenerationState.COMPLETED,
+        )
+        .order_by(OwnerChatMessage.sequence_number.desc())
+        .limit(12)
+    ).all()
+    messages = (
+        tuple(ProviderMessage("owner", item.content) for item in reversed(prior))
+        + messages[-1:]
+    )
     request = OwnerChatRequest(
         profile=_provider_profile(business),
         knowledge=(),
@@ -2271,6 +2298,8 @@ def _validated_provider_arguments(
                 (
                     error["loc"][0]
                     if error["loc"] and error["loc"][0] in input_schema.model_fields
+                    else "selector_contract"
+                    if not error["loc"]
                     else "unknown_field",
                     error["type"],
                 )
@@ -4035,6 +4064,8 @@ def _catalogue_followup_context(
                 for item in pending.candidates
             ),
             truncated=pending.truncated,
+            semantic_query=pending.semantic_query,
+            filter_requests=pending.filter_requests,
         )
     if (_previous_product_clarification(session, owner.id) or {}).get(
         "operation"
@@ -4424,6 +4455,9 @@ def _chat_catalogue_result(
     size = 0
     # Conservative headroom for scope/provenance plus the presentation hint.
     state_bytes = 1_500 + CATALOGUE_CONTEXT_REQUEST_MAX_BYTES
+    state_bytes += len(
+        json.dumps(output.filter_requests, ensure_ascii=False).encode("utf-8")
+    )
     state_bytes += len(output.continuation or "")
     state_bytes += len(
         json.dumps(output.deferred_operation or {}, ensure_ascii=False).encode("utf-8")
@@ -4557,7 +4591,8 @@ def _store_catalogue_clarification(
         return
     owner = session.get(OwnerChatMessage, owner_message_id)
     presentation = presentation or _legacy_catalogue_presentation(owner.content)
-    if output.status == "not_found":
+    keep_filters = bool(output.filter_requests and presentation.intent == "discovery")
+    if output.status == "not_found" and not keep_filters:
         owner.operational_clarification = {"operation": "catalogue_context_cleared"}
         return
     if output.status == "resolved" and presentation.intent != "discovery":
@@ -4583,7 +4618,7 @@ def _store_catalogue_clarification(
         }
         return
     output = _chat_catalogue_result(output, store_candidates=True)
-    if not output.items:
+    if not output.items and not keep_filters:
         owner.operational_clarification = {"operation": "catalogue_context_cleared"}
         return
     owner_request = owner.content
@@ -4603,6 +4638,8 @@ def _store_catalogue_clarification(
             + (" SKUs" if show_sku else "")
         )
     pending = PendingCatalogueClarification(
+        semantic_query=output.semantic_query,
+        filter_requests=output.filter_requests,
         coverage=output.coverage,
         deferred_operation=output.deferred_operation,
         continuation=output.continuation,
@@ -4740,6 +4777,8 @@ def _search_relevant_catalogue(
     provider: OwnerChatProvider,
     request: OwnerChatRequest,
     budget: _OperationalUsageBudget | None,
+    *,
+    offered: PendingCatalogueClarification | None = None,
 ) -> tuple[OperationalToolResult, TokenUsage]:
     """Retrieve approved source candidates, then select source rows by meaning."""
     selectors = dict(arguments)
@@ -4754,6 +4793,7 @@ def _search_relevant_catalogue(
         ), TokenUsage(0, 0, 0, authoritative=True)
     queries = tuple(dict.fromkeys((selectors.get("query"), *alternatives)))
     candidates: dict[str, CatalogueProduct] = {}
+    candidate_pages: list[tuple[CatalogueProduct, ...]] = []
     first = None
     truncated = False
     for query in queries[:6]:
@@ -4778,13 +4818,44 @@ def _search_relevant_catalogue(
             raise ToolExecutionError("integration_unavailable")
         first = first or current
         truncated |= current.output.truncated
-        for item in current.output.items:
+        candidate_pages.append(current.output.items)
+    if offered is not None:
+        if (
+            offered.business_id != business_id
+            or offered.user_id != user.id
+            or offered.expires_at <= utc_now()
+            or offered.source_id != first.source_id
+            or offered.source_updated_at != first.source_updated_at
+            or offered.schema_fingerprint != first.schema_fingerprint
+            or offered.source_fingerprint != first.source_fingerprint
+            or offered.mapping_version != first.output.mapping_version
+            or offered.coverage != first.output.coverage
+        ):
+            raise ToolExecutionError("integration_unavailable")
+        # These are the already verified, scoped offered rows. A refinement can
+        # filter them even when its adjective is absent from catalogue names.
+        for item in offered.candidates:
             candidates.setdefault(item.external_product_id, item)
-        if len(candidates) >= 120:
-            truncated = True
-            break
+        truncated |= offered.truncated
+    prior_requests = (
+        (offered.filter_requests or (offered.owner_request,)) if offered else ()
+    )
+    chain = (*prior_requests, request.messages[-1].content)
+    chain = chain if len(chain) <= 8 else (chain[0], *chain[-7:])
+    filter_requests = tuple(
+        value.encode("utf-8")[:120].decode("utf-8", "ignore") for value in chain
+    )
+    # Give each alternative a share of the bounded candidate set. A broad first
+    # term must not crowd out the later translations or product types.
+    for index in range(50):
+        for page in candidate_pages:
+            if index < len(page):
+                item = page[index]
+                candidates.setdefault(item.external_product_id, item)
+    truncated |= len(candidates) > 120
     items = tuple(candidates.values())[:120]
     usage = TokenUsage(0, 0, 0, authoritative=True)
+    brands: tuple[str, ...] = ()
     if items:
         # Reuse the provider's bounded reference-selection contract. The model
         # sees labels and opaque ordinal references, never executable source IDs.
@@ -4792,6 +4863,7 @@ def _search_relevant_catalogue(
             request,
             mode="category_resolution",
             catalogue_relevance=True,
+            catalogue_brands=bool(request.catalogue_brands),
             messages=(
                 ProviderMessage(
                     "owner",
@@ -4802,8 +4874,14 @@ def _search_relevant_catalogue(
                                 message.content
                                 for message in request.messages[:-1]
                                 if message.role == "owner"
-                            ][-2:],
+                            ][-12:],
                             "proposed_interpretation": str(intent),
+                            "filter_requests": filter_requests,
+                            "active_product_filters": (
+                                request.catalogue_context.semantic_query
+                                if request.catalogue_context is not None
+                                else None
+                            ),
                         },
                         ensure_ascii=False,
                     ),
@@ -4830,9 +4908,73 @@ def _search_relevant_catalogue(
         items = tuple(
             items[int(ref)] for ref in selected.category_candidate_references[:20]
         )
+        product_types = {
+            term.strip().casefold() for term in selected.catalogue_product_type_terms
+        }
+        if any(re.fullmatch(r"(?:[\w-]+\s+)*juices?", term) for term in product_types):
+            # Explicit primary-type labels outrank an incidental juice ingredient.
+            items = tuple(
+                item
+                for item in items
+                if not any(
+                    re.search(
+                        r"\benergy[\s-]*drinks?\b|\bsubstitutes?\b|\bjuice[\s-]+sub(?=\s|\d|$)",
+                        name,
+                        re.I,
+                    )
+                    for name in item.names
+                )
+            )
+        if selected.catalogue_brand_filter is not None:
+            brand = selected.catalogue_brand_filter.strip()
+            items = tuple(
+                item
+                for item in items
+                if brand
+                and any(
+                    re.search(r"(?<!\w)" + re.escape(brand) + r"(?!\w)", name, re.I)
+                    for name in item.names
+                )
+            )
+        brands = tuple(
+            {
+                label.casefold(): label for label in selected.catalogue_brand_labels
+            }.values()
+        )
+        grounded = tuple(
+            label
+            for label in brands
+            if label.strip()
+            and len(label) <= 80
+            and not any(
+                re.search(r"(?<!\w)" + re.escape(label.strip()) + r"(?!\w)", term, re.I)
+                for term in product_types
+            )
+            and any(
+                re.search(r"(?<!\w)" + re.escape(label) + r"(?!\w)", name, re.I)
+                for item in items
+                for name in item.names
+            )
+        )
+        _logger.info(
+            "owner_chat_catalogue_brands proposed=%d verified=%d",
+            len(brands),
+            len(grounded),
+        )
+        truncated |= len(grounded) < len(brands)
+        brands = tuple(
+            {
+                re.sub(r"[\W_]+", "", label).casefold(): label for label in grounded
+            }.values()
+        )
+        if request.catalogue_brands and items and not brands:
+            raise ToolExecutionError("provider_failure", reason="brand_grounding")
     output = first.output.model_copy(
         update={
             "items": items,
+            "semantic_query": str(intent),
+            "filter_requests": filter_requests,
+            "brand_labels": brands,
             "status": "ambiguous"
             if len(items) > 1
             else "resolved"
@@ -4889,12 +5031,33 @@ def _run_operational_loop(
         else None
     )
     owner = session.get(OwnerChatMessage, claim.message_id)
+    page_request = owner.content.strip().casefold().strip("?.!") in {
+        "next",
+        "more",
+        "continue",
+        "next page",
+        "show me the next page",
+        "المزيد",
+        "التالي",
+        "كمل",
+    }
+    if pending_catalogue and page_request and not pending_catalogue.continuation:
+        owner.operational_clarification = pending_catalogue.model_dump(mode="json")
+        usage = TokenUsage(0, 0, 0, authoritative=True)
+        return OwnerChatResult(
+            reply=(
+                "لا توجد صفحة تالية موثقة لهذا البحث. حدّد علامة أو حجماً لتضييق النتائج."
+                if _fallback_language(owner.content, "en") == "arabic"
+                else "There is no verified next page for this search. "
+                "Narrow by brand or size."
+            ),
+            usage=usage,
+        ), usage
     if (
         pending_catalogue
         and pending_catalogue.continuation
         and pending_catalogue.discovery_request
-        and owner.content.strip().casefold().strip("?.!")
-        in {"next", "more", "continue", "next page", "المزيد", "التالي", "كمل"}
+        and page_request
     ):
         page = pending_catalogue.discovery_request.model_copy(
             update={"continuation": pending_catalogue.continuation}
@@ -4996,10 +5159,23 @@ def _run_operational_loop(
             reporting_timezone=reporting_timezone,
             pending_sales_clarification=pending_sales,
         )
+        explicit_concepts = _query_concepts(request.messages[-1].content)
+        unavailable_operation = (
+            "stock"
+            if _is_product_quantity_request(request.messages[-1].content)
+            else {
+                "inventory": "stock",
+                "prices": "prices",
+                "sales": "sales",
+                "revenue": "revenue",
+            }.get(next(iter(explicit_concepts)))
+            if len(explicit_concepts) == 1
+            else None
+        )
         if (
             source is not None
             and {definition.name for definition in definitions} == {PRODUCT_SEARCH_TOOL}
-            and _is_product_quantity_request(request.messages[-1].content)
+            and unavailable_operation is not None
         ):
             # The backend already knows this source exposes catalogue only. A
             # model or cached presentation cannot grant inventory access.
@@ -5007,11 +5183,33 @@ def _run_operational_loop(
                 owner.operational_clarification = pending_catalogue.model_dump(
                     mode="json"
                 )
+            elif selected_catalogue is not None and product_reference_query(
+                owner.content
+            ):
+                owner.operational_clarification = {
+                    "operation": "catalogue_context_cleared"
+                }
             usage = TokenUsage(0, 0, 0, authoritative=True)
+            from app.services.capabilities import latest_event as capability_event
+
+            family = {
+                "stock": "inventory",
+                "prices": "pricing",
+                "sales": "sales",
+                "revenue": "financial",
+            }[unavailable_operation]
+            event = capability_event(session, source, family)
+            reason = (
+                "unapproved"
+                if event is None or event.approval_type != "full"
+                else "validation"
+                if event.expires_at <= utc_now()
+                else "unavailable"
+            )
             return OwnerChatResult(
                 reply=_capability_unavailable_reply(
-                    "stock",
-                    "unapproved",
+                    unavailable_operation,
+                    reason,
                     request.messages[-1].content,
                     prepared.business.default_language,
                 ),
@@ -5270,10 +5468,34 @@ def _run_operational_loop(
             (request.pending_clarification or {}).get("operation")
             == PRODUCT_SEARCH_TOOL
         )
+        if (
+            catalogue_context_reply_allowed
+            and pending_catalogue is not None
+            and pending_catalogue.state_kind == "discovery"
+            and presentation is not None
+            and presentation.intent == "discovery"
+            and result.tool_name == PRODUCT_SEARCH_TOOL
+            and (result.tool_arguments or {}).get("semantic_query")
+            and re.search(
+                r"^(?:(?:please|now)\s+)*(?:go\s+back|return\s+to|back\s+to)\b"
+                r"|^(?:ارجع|رجعني|رجع|عود|ارجعلي)\b"
+                r"|^(?:erja3|rja3|rje3|rja3ne)\b",
+                _normalized_classifier_text(request.messages[-1].content).strip(),
+            )
+        ):
+            # A return changes the requested type, not every compatible filter.
+            presentation = presentation.model_copy(update={"reference": "offered"})
         offered_reference = (
             catalogue_context_reply_allowed
             and presentation is not None
             and presentation.reference == "offered"
+        )
+        catalogue_refinement = bool(
+            offered_reference
+            and presentation.intent == "discovery"
+            and pending_catalogue is not None
+            and pending_catalogue.state_kind == "discovery"
+            and (result.tool_arguments or {}).get("semantic_query")
         )
         if offered_reference and (
             (result.tool_name is not None and result.tool_name not in executor.registry)
@@ -5282,7 +5504,11 @@ def _run_operational_loop(
             raise OwnerChatProviderInvalidResponse(
                 reason="prohibited_provider_arguments", usage=result.usage
             )
-        if (required_catalogue_choice or offered_reference) and not changed_reference:
+        if (
+            (required_catalogue_choice or offered_reference)
+            and not changed_reference
+            and not catalogue_refinement
+        ):
             selection = (
                 _source_candidate_selection(
                     request.messages[-1].content,
@@ -6543,8 +6769,15 @@ def _run_operational_loop(
                     business_id,
                     arguments,
                     provider,
-                    request,
+                    replace(
+                        request,
+                        catalogue_brands=bool(
+                            result.product_presentation
+                            and result.product_presentation.group_by == "brands"
+                        ),
+                    ),
                     budget,
+                    offered=pending_catalogue if catalogue_refinement else None,
                 )
                 aggregate_usage = _add_usage(aggregate_usage, relevance_usage)
                 if budget is not None:
@@ -6560,16 +6793,32 @@ def _run_operational_loop(
             _logger.info(
                 "owner_chat_operational_dispatch outcome=tool_error "
                 "fallback_reason=tool_execution_error "
-                "final_synthesis_path=deterministic tool=%s error_code=%s",
+                "final_synthesis_path=deterministic tool=%s error_code=%s "
+                "verification=%s",
                 result.tool_name,
                 exc.code,
+                exc.reason
+                if exc.reason in {"relevance", "brand_grounding"}
+                else "source",
             )
             fallback = OwnerChatResult(
                 reply=(
-                    "I couldn't verify which catalogue products match that request. "
-                    "Please retry or narrow the product type. "
-                    "No stock or price was inferred."
-                    if getattr(exc, "reason", None) == "relevance"
+                    (
+                        "تعذّر التحقق من نتائج الكتالوج لهذا الطلب. "
+                        "حدّد نوع المنتج أو العلامة. "
+                        "المخزون والأسعار غير معروفين."
+                        if _fallback_language(
+                            request.messages[-1].content,
+                            prepared.business.default_language,
+                        )
+                        in {"arabic", "lebanese_arabic", "mixed"}
+                        else "I couldn't verify which catalogue products "
+                        "match that request. "
+                        "Please retry or narrow the product type. "
+                        "No stock or price was inferred."
+                    )
+                    if exc.code == "provider_failure"
+                    and result.tool_name == PRODUCT_SEARCH_TOOL
                     else _catalogue_lookup_unavailable(
                         request.messages[-1].content, prepared.business.default_language
                     ).reply
@@ -7044,6 +7293,16 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
             or (status == "matched" and len(result_references) != 1)
             or (status == "ambiguous" and len(result_references) < 2)
             or (status == "no_match" and result_references)
+            or (result.catalogue_brand_labels and not request.catalogue_brands)
+            or (result.catalogue_product_type_terms and not request.catalogue_brands)
+            or (
+                result.catalogue_brand_filter is not None
+                and (
+                    not request.catalogue_relevance
+                    or not isinstance(result.catalogue_brand_filter, str)
+                    or not 1 <= len(result.catalogue_brand_filter.strip()) <= 80
+                )
+            )
         ):
             raise OwnerChatProviderInvalidResponse(
                 reason="invalid_category_resolution_response"
@@ -7386,6 +7645,7 @@ def _generate_claimed_turn(
                 ):
                     families = {
                         "inventory": ("stock", "inventory"),
+                        "prices": ("prices", "pricing"),
                         "sales": ("sales", "sales"),
                         "revenue": ("revenue", "financial"),
                     }

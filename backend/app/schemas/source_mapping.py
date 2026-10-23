@@ -212,6 +212,9 @@ class CatalogueCoverage(MappingContract):
 
 
 class CatalogueResult(MappingContract):
+    semantic_query: str | None = Field(default=None, max_length=255)
+    filter_requests: tuple[str, ...] = Field(default=(), max_length=8)
+    brand_labels: tuple[str, ...] = Field(default=(), max_length=20)
     matched_records: int | None = Field(default=None, ge=0)
     coverage: CatalogueCoverage | None = None
     deferred_operation: dict[str, object] | None = None
@@ -231,6 +234,8 @@ class PendingCatalogueClarification(MappingContract):
     """Scoped source choices; the planner cannot create selection identifiers."""
 
     deferred_operation: dict[str, object] | None = None
+    semantic_query: str | None = Field(default=None, max_length=255)
+    filter_requests: tuple[str, ...] = Field(default=(), max_length=8)
     coverage: CatalogueCoverage | None = None
     continuation: str | None = None
     discovery_request: CatalogueRequest | None = None
@@ -246,17 +251,21 @@ class PendingCatalogueClarification(MappingContract):
     schema_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
     source_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
     expires_at: AwareDatetime
-    candidates: tuple[CatalogueProduct, ...] = Field(min_length=1, max_length=50)
+    candidates: tuple[CatalogueProduct, ...] = Field(max_length=50)
     truncated: bool
     owner_request: str = Field(min_length=1, max_length=14_000)
 
     @model_validator(mode="after")
     def validate_choices(self) -> PendingCatalogueClarification:
         identifiers = [item.external_product_id for item in self.candidates]
-        if len(set(identifiers)) != len(identifiers) or (
-            len(identifiers) < 2
-            and not self.truncated
-            and self.state_kind == "clarification"
+        if (
+            (not identifiers and self.state_kind == "clarification")
+            or len(set(identifiers)) != len(identifiers)
+            or (
+                len(identifiers) < 2
+                and not self.truncated
+                and self.state_kind == "clarification"
+            )
         ):
             raise ValueError("A catalogue clarification requires ambiguous choices.")
         return self

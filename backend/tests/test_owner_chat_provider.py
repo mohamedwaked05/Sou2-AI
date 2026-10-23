@@ -857,6 +857,8 @@ def test_category_resolution_returns_only_validated_candidate_references(
         owner_chat_provider._CategoryResolutionStructuredResult.model_json_schema()
     )
     if adapter == "gemini":
+        expected["properties"].pop("brand_labels")
+        expected["properties"].pop("product_type_terms")
         expected["properties"]["candidate_references"].update(
             maxItems=2,
             items={"type": "string", "enum": ["category-7", "category-8"]},
@@ -884,6 +886,72 @@ def test_gemini_relevance_schema_limits_choices_to_real_opaque_references():
     assert "NESCAFE GOLD 0" not in choices["items"]["enum"]
     assert choices["maxItems"] == 20
     assert "never product labels" in payload["systemInstruction"]["parts"][0]["text"]
+
+
+@pytest.mark.parametrize("adapter", ["ollama", "gemini"])
+def test_relevance_preserves_explicit_brand_constraint(adapter):
+    structured = {
+        "status": "matched",
+        "candidate_references": ["category-7"],
+        "brand_filter": "Acme",
+        "brand_labels": ["Acme"],
+        "product_type_terms": ["water"],
+    }
+    provider = (
+        ollama_provider(successful_transport(structured))
+        if adapter == "ollama"
+        else gemini_provider(gemini_successful_transport(structured))
+    )
+    request = replace(
+        category_resolution_request(), catalogue_relevance=True, catalogue_brands=True
+    )
+    result = provider.generate(request)
+    assert result.catalogue_brand_filter == "Acme"
+    assert result.catalogue_product_type_terms == ("water",)
+    payload = provider._request_payload(request)
+    schema = (
+        payload["format"]
+        if adapter == "ollama"
+        else payload["generationConfig"]["responseJsonSchema"]
+    )
+    assert "brand_filter" in schema["required"]
+    assert "product_type_terms" in schema["required"]
+    assert schema["properties"]["product_type_terms"]["minItems"] == 1
+
+
+@pytest.mark.parametrize("adapter", ["ollama", "gemini"])
+@pytest.mark.parametrize(
+    "references,status,expected",
+    [
+        ([], "no_match", ()),
+        (["category-7"], "matched", ("category-7",)),
+        (["category-7", "category-8"], "ambiguous", ("category-7", "category-8")),
+        (["category-7", "category-7"], "matched", ("category-7",)),
+    ],
+)
+def test_catalogue_discovery_derives_status_without_redundant_model_claim(
+    adapter, references, status, expected
+):
+    structured = {"candidate_references": references, "brand_filter": None}
+    provider = (
+        ollama_provider(successful_transport(structured))
+        if adapter == "ollama"
+        else gemini_provider(gemini_successful_transport(structured))
+    )
+    request = replace(category_resolution_request(), catalogue_relevance=True)
+    result = provider.generate(request)
+    assert result.category_resolution_status == status
+    assert result.category_candidate_references == expected
+    payload = provider._request_payload(request)
+    schema = (
+        payload["format"]
+        if adapter == "ollama"
+        else payload["generationConfig"]["responseJsonSchema"]
+    )
+    assert "status" not in schema["properties"]
+    assert "candidate_references" in schema["required"]
+    with pytest.raises(OwnerChatProviderInvalidResponse):
+        provider.generate(replace(request, catalogue_relevance=False))
 
 
 def test_gemini_empty_relevance_candidates_allow_only_an_empty_selection():
@@ -920,6 +988,43 @@ def test_gemini_search_contract_requires_a_query_or_explicit_browse():
     assert browse["required"] == ["browse"]
     assert browse["properties"]["browse"] == {"enum": [True]}
     assert browse["properties"]["query"] == {"type": "null"}
+
+
+@pytest.mark.parametrize("adapter", ["gemini", "ollama"])
+def test_operational_history_is_context_not_multiple_active_requests(adapter):
+    current = "What kinds of drinking water do you have?"
+    request = replace(
+        operational_request(),
+        messages=(
+            ProviderMessage("owner", "What is the recorded price of Pepsi Diet Mini?"),
+            ProviderMessage("assistant", "Pricing access has not been approved."),
+            ProviderMessage("owner", "How many Pepsi Diet Mini units are in stock?"),
+            ProviderMessage("assistant", "Inventory access has not been approved."),
+            ProviderMessage("owner", current),
+        ),
+    )
+    transport = httpx.MockTransport(
+        lambda _: pytest.fail("Payload check must not call a provider")
+    )
+    provider = (
+        gemini_provider(transport)
+        if adapter == "gemini"
+        else ollama_provider(transport)
+    )
+    payload = provider._request_payload(request)
+    if adapter == "gemini":
+        assert payload["contents"] == [{"role": "user", "parts": [{"text": current}]}]
+        instructions = payload["systemInstruction"]["parts"][0]["text"]
+    else:
+        assert payload["messages"][1:] == [{"role": "user", "content": current}]
+        instructions = payload["messages"][0]["content"]
+    context = json.loads(instructions.split("Safe context follows:\n", 1)[1])
+    assert context["current_owner_request"] == current
+    assert context["preceding_owner_requests"] == [
+        request.messages[0].content,
+        request.messages[2].content,
+    ]
+    assert "only request to answer now" in instructions
 
 
 def test_incomplete_typed_preference_plan_is_an_interpreted_intent() -> None:
