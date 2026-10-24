@@ -23,11 +23,15 @@ from tests.test_rag_lifecycle import Provider, ready_document, vector
 class _NoEvidenceProvider:
     model = "bge-m3"
 
-    def embed(self, texts: list[str]) -> EmbeddingResult:
+    def embed(
+        self, texts: list[str], *, task_type: str = "RETRIEVAL_DOCUMENT"
+    ) -> EmbeddingResult:
         question = tuple(vector(1))
         unrelated = (0.0, 1.0, *([0.0] * 1022))
         return EmbeddingResult(
-            vectors=(question, *(unrelated for _ in texts[1:])),
+            vectors=tuple(
+                question if task_type == "RETRIEVAL_QUERY" else unrelated for _ in texts
+            ),
             model=self.model,
         )
 

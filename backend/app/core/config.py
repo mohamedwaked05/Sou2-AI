@@ -158,8 +158,9 @@ class Settings(BaseSettings):
     gemini_request_timeout_seconds: int = Field(default=120, ge=1)
     gemini_api_key: SecretStr | None = None
     ollama_embedding_model: str = "bge-m3"
-    embedding_provider: Literal["ollama"] = "ollama"
+    embedding_provider: Literal["ollama", "gemini"] = "ollama"
     embedding_model: str = "bge-m3"
+    embedding_request_timeout_seconds: int = Field(default=20, ge=1, le=30)
     embedding_batch_size: int = Field(default=16, ge=1, le=128)
     retrieval_candidate_limit: int = Field(default=10, ge=1, le=100)
     retrieval_minimum_similarity: float = Field(default=0.50, ge=-1, le=1)
@@ -317,6 +318,7 @@ class Settings(BaseSettings):
             self.conversation_summary_provider,
             self.customer_chat_provider,
             self.source_mapping_provider,
+            self.embedding_provider,
         )
         if self.environment.casefold() not in {"development", "testing"}:
             if "mock" in generation_providers:
@@ -347,6 +349,13 @@ class Settings(BaseSettings):
             or not self.gemini_api_key.get_secret_value().strip()
         ):
             raise ValueError("GEMINI_API_KEY is required when using Gemini.")
+        if (
+            self.embedding_provider == "gemini"
+            and self.embedding_model != "gemini-embedding-001"
+        ):
+            raise ValueError(
+                "Gemini embeddings require EMBEDDING_MODEL=gemini-embedding-001."
+            )
         if (
             self.source_mapping_provider == "gemini"
             and self.gemini_request_timeout_seconds >= 240

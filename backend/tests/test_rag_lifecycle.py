@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from app.core.config import Settings
 from app.database.models import (
     KnowledgeDocument,
@@ -38,7 +39,9 @@ class Provider:
         self.vectors = vectors or [vector(1.0)]
         self.calls = 0
 
-    def embed(self, texts: list[str]) -> EmbeddingResult:
+    def embed(
+        self, texts: list[str], *, task_type: str = "RETRIEVAL_DOCUMENT"
+    ) -> EmbeddingResult:
         self.calls += 1
         return EmbeddingResult(
             vectors=tuple(
@@ -348,7 +351,9 @@ def test_reembedding_skips_if_business_disables_before_persistence(
     from app.rag import reembed
 
     class DisablingProvider(Provider):
-        def embed(self, texts: list[str]) -> EmbeddingResult:
+        def embed(
+            self, texts: list[str], *, task_type: str = "RETRIEVAL_DOCUMENT"
+        ) -> EmbeddingResult:
             result = super().embed(texts)
             change_business_status(db_session, business_id, "DISABLED")
             return result
@@ -365,3 +370,139 @@ def test_reembedding_skips_if_business_disables_before_persistence(
     db_session.refresh(document)
     assert document.chunks[0].embedding_model == "old-model"
     assert list(document.chunks[0].embedding or []) == original
+
+
+@pytest.mark.parametrize("retryable,expected", [(True, "PENDING"), (False, "FAILED")])
+def test_embedding_http_failure_respects_provider_retryability(
+    api_client, db_session: Session, database_engine, monkeypatch, retryable, expected
+) -> None:
+    _, business = active_business(api_client, db_session)
+    document = KnowledgeDocument(**document_values(uuid.UUID(business["id"])))
+    db_session.add(document)
+    db_session.commit()
+    document.status = KnowledgeDocumentStatus.PROCESSING
+    document.processing_started_at = datetime.now(UTC)
+    document.processing_attempts = 1
+    db_session.commit()
+    monkeypatch.setattr(
+        knowledge, "get_session_factory", lambda: sessionmaker(bind=database_engine)
+    )
+    assert (
+        knowledge._fail(document.id, "embedding_http_error", retryable=retryable)
+        is retryable
+    )
+    db_session.refresh(document)
+    assert document.status == expected
+
+
+def test_reembedding_does_not_write_vectors_for_replaced_same_count_chunks(
+    api_client, db_session: Session, database_engine, monkeypatch
+) -> None:
+    _, business = active_business(api_client, db_session)
+    document = ready_document(
+        db_session,
+        uuid.UUID(business["id"]),
+        digest="f" * 64,
+        chunks=[("original", vector(0.2), "old-model")],
+    )
+    from app.rag import reembed
+
+    class ReplacingProvider(Provider):
+        def embed(self, texts, *, task_type="RETRIEVAL_DOCUMENT"):
+            document.chunks[0].content = "changed!"
+            document.chunks[0].character_count = len("changed!")
+            db_session.commit()
+            return super().embed(texts, task_type=task_type)
+
+    monkeypatch.setattr(
+        reembed, "get_session_factory", lambda: sessionmaker(bind=database_engine)
+    )
+    monkeypatch.setattr(reembed, "get_settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr(
+        reembed, "create_embedding_provider", lambda _: ReplacingProvider()
+    )
+    reembed.process_reembed(str(document.id))
+    db_session.refresh(document)
+    assert document.chunks[0].content == "changed!"
+    assert document.chunks[0].embedding_model == "old-model"
+
+
+def test_owner_retry_accepts_embedding_failure_without_replacing_document(
+    api_client, db_session: Session, monkeypatch
+) -> None:
+    user, business = active_business(api_client, db_session)
+    document = KnowledgeDocument(**document_values(uuid.UUID(business["id"])))
+    db_session.add(document)
+    db_session.commit()
+    document.status = KnowledgeDocumentStatus.PROCESSING
+    document.processing_started_at = datetime.now(UTC)
+    document.processing_attempts = 3
+    db_session.commit()
+    document.status = KnowledgeDocumentStatus.FAILED
+    document.failure_code = "embedding_unavailable"
+    document.processing_completed_at = datetime.now(UTC)
+    db_session.commit()
+    queued = []
+    monkeypatch.setattr(
+        knowledge,
+        "enqueue_document",
+        lambda identifier, settings, **kwargs: queued.append((identifier, kwargs)),
+    )
+    from app.services.knowledge_documents import retry
+
+    result = retry(
+        db_session, user, document.business_id, document.id, Settings(_env_file=None)
+    )
+    assert result.id == document.id
+    assert result.status is KnowledgeDocumentStatus.PENDING
+    assert queued == [(document.id, {"retry_failed": True})]
+
+
+def test_ready_replacement_supersedes_old_chunks_without_deleting_history(
+    api_client, db_session: Session
+) -> None:
+    user, business = active_business(api_client, db_session)
+    business_id = uuid.UUID(business["id"])
+    original = ready_document(
+        db_session,
+        business_id,
+        digest="a" * 64,
+        chunks=[("Original return policy.", vector(1), "bge-m3")],
+    )
+    replacement = KnowledgeDocument(
+        **document_values(
+            business_id, content_sha256="b" * 64, replaces_document_id=original.id
+        )
+    )
+    db_session.add(replacement)
+    db_session.commit()
+    settings = Settings(_env_file=None)
+    found = retrieve(
+        db_session, user, business_id, "return policy", Provider(), settings
+    )
+    assert {chunk.document_id for chunk in found.chunks} == {original.id}
+    replacement.status = KnowledgeDocumentStatus.PROCESSING
+    replacement.processing_started_at = datetime.now(UTC)
+    db_session.commit()
+    db_session.add(
+        KnowledgeDocumentChunk(
+            business_id=business_id,
+            document_id=replacement.id,
+            chunk_index=0,
+            content="Updated return policy.",
+            character_count=len("Updated return policy."),
+            embedding=vector(1),
+            embedding_model="bge-m3",
+            embedded_at=datetime.now(UTC),
+        )
+    )
+    db_session.flush()
+    replacement.status = KnowledgeDocumentStatus.READY
+    replacement.processing_completed_at = datetime.now(UTC)
+    db_session.commit()
+    found = retrieve(
+        db_session, user, business_id, "return policy", Provider(), settings
+    )
+    assert {chunk.document_id for chunk in found.chunks} == {replacement.id}
+    assert db_session.get(KnowledgeDocument, original.id) is not None
+    assert original.chunks[0].content == "Original return policy."

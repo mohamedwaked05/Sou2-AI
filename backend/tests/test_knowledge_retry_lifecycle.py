@@ -11,6 +11,7 @@ from app.core.config import Settings
 from app.database.models import KnowledgeDocument, KnowledgeDocumentStatus
 from app.services.knowledge_documents import RETRYABLE_FAILURE_CODES
 from app.worker.knowledge import PERMANENT, document_job_id, enqueue_document
+from rq.job import JobStatus
 from sqlalchemy.orm import Session, sessionmaker
 
 
@@ -20,8 +21,11 @@ def test_document_job_identity_is_deterministic_and_non_secret() -> None:
     assert document_job_id(identifier).endswith(str(identifier))
 
 
-def test_retryable_and_permanent_codes_do_not_overlap() -> None:
-    assert RETRYABLE_FAILURE_CODES.isdisjoint(PERMANENT)
+def test_explicit_owner_retry_can_recover_repaired_provider_configuration() -> None:
+    assert RETRYABLE_FAILURE_CODES & PERMANENT == {
+        "embedding_model_missing",
+        "embedding_http_error",
+    }
     assert "processing_unavailable" in RETRYABLE_FAILURE_CODES
     assert "malformed_document" in PERMANENT
 
@@ -31,14 +35,15 @@ def test_terminal_job_is_replaced_but_active_job_is_not(monkeypatch) -> None:
     from app.worker import knowledge
     from rq.job import JobStatus
 
-    settings = Mock(
-        knowledge_queue_name="test",
-        redis_url="redis://unused",
-        knowledge_worker_timeout_seconds=120,
+    settings = Settings(
+        _env_file=None, knowledge_queue_name="test", redis_url="redis://unused"
     )
     queue = Mock()
     terminal = Mock()
     terminal.get_status.return_value = JobStatus.FAILED
+    from app.core.runtime import job_contract
+
+    terminal.meta = {"runtime_contract": job_contract(settings, "knowledge")}
     queue.fetch_job.return_value = terminal
     monkeypatch.setattr(knowledge, "Queue", lambda *_args, **_kwargs: queue)
     monkeypatch.setattr(knowledge.Redis, "from_url", lambda _url: object())
@@ -139,3 +144,45 @@ def test_unexpected_worker_failure_reaches_failed_after_retry_limit(
     assert document.processing_attempts == 3
     assert document.failure_code == "processing_unavailable"
     assert document.processing_completed_at is not None
+
+
+@pytest.mark.parametrize("previous_status", [JobStatus.FAILED, JobStatus.FINISHED])
+def test_explicit_document_retry_retains_previous_job(monkeypatch, previous_status):
+    from app.core import runtime
+    from app.worker import knowledge
+
+    configured = Settings(_env_file=None)
+    previous = Mock()
+    previous.get_status.return_value = previous_status
+    previous.meta = {"runtime_contract": {"source_version": "previous-release"}}
+    queue = Mock()
+    queue.fetch_job.return_value = previous
+    monkeypatch.setattr(knowledge, "Queue", lambda *args, **kwargs: queue)
+    monkeypatch.setattr(knowledge.Redis, "from_url", lambda *args: object())
+    identifier = uuid.uuid4()
+    knowledge.enqueue_document(identifier, configured, retry_failed=True)
+    previous.delete.assert_not_called()
+    assert queue.enqueue.call_args.kwargs["job_id"].startswith(
+        knowledge.document_job_id(identifier) + "-retry-"
+    )
+    assert queue.enqueue.call_args.kwargs["meta"][
+        "runtime_contract"
+    ] == runtime.job_contract(configured, "knowledge")
+
+
+def test_reembed_retains_terminal_job_evidence(monkeypatch):
+    from app.rag import reembed
+
+    configured = Settings(_env_file=None)
+    previous = Mock()
+    previous.get_status.return_value = JobStatus.FINISHED
+    queue = Mock()
+    queue.fetch_job.return_value = previous
+    monkeypatch.setattr(reembed, "Queue", lambda *args, **kwargs: queue)
+    monkeypatch.setattr(reembed.Redis, "from_url", lambda *args: object())
+    identifier = uuid.uuid4()
+    reembed.enqueue_reembed(identifier, configured)
+    previous.delete.assert_not_called()
+    assert queue.enqueue.call_args.kwargs["job_id"].startswith(
+        reembed.reembed_job_id(identifier, configured.embedding_model) + "-retry-"
+    )

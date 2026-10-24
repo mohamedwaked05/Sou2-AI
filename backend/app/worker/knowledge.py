@@ -65,7 +65,9 @@ def document_job_id(document_id: uuid.UUID) -> str:
     return f"knowledge-document-{document_id}"
 
 
-def enqueue_document(document_id: uuid.UUID, settings: Settings) -> None:
+def enqueue_document(
+    document_id: uuid.UUID, settings: Settings, *, retry_failed: bool = False
+) -> None:
     require_open_admission(settings)
     queue = Queue(
         settings.knowledge_queue_name, connection=Redis.from_url(settings.redis_url)
@@ -81,8 +83,13 @@ def enqueue_document(document_id: uuid.UUID, settings: Settings) -> None:
     if existing is not None:
         if existing.get_status(refresh=True) in active_statuses:
             return
-        preserve_incompatible_failed_job(existing, settings, "knowledge")
-        existing.delete()
+        if retry_failed:
+            # An explicit owner retry creates new work under the current contract;
+            # the previous job and its failure evidence remain untouched.
+            job_id = f"{job_id}-retry-{uuid.uuid4().hex}"
+        else:
+            preserve_incompatible_failed_job(existing, settings, "knowledge")
+            existing.delete()
     queue.enqueue(
         process_document,
         str(document_id),
@@ -210,7 +217,7 @@ def process_document(document_id: str) -> None:
     except DocumentProcessingError as exc:
         _fail(identifier, exc.code)
     except EmbeddingProviderError as exc:
-        retry = _fail(identifier, exc.code)
+        retry = _fail(identifier, exc.code, retryable=exc.retryable)
         if retry and exc.retryable:
             raise
     except Exception:
@@ -219,7 +226,7 @@ def process_document(document_id: str) -> None:
             raise
 
 
-def _fail(identifier: uuid.UUID, code: str) -> bool:
+def _fail(identifier: uuid.UUID, code: str, *, retryable: bool | None = None) -> bool:
     with get_session_factory()() as session:
         document = session.scalar(
             select(KnowledgeDocument)
@@ -236,7 +243,9 @@ def _fail(identifier: uuid.UUID, code: str) -> bool:
                 KnowledgeDocumentChunk.document_id == identifier
             )
         )
-        retry = code not in PERMANENT and document.processing_attempts < 3
+        retry = (
+            retryable if retryable is not None else code not in PERMANENT
+        ) and document.processing_attempts < 3
         if retry:
             document.status = KnowledgeDocumentStatus.PENDING
             document.processing_started_at = None

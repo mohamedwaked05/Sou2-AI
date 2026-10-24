@@ -2589,19 +2589,21 @@ def test_gemini_planner_branches_require_only_relevant_fields():
     "model,mode,expected",
     [
         ("gemini-3.1-flash-lite", "operational", "MINIMAL"),
-        ("gemini-3.1-flash-lite", "operational_synthesis", "LOW"),
+        ("gemini-3.1-flash-lite", "operational_synthesis", "MINIMAL"),
         ("gemini-3.1-flash-lite", "conversation", "MINIMAL"),
         ("gemini-3.1-flash-lite", "category_resolution", "MINIMAL"),
-        ("gemini-3.1-flash-lite", "preference_resolution", "LOW"),
+        ("gemini-3.1-flash-lite", "preference_resolution", "MINIMAL"),
         ("gemini-3.5-flash-lite", "operational", "MINIMAL"),
         ("gemini-3.5-flash-lite", "conversation", "MINIMAL"),
         ("gemini-3.5-flash-lite", "category_resolution", "MINIMAL"),
-        ("gemini-3.5-flash-lite", "operational_synthesis", "LOW"),
+        ("gemini-3.5-flash-lite", "operational_synthesis", "MINIMAL"),
+        ("gemini-3.5-flash-lite", "grounded", "MINIMAL"),
+        ("gemini-3.1-flash-lite", "grounded", "MINIMAL"),
         ("gemini-3-flash-preview", "category_resolution", "LOW"),
         ("gemini-3-flash-preview", "operational", "LOW"),
     ],
 )
-def test_minimal_thinking_is_scoped_to_supported_flash_lite_bounded_modes(
+def test_minimal_thinking_is_scoped_to_supported_flash_lite_models(
     model, mode, expected
 ):
     provider = GeminiOwnerChatProvider(

@@ -530,7 +530,8 @@ def main() -> None:
             list(_profile_evidence_texts(_profile()))
         ).vectors
         question_vectors = embeddings.embed(
-            [_search_query_text(case["question"]) for case in cases]
+            [_search_query_text(case["question"]) for case in cases],
+            task_type="RETRIEVAL_QUERY",
         ).vectors
     except EmbeddingProviderError as exc:
         outcomes = {case["id"]: _failure(case, (), exc.code) for case in cases}

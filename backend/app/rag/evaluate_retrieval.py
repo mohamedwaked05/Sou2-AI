@@ -52,7 +52,9 @@ def main() -> None:
     result_tenants: dict[str, list[str]] = {}
     for raw_case in raw_cases:
         try:
-            question = provider.embed([str(raw_case["question"])]).vectors[0]
+            question = provider.embed(
+                [str(raw_case["question"])], task_type="RETRIEVAL_QUERY"
+            ).vectors[0]
         except EmbeddingProviderError:
             continue
         ranked = sorted(

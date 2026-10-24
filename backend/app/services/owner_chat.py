@@ -68,7 +68,7 @@ from app.database.models import (
     UserOperationalPreference,
 )
 from app.integrations.profiles import ConnectionProfileRegistry
-from app.rag.embeddings import create_embedding_provider
+from app.rag.embeddings import create_embedding_provider, embed_batched
 from app.rag.retrieval import retrieve
 from app.schemas.operational import (
     BestSellingProductsResult,
@@ -714,11 +714,29 @@ def _normalized_classifier_text(value: str) -> str:
     )
 
 
+def _is_delivery_fee_request(value: str) -> bool:
+    """Distinguish a delivery-service fee from a product amount or quantity."""
+    text = _normalized_classifier_text(value).strip()
+    return bool(
+        re.search(
+            r"^(?:(?:how much (?:is|does)|what (?:is|does))\s+(?:the\s+)?"
+            r"(?:delivery|shipping)\b|"
+            r"(?:قديش|كم)\s+(?:(?:كلفة|تكلفة|رسوم|اجرة)\s+)?"
+            r"(?:التوصيل|توصيل|الشحن|شحن)\b|"
+            r"(?:adeh|addeh?|2addeh?|addesh|2addesh)\s+(?:el\s+)?"
+            r"(?:tawseel|tawsil|tawsiil|delivery|shipping)\b)",
+            text,
+        )
+    )
+
+
 def _is_product_quantity_request(value: str) -> bool:
     """Recognize bounded stock phrasing without classifying generic quantities."""
 
     text = _normalized_classifier_text(value).strip(" ?!.,")
     if not text:
+        return False
+    if _is_delivery_fee_request(value):
         return False
     if re.search(
         r"\b(?:prices?|pricing|cost|se3er|si3r)\b|سعر|اسعار", text
@@ -726,6 +744,7 @@ def _is_product_quantity_request(value: str) -> bool:
         return False
     if re.search(
         r"\b(?:sales?|revenue|refunds?|invoices?|fwetir|fawetir)\b"
+        r"|\bpaid\s+si\s+(?:documents?|headers?|invoices?)\b"
         r"|فواتير|مبيعات|المبيعات|ايراد",
         text,
     ) and not re.search(r"\b(?:stock|inventory)\b|مخزون", text):
@@ -736,6 +755,7 @@ def _is_product_quantity_request(value: str) -> bool:
         r"\bhow many (?P<product>.+?) do we have(?: left| remaining)?\b",
         r"\bhow much (?:do we have|we have)(?: of (?P<product>.+))?$",
         r"\bdo we have (?P<product>.+?) (?:available|left|in stock)\b",
+        r"\bis (?P<product>.+?) (?:currently )?available in (?:warehouse|branch)\b",
         r"\bwhat is (?:the )?quantity of (?P<product>.+?)$",
         r"\bhow much (?P<product>.+?) (?:remains?|is left)\b",
         r"(?:قديش|كم)\s+(?:عنا\s+)?(?P<product>.+?)(?:\s+(?:باقي|ضال|ضل))?$",
@@ -796,7 +816,7 @@ def _query_concepts(value: str) -> frozenset[str]:
             r"ارجاع",
             r"ترجيع",
             r"رجع",
-            r"\b(?:tarji\w*|raje3\w*|rja3\w*)\b",
+            r"\b(?:tarji\w*|rajje3\w*|raje3\w*|rja3\w*)\b",
         ),
         "delivery": (
             r"\bdeliver\w*\b",
@@ -886,9 +906,38 @@ def _query_concepts(value: str) -> frozenset[str]:
         for concept, concept_patterns in patterns.items()
         if any(re.search(pattern, text) for pattern in concept_patterns)
     }
+    if _is_delivery_fee_request(value):
+        if not re.search(r"\b(?:prices?|pricing|se3er|si3r)\b|سعر", text):
+            concepts.discard("prices")
+        concepts.add("delivery")
     if _is_product_quantity_request(value):
         concepts.add("inventory")
     return frozenset(concepts)
+
+
+def _is_knowledge_policy_request(value: str) -> bool:
+    concepts = _query_concepts(value)
+    if concepts & {
+        "inventory",
+        "prices",
+        "sales",
+        "revenue",
+        "restocking",
+        "orders",
+        "appointments",
+    }:
+        return False
+    return bool(
+        concepts & {"returns", "delivery", "warranty", "opening_hours", "location"}
+    ) or bool(
+        re.search(
+            r"\b(?:coupons?|promotions?|loyalty points?)\b|"
+            r"\b(?:frozen|chilled|food)\b.{0,50}\b(?:arriv\w*|wesel|wosel)\b"
+            r".{0,30}\b(?:warm|defi|defe|unsafe)\b|"
+            r"(?:اكل|طعام|مجمد|مبرد).{0,50}(?:وصل|يصل).{0,30}(?:داف|ساخن|حار)",
+            _normalized_classifier_text(value),
+        )
+    )
 
 
 def _search_query_text(value: str) -> str:
@@ -1271,6 +1320,75 @@ def _load_provider_business(
     )
 
 
+def _knowledge_followup_query(
+    session: Session, owner_message: OwnerChatMessage
+) -> str | None:
+    """Keep a referential policy turn with its last cited knowledge answer."""
+    current = owner_message.content
+    if _query_concepts(current) & {
+        "inventory",
+        "prices",
+        "sales",
+        "revenue",
+        "restocking",
+        "orders",
+        "appointments",
+    } or _is_product_quantity_request(current):
+        return None
+    text = _normalized_classifier_text(current)
+    if not re.search(
+        r"^(?:and\b|what about\b|how about\b|does (?:the )?same policy\b|"
+        r"و(?:\s|شو|بالنسبة)|طيب\b|وهل\b|w\s|tab\b|tayeb\b)",
+        text,
+    ):
+        return None
+    if _is_catalogue_lookup_request(current) and re.search(
+        r"\b(?:list|find|search|show|carry|sell|catalogue|catalog)\b", text
+    ):
+        return None
+    previous = session.scalar(
+        select(OwnerChatMessage)
+        .where(
+            OwnerChatMessage.conversation_id == owner_message.conversation_id,
+            OwnerChatMessage.sequence_number < owner_message.sequence_number,
+            OwnerChatMessage.role == ChatMessageRole.ASSISTANT,
+        )
+        .order_by(OwnerChatMessage.sequence_number.desc())
+        .limit(1)
+    )
+    if previous is None or not previous.citations:
+        return None
+    questions = session.scalars(
+        select(OwnerChatMessage.content)
+        .where(
+            OwnerChatMessage.conversation_id == owner_message.conversation_id,
+            OwnerChatMessage.sequence_number < owner_message.sequence_number,
+            OwnerChatMessage.role == ChatMessageRole.OWNER,
+            OwnerChatMessage.generation_state == ChatGenerationState.COMPLETED,
+        )
+        .order_by(OwnerChatMessage.sequence_number.desc())
+        .limit(CHAT_CONTEXT_MESSAGE_LIMIT // 2)
+    ).all()
+    anchor = next(
+        (
+            question
+            for question in questions
+            if _query_concepts(question)
+            & {"returns", "delivery", "warranty", "opening_hours", "location"}
+        ),
+        questions[-1] if questions else "",
+    )
+    return (
+        current
+        + "\nPrevious policy questions: "
+        + " | ".join(
+            dict.fromkeys(
+                question[:400] for question in (anchor, *questions[:1]) if question
+            )
+        )
+    )
+
+
 def _build_conversation_request(
     session: Session,
     business_id: uuid.UUID,
@@ -1505,6 +1623,8 @@ def _build_provider_request(
     business_id: uuid.UUID,
     owner_message_id: uuid.UUID,
     settings: Settings,
+    *,
+    search_question: str | None = None,
 ) -> _PreparedTurn:
     owner_message = session.get(OwnerChatMessage, owner_message_id)
     business = _load_provider_business(session, business_id)
@@ -1529,16 +1649,20 @@ def _build_provider_request(
     knowledge_evidence = tuple(
         f"{record.subject_key}: {record.content}" for record in knowledge
     )
-    search_query = _search_query_text(owner_message.content)
+    search_query = _search_query_text(search_question or owner_message.content)
     embedding_provider = create_embedding_provider(settings)
-    evidence_embeddings = embedding_provider.embed(
-        [search_query, *profile_evidence, *knowledge_evidence]
-    ).vectors
-    question_embedding = evidence_embeddings[0]
-    profile_end = 1 + len(profile_evidence)
+    question_embedding = embedding_provider.embed(
+        [search_query], task_type="RETRIEVAL_QUERY"
+    ).vectors[0]
+    evidence_embeddings = embed_batched(
+        embedding_provider,
+        [*profile_evidence, *knowledge_evidence],
+        settings.embedding_batch_size,
+    )
+    profile_end = len(profile_evidence)
     profile_similarities = tuple(
         _cosine_similarity(question_embedding, vector)
-        for vector in evidence_embeddings[1:profile_end]
+        for vector in evidence_embeddings[:profile_end]
     )
     knowledge_similarities = tuple(
         _cosine_similarity(question_embedding, vector)
@@ -1572,6 +1696,9 @@ def _build_provider_request(
         rolling_summary=rolling_summary,
         requested_at=now,
         max_output_tokens=settings.owner_chat_max_output_tokens,
+        reply_language=_fallback_language(
+            owner_message.content, business.default_language
+        ),
     )
     session.commit()
     return _PreparedTurn(
@@ -1723,8 +1850,8 @@ def _fallback_language(message: str, default_language: str) -> str:
             else "arabic"
         )
     franco_markers = re.search(
-        r"(?i)\b(?:shu|shou|wen|wein|emta|adde|addesh|kif|leish|lesh|"
-        r"nhar|fina|fine|fik|bte[a-z]*|bt[a-z]+|hal|mawdu3|marhaba|"
+        r"(?i)\b(?:shu|shou|wen|wein|emta|adeh|adde|addesh|kif|leish|lesh|"
+        r"nhar|fina|fini|fine|fik|bte[a-z]*|bt[a-z]+|hal|mawdu3|marhaba|"
         r"ahla|ahlein|merci|shukran|chokran|tamam|fhemet|kifak|kifik|"
         r"bshoufak|yalla)\b",
         message,
@@ -1976,48 +2103,38 @@ def _capability_access_reply(
 def _conflicting_source_labels(
     sources: tuple[ProviderSource, ...],
 ) -> tuple[str, ...]:
-    ignored = {
-        "business",
-        "current",
-        "customer",
-        "document",
-        "information",
-        "policy",
-        "service",
-        "that",
-        "the",
-        "this",
-        "with",
-    }
+    # Compare individual claims, not every number or negation in a chunk.
+    # Overlapping passages can contain different examples, fees and page numbers
+    # while making the same policy statement.
+    number = re.compile(r"(?<!\w)[+-]?\d+(?:[.,]\d+)*%?")
+    negation = re.compile(r"\b(?:no|not|never|without|ma|mesh|mish|ليس|لا|غير)\b")
+    quantity = re.compile(
+        r"\d[\d,.% :+-]*(?:lbp|usd|eur|dollars?|days?|hours?|minutes?|"
+        r"percent|kg|units?|أيام|ايام|ساعات|ليرة)\b|\d+:\d+|\d+%"
+    )
 
-    def stated_values(content: str) -> set[str]:
-        return set(re.findall(r"\b\d+(?:[.,]\d+)?%?\b", content))
-
-    def has_negation(content: str) -> bool:
-        text = _normalized_classifier_text(content)
-        return bool(
-            re.search(r"\b(?:no|not|never|without|ma|mesh|mish)\b", text)
-            or re.search(r"(?:ليس|لا|غير)", text)
-        )
-
-    involved: set[str] = set()
-    for index, left in enumerate(sources):
-        left_terms = _evidence_terms(left.content) - ignored
-        left_values = stated_values(left.content)
-        for right in sources[index + 1 :]:
-            right_terms = _evidence_terms(right.content) - ignored
-            smaller = min(len(left_terms), len(right_terms))
-            if smaller == 0 or len(left_terms & right_terms) / smaller < 0.6:
+    def claims(content: str) -> dict[str, set[tuple[tuple[str, ...], bool]]]:
+        statements: dict[str, set[tuple[tuple[str, ...], bool]]] = {}
+        for line in re.split(r"\n+|(?<=[.!?؟])\s+", content):
+            text = _normalized_classifier_text(line)
+            values = tuple(value.replace(",", "") for value in number.findall(text))
+            if values and not quantity.search(text):
                 continue
-            right_values = stated_values(right.content)
-            numeric_conflict = bool(
-                left_values and right_values and left_values != right_values
-            )
-            polarity_conflict = has_negation(left.content) != has_negation(
-                right.content
-            )
-            if numeric_conflict or polarity_conflict:
-                involved.update((left.label, right.label))
+            key = number.sub(" number ", negation.sub("", text))
+            key = " ".join(re.findall(r"[^\W_]+", key, flags=re.UNICODE))
+            if len(key.split()) < 3:
+                continue
+            statements.setdefault(key, set()).add((values, bool(negation.search(text))))
+        return statements
+
+    parsed = [(source, claims(source.content)) for source in sources]
+    involved: set[str] = set()
+    for index, (left, left_claims) in enumerate(parsed):
+        for right, right_claims in parsed[index + 1 :]:
+            for key in left_claims.keys() & right_claims.keys():
+                if len(left_claims[key] | right_claims[key]) > 1:
+                    involved.update((left.label, right.label))
+                    break
     return tuple(source.label for source in sources if source.label in involved)
 
 
@@ -2276,6 +2393,54 @@ def _completed_month_period(
     return None
 
 
+def _source_calendar_sales_arguments(
+    arguments: dict[str, object], request: OwnerChatRequest
+) -> dict[str, object] | None:
+    """Keep calendar days in the approved source zone, not a planner's UTC default."""
+    if arguments.get("capability") != "sales":
+        return arguments
+    message = _normalized_classifier_text(request.messages[-1].content)
+    if re.search(
+        r"\b\d{1,2}:\d{2}\b|t\d{2}:\d{2}"
+        r"|\b\d{1,2}\s*(?:am|pm)\b|\b(?:utc|gmt|noon|midnight)\b"
+        r"|(?<!\d)[+-](?:0\d|1[0-4]):?[0-5]\d\b",
+        message,
+    ):
+        # Explicit instants/timezones retain their meaning, including UTC dates.
+        return arguments
+    zone_name = request.reporting_timezone or request.profile.timezone
+    if any(
+        name != zone_name.casefold()
+        for name in re.findall(r"\b[a-z_]+/[a-z_]+(?:/[a-z_]+)?\b", message)
+    ):
+        return arguments
+    try:
+        start = datetime.fromisoformat(str(arguments["start"]))
+        end = datetime.fromisoformat(str(arguments["end"]))
+    except KeyError, ValueError:
+        return None
+    if start.tzinfo is None or end.tzinfo is None:
+        return None
+    zone = ZoneInfo(zone_name)
+    local = (start.astimezone(zone), end.astimezone(zone))
+    if all(
+        bound.hour == bound.minute == bound.second == bound.microsecond == 0
+        for bound in local
+    ):
+        return arguments
+    if not all(
+        bound.hour == bound.minute == bound.second == bound.microsecond == 0
+        for bound in (start, end)
+    ):
+        # A partial-day proposal cannot safely stand for an unspecified calendar day.
+        return None
+    return {
+        **arguments,
+        "start": start.replace(tzinfo=zone).isoformat(),
+        "end": end.replace(tzinfo=zone).isoformat(),
+    }
+
+
 def _previous_completed_exchange(
     session: Session,
     owner_message_id: uuid.UUID,
@@ -2407,6 +2572,10 @@ def _backend_operational_command(
         if proposal is None:
             return None
         arguments = proposal
+        if tool_name == "operational_report" and request is not None:
+            arguments = _source_calendar_sales_arguments(arguments, request)
+            if arguments is None:
+                return None
     elif tool_name == CURRENT_INVENTORY_TOOL:
         # Only the typed semantic entity can scope an inventory lookup. A provider
         # may propose an owner-facing location reference, which is separately
@@ -5245,13 +5414,30 @@ def _run_operational_loop(
             if len(operational_concepts) == 1
             else None
         )
+        mapped_operations = next(
+            (
+                definition.input_schema.get("properties", {})
+                .get("capability", {})
+                .get("enum")
+                for definition in definitions
+                if definition.name == "operational_report"
+            ),
+            None,
+        )
         if (
             source is not None
-            and {definition.name for definition in definitions} == {PRODUCT_SEARCH_TOOL}
             and unavailable_operation is not None
+            and (
+                {definition.name for definition in definitions} == {PRODUCT_SEARCH_TOOL}
+                or (
+                    source.mapping_profile_key == "discovered_products"
+                    and mapped_operations is not None
+                    and unavailable_operation not in mapped_operations
+                )
+            )
         ):
-            # The backend already knows this source exposes catalogue only. A
-            # model or cached presentation cannot grant inventory access.
+            # Each mapped capability has its own approval. Another approved
+            # operation cannot authorize this request or substitute for it.
             if pending_catalogue is not None:
                 owner.operational_clarification = pending_catalogue.model_dump(
                     mode="json"
@@ -5907,6 +6093,19 @@ def _run_operational_loop(
                         request.messages[-1].content, prepared.business.default_language
                     ),
                 ),
+                usage=aggregate_usage,
+                provider_identifier=result.provider_identifier,
+                model_identifier=result.model_identifier,
+            ), aggregate_usage
+        if (
+            result.semantic_operation == "operational_report"
+            and (result.tool_arguments or {}).get("capability") == "sales"
+            and command is None
+        ):
+            return OwnerChatResult(
+                reply="Please confirm the Sales calendar dates or explicit timestamps. "
+                f"Date-only reports use {reporting_timezone} and include the final "
+                "requested day.",
                 usage=aggregate_usage,
                 provider_identifier=result.provider_identifier,
                 model_identifier=result.model_identifier,
@@ -7590,6 +7789,8 @@ def _generate_claimed_turn(
         # capabilities. The classifier remains only a fast path for legacy live
         # turns; source-backed non-casual turns also receive the planner so a
         # product or category reference is not lost before tool selection.
+        knowledge_followup = _knowledge_followup_query(session, owner_message)
+        policy_request = _is_knowledge_policy_request(owner_message.content)
         is_live_operational = _is_live_operational_request(owner_message.content)
         has_pending_preference = (
             session.scalar(
@@ -7605,7 +7806,9 @@ def _generate_claimed_turn(
             )
             is not None
         )
-        catalogue_lookup = _is_catalogue_lookup_request(owner_message.content)
+        catalogue_lookup = not (
+            knowledge_followup or policy_request
+        ) and _is_catalogue_lookup_request(owner_message.content)
         if _is_short_acknowledgement(owner_message.content):
             previous_owner = session.scalar(
                 select(OwnerChatMessage)
@@ -7673,8 +7876,9 @@ def _generate_claimed_turn(
             )
             _persist_result(session, business_id, claim, result, None, None, ())
             return True
-        if is_live_operational or (
-            profiles is not None and has_active_operational_source
+        if not (knowledge_followup or policy_request) and (
+            is_live_operational
+            or (profiles is not None and has_active_operational_source)
         ):
             executor = (
                 OperationalToolExecutor(session, profiles, settings)
@@ -7798,9 +8002,18 @@ def _generate_claimed_turn(
                 tuple(selected_sources),
             )
             return result.semantic_operation not in {"conversation", "knowledge"}
-        if _requires_business_evidence(owner_message.content):
+        if (
+            policy_request
+            or knowledge_followup
+            or _requires_business_evidence(owner_message.content)
+        ):
             prepared = _build_provider_request(
-                session, user, business_id, claim.message_id, settings
+                session,
+                user,
+                business_id,
+                claim.message_id,
+                settings,
+                search_question=knowledge_followup,
             )
         else:
             prepared = _build_conversation_request(

@@ -4,12 +4,13 @@ Platform persistence/accounting use the existing state-session fixture; source
 queries execute on memory-only SQLite. Native database ACLs have separate tests.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 from app.agent.owner_chat_provider import ProviderToolDefinition
 from app.database.models import SourceOperationalMappingRevision, ToolCallLog
+from app.schemas.operational_mapping import OperationalMapping
 from app.services import operational_mapping, source_mapping
 from sqlalchemy import Engine
 from test_catalogue_chat import offline_provider
@@ -275,6 +276,160 @@ def test_reporting_timezone_comes_from_approved_source_not_business(mapped_chat)
     )
     assert timezone == "Pacific/Honolulu"
     assert set(metrics) == {"revenue", "sales_count"}
+
+
+@pytest.mark.parametrize(
+    "recorded_at,expected",
+    [
+        ("2023-01-31T21:59:59", 0),
+        ("2023-01-31T22:00:00", 1),
+        ("2023-02-01T00:30:00", 1),
+        ("2023-02-16T21:59:59", 1),
+        ("2023-02-16T22:00:00", 0),
+    ],
+)
+@pytest.mark.parametrize(
+    "question",
+    [
+        "How many Paid SI documents were recorded "
+        "from February 1 through February 16, 2023?",
+        "How many Paid SI documents were recorded February 1–16, 2023 "
+        "using Asia/Beirut dates?",
+    ],
+)
+def test_date_only_document_counts_use_source_calendar_boundaries(
+    mapped_chat, recorded_at, expected, question
+):
+    system, source = mapped_chat
+    payload = source.adapter.mapping.model_dump()
+    payload.update(stock=None, prices=None, revenue=None, refunds=None)
+    payload["sales"].update(
+        grain="transaction_events",
+        transaction_identity="enforced_header_key",
+        transaction_columns=[{"object_id": "o3", "column": "id"}],
+        product_columns=[],
+        product_reference="none",
+        quantity=None,
+        unit=None,
+        returns_semantics="unsupported",
+    )
+    source.adapter.mapping = OperationalMapping.model_validate(payload)
+    revision = next(
+        row
+        for row in system.session.added
+        if isinstance(row, SourceOperationalMappingRevision)
+    )
+    revision.mapping = source.adapter.mapping.model_dump(mode="json")
+    sales = source.tables[3]
+    with source.engine.begin() as connection:
+        connection.execute(
+            sales.update()
+            .where(sales.c.tenant == "A")
+            .values(at=datetime.fromisoformat(recorded_at))
+        )
+    # The business fixture is UTC; the approved source is Asia/Beirut.
+    new_turn(system, question)
+    provider, _ = offline_provider(
+        dict(
+            decision="tool",
+            semantic_operation="operational_report",
+            tool_name="operational_report",
+            arguments=dict(
+                capability="sales",
+                start="2023-02-01T00:00:00Z",
+                end="2023-02-17T00:00:00Z",
+            ),
+        )
+    )
+    result, _ = run(system, provider)
+    report = result.operational_presentation.result
+    assert sum(total.transaction_count for total in report.totals) == expected
+    assert report.start == datetime(2023, 1, 31, 22, tzinfo=UTC)
+    assert report.end == datetime(2023, 2, 16, 22, tzinfo=UTC)
+    assert report.timezone == "Asia/Beirut"
+    assert all(total.gross_quantity is None for total in report.totals)
+    assert all(total.gross_revenue is None for total in report.totals)
+
+
+@pytest.mark.parametrize(
+    "question,start,end,expected_start,expected_end",
+    [
+        (
+            "How many Paid SI documents were recorded February 1–16, 2023?",
+            "2023-02-01T00:00:00+02:00",
+            "2023-02-17T00:00:00+02:00",
+            "2023-01-31T22:00:00Z",
+            "2023-02-16T22:00:00Z",
+        ),
+        (
+            "How many Paid SI documents were recorded February 1–16, 2023?",
+            "2023-01-31T22:00:00Z",
+            "2023-02-16T22:00:00Z",
+            "2023-01-31T22:00:00Z",
+            "2023-02-16T22:00:00Z",
+        ),
+        (
+            "How many Paid SI documents were recorded June 1–16, 2023?",
+            "2023-06-01T00:00:00Z",
+            "2023-06-17T00:00:00Z",
+            "2023-05-31T21:00:00Z",
+            "2023-06-16T21:00:00Z",
+        ),
+        (
+            "How many Paid SI documents were recorded February 1–16, 2023 UTC?",
+            "2023-02-01T00:00:00Z",
+            "2023-02-17T00:00:00Z",
+            "2023-02-01T00:00:00Z",
+            "2023-02-17T00:00:00Z",
+        ),
+        (
+            "Count Paid SI documents "
+            "from 2023-02-01T12:30:00Z to 2023-02-02T15:30:00Z.",
+            "2023-02-01T12:30:00Z",
+            "2023-02-02T15:30:00Z",
+            "2023-02-01T12:30:00Z",
+            "2023-02-02T15:30:00Z",
+        ),
+    ],
+)
+def test_sales_calendar_normalization_preserves_instants_and_seasonal_offsets(
+    mapped_chat, question, start, end, expected_start, expected_end
+):
+    system, _source = mapped_chat
+    new_turn(system, question)
+    provider, _ = offline_provider(
+        dict(
+            decision="tool",
+            semantic_operation="operational_report",
+            tool_name="operational_report",
+            arguments=dict(capability="sales", start=start, end=end),
+        )
+    )
+    result, _ = run(system, provider)
+    report = result.operational_presentation.result
+    assert report.start == datetime.fromisoformat(expected_start)
+    assert report.end == datetime.fromisoformat(expected_end)
+
+
+def test_date_only_sales_cannot_execute_an_unexplained_partial_day(mapped_chat):
+    system, _source = mapped_chat
+    new_turn(system, "Count Paid SI documents for February 1–16, 2023.")
+    provider, _ = offline_provider(
+        dict(
+            decision="tool",
+            semantic_operation="operational_report",
+            tool_name="operational_report",
+            arguments={
+                "capability": "sales",
+                "start": "2023-02-01T12:30:00Z",
+                "end": "2023-02-17T15:30:00Z",
+            },
+        ),
+    )
+    result, _ = run(system, provider)
+    assert result.operational_presentation is None
+    assert "confirm" in result.reply and "Asia/Beirut" in result.reply
+    assert not any(isinstance(row, ToolCallLog) for row in system.session.added)
 
 
 def test_explicit_numeric_product_request_cannot_reuse_selected_identity(mapped_chat):

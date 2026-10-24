@@ -143,6 +143,12 @@ def job_contract(settings: Settings, responsibility: str) -> dict[str, object]:
         contract["embedding_provider"] = settings.embedding_provider
         contract["embedding_model"] = settings.embedding_model
         contract["ollama_embedding_model"] = settings.ollama_embedding_model
+        contract["embedding_dimensions"] = 1024
+        contract["embedding_timeout_seconds"] = (
+            settings.embedding_request_timeout_seconds
+            if settings.embedding_provider == "gemini"
+            else settings.ollama_request_timeout_seconds
+        )
     if responsibility == "outbound":
         contract["provider"] = "meta_whatsapp"
         contract["request_timeout_seconds"] = settings.whatsapp_request_timeout_seconds

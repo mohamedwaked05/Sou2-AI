@@ -12,6 +12,7 @@ from app.agent.owner_chat_provider import (
     GeminiOwnerChatProvider,
     OwnerChatRequest,
     ProviderMessage,
+    ProviderToolDefinition,
     TokenUsage,
 )
 from app.core.exceptions import ApplicationError
@@ -373,11 +374,7 @@ def test_flash_lite_minimal_thinking_preserves_output_allowance(mode):
         mode=mode,
     )
     config = provider._request_payload(request)["generationConfig"]
-    assert config["thinkingConfig"]["thinkingLevel"] == (
-        "MINIMAL"
-        if mode in {"conversation", "operational", "category_resolution"}
-        else "LOW"
-    )
+    assert config["thinkingConfig"]["thinkingLevel"] == "MINIMAL"
     assert config["maxOutputTokens"] == request.max_output_tokens == 512
 
 
@@ -658,4 +655,35 @@ def test_known_unapproved_capability_bypasses_generation(system, question, label
     result, usage = run(system, provider)
     assert label in result.reply
     assert "999" not in result.reply
+    assert not calls and not system.reads and usage.total_tokens == 0
+
+
+@pytest.mark.parametrize(
+    "question,label",
+    [
+        (
+            "How many Pepsi Diet Mini units are in stock in warehouse MN, branch 1?",
+            "Inventory",
+        ),
+        ("Is product 5285000328803 available in warehouse MN, branch 1?", "Inventory"),
+        ("What is the price of Pepsi Diet Mini?", "Pricing"),
+    ],
+)
+def test_sales_approval_cannot_route_unapproved_stock_or_prices_to_sales(
+    system, question, label
+):
+    system.definitions += (
+        ProviderToolDefinition(
+            name="operational_report",
+            description="Approved sales only",
+            input_schema={"properties": {"capability": {"enum": ["sales"]}}},
+        ),
+    )
+    new_turn(system, question)
+    provider, calls = offline_provider(
+        {"decision": "final", "reply": "Invented result 999"}
+    )
+    result, usage = run(system, provider)
+    assert label in result.reply and "not been approved" in result.reply
+    assert "Sales" not in result.reply and "999" not in result.reply
     assert not calls and not system.reads and usage.total_tokens == 0

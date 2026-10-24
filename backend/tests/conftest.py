@@ -95,13 +95,9 @@ def operator_engine(migration_engine: Engine) -> Generator[Engine]:
     engine.dispose()
 
 
-@pytest.fixture
-def db_session(database_engine: Engine, migration_engine: Engine) -> Generator[Session]:
-    factory = sessionmaker(bind=database_engine, expire_on_commit=False)
-    with factory() as session:
-        yield session
-        session.rollback()
-    with migration_engine.begin() as connection:
+def _clear_test_database(engine: Engine) -> None:
+    ensure_test_database_url(str(engine.url))
+    with engine.begin() as connection:
         connection.execute(
             text(
                 "ALTER TABLE business_lifecycle_history DISABLE TRIGGER "
@@ -114,6 +110,11 @@ def db_session(database_engine: Engine, migration_engine: Engine) -> Generator[S
                 "trg_ai_allowance_audit_no_truncate"
             )
         )
+        for table, trigger in (
+            ("catalogue_quality_reports", "trg_quality_report_no_truncate"),
+            ("catalogue_quality_approvals", "trg_quality_approval_no_truncate"),
+        ):
+            connection.execute(text(f"ALTER TABLE {table} DISABLE TRIGGER {trigger}"))
         connection.execute(
             text(
                 "TRUNCATE authentication_maintenance_tasks, authentication_events, "
@@ -145,6 +146,23 @@ def db_session(database_engine: Engine, migration_engine: Engine) -> Generator[S
                 "trg_ai_allowance_audit_no_truncate"
             )
         )
+        for table, trigger in (
+            ("catalogue_quality_reports", "trg_quality_report_no_truncate"),
+            ("catalogue_quality_approvals", "trg_quality_approval_no_truncate"),
+        ):
+            connection.execute(text(f"ALTER TABLE {table} ENABLE TRIGGER {trigger}"))
+
+
+@pytest.fixture
+def db_session(database_engine: Engine, migration_engine: Engine) -> Generator[Session]:
+    _clear_test_database(migration_engine)
+    factory = sessionmaker(bind=database_engine, expire_on_commit=False)
+    try:
+        with factory() as session:
+            yield session
+            session.rollback()
+    finally:
+        _clear_test_database(migration_engine)
 
 
 class MockEmailService:
@@ -162,7 +180,9 @@ class MockEmailService:
 class MockEmbeddingProvider:
     model = "bge-m3"
 
-    def embed(self, texts: list[str]) -> EmbeddingResult:
+    def embed(
+        self, texts: list[str], *, task_type: str = "RETRIEVAL_DOCUMENT"
+    ) -> EmbeddingResult:
         vector = (1.0, *([0.0] * 1023))
         return EmbeddingResult(
             vectors=tuple(vector for _ in texts),
@@ -192,6 +212,7 @@ def api_client(
     monkeypatch.setattr(
         owner_chat, "create_embedding_provider", lambda _: MockEmbeddingProvider()
     )
+    monkeypatch.setattr(owner_chat, "_enqueue_summary_safely", lambda *_: None)
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
         yield client
     app.dependency_overrides.clear()

@@ -7,7 +7,8 @@ Arabic, Franco-Arabic, and mixed-language owner conversations.
 
 Milestone 14 is in progress. It adds tenant-scoped grounded owner-chat retrieval,
 safe persisted citations, and Gemini development generation through the existing
-replaceable provider boundary. Local Ollama `bge-m3` remains the embedding model.
+replaceable provider boundary. Embeddings support Gemini `gemini-embedding-001`
+and local Ollama `bge-m3`, using the existing 1,024-dimensional pgvector storage.
 
 Milestone 17 adds controlled owner-chat execution of four read-only operations on
 top of Milestone 16's strict provider-neutral operational contracts, a predefined
@@ -326,13 +327,22 @@ uvicorn app.main:app --reload
 
 Open Swagger UI at <http://127.0.0.1:8000/docs>.
 
-### Gemini owner chat and local embeddings
+### Gemini owner chat and embeddings
 
 Development owner-chat generation uses deployment-wide
 `OWNER_CHAT_PROVIDER=gemini`. The deterministic mock remains explicit and offline
 for tests or offline development; Gemini failures never fall back to another
 provider. Keep the real `GEMINI_API_KEY` only in the ignored local `.env` file.
-Ollama remains required locally for `bge-m3` document and query embeddings.
+Gemini embeddings use the same private credential loader and API key. Select
+`EMBEDDING_PROVIDER=gemini` and `EMBEDDING_MODEL=gemini-embedding-001` in both API
+and worker configuration. Requests use 1,024 output dimensions, separate
+`RETRIEVAL_DOCUMENT`/`RETRIEVAL_QUERY` tasks, and L2 normalization. The provider
+contract is documented by [Google](https://ai.google.dev/gemini-api/docs/embeddings).
+Ollama is optional when Gemini embeddings are selected; failures never silently
+switch embedding models. After a protected release is OPEN with matching API and
+worker configuration, use the existing `python -m app.rag.reembed --all` workflow
+to replace old-model vectors atomically. Until then, retrieval excludes them.
+Explicit owner retries retain previous queue-job failure evidence.
 Configure the backend before starting it:
 
 ```powershell
@@ -340,6 +350,9 @@ $env:OWNER_CHAT_PROVIDER = "gemini"
 $env:GEMINI_CHAT_MODEL = "gemini-3-flash-preview"
 $env:GEMINI_REQUEST_TIMEOUT_SECONDS = "120"
 $env:OLLAMA_EMBEDDING_MODEL = "bge-m3"
+$env:EMBEDDING_PROVIDER = "gemini"
+$env:EMBEDDING_MODEL = "gemini-embedding-001"
+$env:EMBEDDING_REQUEST_TIMEOUT_SECONDS = "20"
 $env:OWNER_CHAT_GENERATION_LEASE_SECONDS = "150"
 uvicorn app.main:app --reload
 ```

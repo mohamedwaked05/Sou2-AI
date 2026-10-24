@@ -8,7 +8,9 @@ import pytest
 from app.rag.embeddings import (
     EMBEDDING_DIMENSIONS,
     EmbeddingProviderError,
+    GeminiEmbeddingProvider,
     OllamaEmbeddingProvider,
+    create_embedding_provider,
     embed_batched,
 )
 
@@ -100,6 +102,113 @@ def test_missing_model_and_other_client_errors_are_not_retryable() -> None:
     ) as caught:
         missing.embed(["a"])
     assert not caught.value.retryable
+
+
+@pytest.mark.parametrize("task", ["RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY"])
+def test_gemini_contract_preserves_order_dimension_and_normalizes(task: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert (
+            str(request.url)
+            == "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents"
+        )
+        assert request.headers["x-goog-api-key"] == "private-test-key"
+        body = json.loads(request.content)
+        assert [r["content"]["parts"][0]["text"] for r in body["requests"]] == [
+            "first",
+            "second",
+        ]
+        assert all(
+            r["outputDimensionality"] == 1024 and r["taskType"] == task
+            for r in body["requests"]
+        )
+        return httpx.Response(
+            200,
+            json={
+                "embeddings": [
+                    {"values": [3, 4] + [0] * 1022},
+                    {"values": [0, 2] + [0] * 1022},
+                ]
+            },
+        )
+
+    provider = GeminiEmbeddingProvider(
+        api_key="private-test-key",
+        model="gemini-embedding-001",
+        timeout_seconds=1,
+        transport=httpx.MockTransport(handler),
+    )
+    result = provider.embed(["first", "second"], task_type=task)
+    assert result.model == "gemini-embedding-001"
+    assert result.vectors[0][:2] == (0.6, 0.8)
+    assert result.vectors[1][:2] == (0.0, 1.0)
+    assert all(
+        len(v) == 1024 and math.isclose(math.hypot(*v), 1) for v in result.vectors
+    )
+
+
+@pytest.mark.parametrize(
+    "payload,code",
+    [
+        ({"embeddings": []}, "embedding_output_count"),
+        ({"embeddings": [{"values": [1]}]}, "embedding_dimension"),
+        ({"embeddings": [{"values": [0] * 1024}]}, "embedding_invalid_values"),
+        ({"embeddings": [{"values": [True] * 1024}]}, "embedding_invalid_values"),
+        ({"embeddings": [{"values": [math.nan] * 1024}]}, "embedding_invalid_values"),
+        ({"embeddings": [{"values": [math.inf] * 1024}]}, "embedding_invalid_values"),
+        ([], "embedding_invalid_response"),
+    ],
+)
+def test_gemini_rejects_unusable_vectors(payload, code: str) -> None:
+    provider = GeminiEmbeddingProvider(
+        api_key="secret",
+        model="gemini-embedding-001",
+        timeout_seconds=1,
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, content=json.dumps(payload, allow_nan=True))
+        ),
+    )
+    with pytest.raises(EmbeddingProviderError, match=code):
+        provider.embed(["question"])
+
+
+@pytest.mark.parametrize(
+    "status,retryable", [(401, False), (404, False), (429, True), (503, True)]
+)
+def test_gemini_errors_are_safe_and_correctly_retryable(
+    status: int, retryable: bool
+) -> None:
+    provider = GeminiEmbeddingProvider(
+        api_key="secret",
+        model="gemini-embedding-001",
+        timeout_seconds=1,
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(status, text="sensitive-provider-body")
+        ),
+    )
+    with pytest.raises(EmbeddingProviderError) as caught:
+        provider.embed(["private document"])
+    assert caught.value.retryable is retryable
+    assert "sensitive" not in str(caught.value)
+
+
+def test_gemini_factory_requires_matching_configuration() -> None:
+    from app.core.config import Settings
+
+    settings = Settings(
+        _env_file=None,
+        embedding_provider="gemini",
+        embedding_model="gemini-embedding-001",
+        gemini_api_key="test",
+    )
+    assert isinstance(create_embedding_provider(settings), GeminiEmbeddingProvider)
+    with pytest.raises(ValueError, match="EMBEDDING_MODEL"):
+        Settings(_env_file=None, embedding_provider="gemini", gemini_api_key="test")
+    with pytest.raises(ValueError, match="GEMINI_API_KEY"):
+        Settings(
+            _env_file=None,
+            embedding_provider="gemini",
+            embedding_model="gemini-embedding-001",
+        )
     invalid_request = _provider(
         httpx.MockTransport(lambda _: httpx.Response(400, content=b"not-json"))
     )

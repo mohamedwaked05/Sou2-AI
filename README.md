@@ -54,18 +54,21 @@ The restricted operator also changes AI allowances through one controlled
 PostgreSQL function with permanent append-only audit. Owners cannot change their
 allowance through the API.
 
-The architecture includes a FastAPI backend, PostgreSQL with pgvector, local Ollama models, and a React frontend. The backend lives in [`backend/`](backend/README.md), and the frontend lives in [`frontend/`](frontend/README.md).
+The application uses a FastAPI backend, PostgreSQL with pgvector, Gemini or local
+Ollama providers, and a React frontend. Setup details are in
+[`backend/`](backend/README.md) and [`frontend/`](frontend/README.md).
 
 PostgreSQL development uses pgvector. Tenant-owned document metadata and normalized
 chunks are separate from owner-chat `business_knowledge`; PostgreSQL stores only
 provider-neutral storage keys, never file bytes or public URLs. Upload, parsing,
-embeddings, retrieval, and RAG remain future work.
+embedding generation, tenant-scoped retrieval, and grounded Owner Chat with
+persisted source citations are implemented.
 
-Local development uses deployment-wide Ollama for every business; startup remains
-independent of Ollama. The mock provider is explicit and offline-only for tests or
-offline development—there is no automatic fallback. Milestone 9 found critical
-multilingual failures, so Qwen2.5 7B is not production-approved. Production will
-later use an approved OpenAI model through this boundary; OpenAI is not implemented.
+Embedding configuration is shared by the API and knowledge worker. Gemini
+`gemini-embedding-001` supports the existing 1,024-dimensional vector storage;
+Ollama remains an optional provider. Retrieval excludes vectors from other models
+until the safe re-embedding workflow replaces them. The mock provider is explicit
+and offline-only; provider failures never silently switch models.
 
 - [Project specification](PROJECT.md)
 - [System architecture](ARCHITECTURE.md)
@@ -77,7 +80,7 @@ Authenticated full-access members of active businesses can upload private PDF,
 DOCX, and UTF-8 TXT knowledge sources. Redis/RQ runs a separate processing worker;
 the API returns `202` after durable storage and metadata creation. Files are kept
 outside public directories under provider-neutral keys, validated before queuing,
-and normalized into internal chunks only—there are no downloads, embeddings, or
-RAG endpoints. Limits are 5 MiB, 100 PDF pages, 500,000 extracted characters, and
+and normalized into embedded chunks for internal Owner Chat retrieval. Limits
+are 5 MiB, 100 PDF pages, 500,000 extracted characters, and
 500 chunks. Failed documents have safe codes and may be retried; a replacement
 keeps the old READY version until its successor is READY. Deletion is permanent.

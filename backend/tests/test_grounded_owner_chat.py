@@ -28,11 +28,15 @@ from tests.test_rag_lifecycle import Provider, ready_document, vector
 class _MissingEvidenceEmbeddingProvider:
     model = "bge-m3"
 
-    def embed(self, texts: list[str]) -> EmbeddingResult:
+    def embed(
+        self, texts: list[str], *, task_type: str = "RETRIEVAL_DOCUMENT"
+    ) -> EmbeddingResult:
         question = tuple(vector(1))
         unrelated = (0.0, 1.0, *([0.0] * 1022))
         return EmbeddingResult(
-            vectors=(question, *(unrelated for _ in texts[1:])),
+            vectors=tuple(
+                question if task_type == "RETRIEVAL_QUERY" else unrelated for _ in texts
+            ),
             model=self.model,
         )
 
@@ -333,6 +337,90 @@ def test_conflict_detection_requires_material_contradiction() -> None:
     assert owner_chat._conflicting_source_labels(polarity_conflict) == ("S1", "S2")
 
 
+def test_overlapping_policy_chunks_and_distinct_scopes_are_not_conflicts() -> None:
+    sources = (
+        _provider_source(
+            "S1",
+            "DOCUMENT EDITION 1.0 PAGE 4\nZone A delivery costs 75,000 LBP.\n"
+            "Zone B delivery costs 130,000 LBP.",
+            1,
+        ),
+        _provider_source(
+            "S2",
+            "Zone B delivery costs 130,000 LBP.\n"
+            "Zone B requires a 600,000 LBP minimum.\nDOCUMENT EDITION 1.0 PAGE 5",
+            2,
+        ),
+        _provider_source(
+            "S3",
+            "Zone A delivery costs 75,000 LBP.\nZone B delivery costs 130,000 LBP.\n"
+            "Delivery is not offered beyond Zone B.",
+            3,
+        ),
+    )
+    assert owner_chat._conflicting_source_labels(sources) == ()
+    contradictory = _provider_source("S4", "Zone B delivery costs 150,000 LBP.", 4)
+    assert owner_chat._conflicting_source_labels((sources[0], contradictory)) == (
+        "S1",
+        "S4",
+    )
+
+
+def test_cited_policy_followup_keeps_knowledge_context_and_explicit_operations_exit(
+    api_client, db_session: Session, monkeypatch
+) -> None:
+    user, business = active_business(api_client, db_session)
+    business_id = uuid.UUID(business["id"])
+    ready_document(
+        db_session,
+        business_id,
+        digest="f" * 64,
+        chunks=[
+            (
+                "Frozen goods are not eligible for change-of-mind returns.",
+                vector(1),
+                "bge-m3",
+            )
+        ],
+    )
+    provider = CapturingProvider(
+        OwnerChatResult(
+            reply="The demo policy excludes change-of-mind frozen returns [S1].",
+            cited_source_ids=("S1",),
+        )
+    )
+    from app.agent.owner_chat_provider import get_owner_chat_provider
+    from app.main import app
+
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+    first = submit(
+        api_client,
+        user,
+        business["id"],
+        "What are the return conditions?",
+        key="policy-first",
+    )
+    assert first.status_code == 200
+    second = submit(
+        api_client, user, business["id"], "And frozen products?", key="policy-followup"
+    )
+    assert second.status_code == 200
+    assert second.json()["assistant_message"]["sources"][0]["label"] == "S1"
+    assert len(provider.requests) == 2
+    message = db_session.get(
+        OwnerChatMessage, uuid.UUID(second.json()["owner_message"]["id"])
+    )
+    query = owner_chat._knowledge_followup_query(db_session, message)
+    assert "return conditions" in query
+    for content in (
+        "And how much is Pepsi?",
+        "And what is its stock?",
+        "And show Pepsi products",
+    ):
+        message.content = content
+        assert owner_chat._knowledge_followup_query(db_session, message) is None
+
+
 def test_conflict_clarification_enforces_every_authorized_source(
     api_client, db_session: Session, monkeypatch
 ) -> None:
@@ -490,6 +578,96 @@ def test_multilingual_search_expansion_is_semantic_not_question_specific() -> No
     assert "return refund exchange policy" in owner_chat._search_query_text(
         "shu siyaset el tarjii3?"
     )
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "قديش كلفة التوصيل للمنطقة B",
+        "قديش التوصيل للمنطقة B",
+        "Adeh tawseel la zone B?",
+        "How much is delivery to Zone B?",
+    ],
+)
+def test_delivery_fee_questions_are_policies_not_product_stock_or_prices(question):
+    assert not owner_chat._is_product_quantity_request(question)
+    assert "delivery" in owner_chat._query_concepts(question)
+    assert not owner_chat._query_concepts(question) & {"inventory", "prices"}
+
+
+@pytest.mark.parametrize(
+    "question,concept",
+    [
+        ("قديش بقي عنا بيبسي بالمخزون", "inventory"),
+        ("How much is Pepsi Diet Mini?", "prices"),
+        ("How many Pepsi units do we have for delivery?", "inventory"),
+    ],
+)
+def test_product_operational_questions_keep_their_capability_guards(question, concept):
+    assert concept in owner_chat._query_concepts(question)
+
+
+@pytest.mark.parametrize(
+    "question,language",
+    [
+        ("قديش كلفة التوصيل للمنطقة B", "mixed"),
+        ("Fini rajje3 pasta ba3d 5 iyem?", "franco_arabic"),
+        ("Shu bya3mlo iza el frozen food wesel defi?", "franco_arabic"),
+    ],
+)
+def test_clear_policy_uses_rag_with_active_operational_source(
+    api_client, db_session: Session, monkeypatch, question, language
+):
+    user, business = active_business(api_client, db_session)
+    ready_document(
+        db_session,
+        uuid.UUID(business["id"]),
+        digest="f" * 64,
+        chunks=[
+            ("Demo delivery and return policy for frozen food.", vector(1), "bge-m3")
+        ],
+    )
+
+    class Executor:
+        def __init__(self, *_):
+            pass
+
+        def _active_source(self, *_):
+            return object()
+
+        def available_definitions(self, *_):
+            raise AssertionError(
+                "A clear policy question must not use operational tools"
+            )
+
+    monkeypatch.setattr(owner_chat, "OperationalToolExecutor", Executor)
+    provider = CapturingProvider(
+        OwnerChatResult(reply="Demo policy [S1].", cited_source_ids=("S1",))
+    )
+    from app.agent.owner_chat_provider import get_owner_chat_provider
+    from app.main import app
+
+    app.dependency_overrides[get_owner_chat_provider] = lambda: provider
+    response = submit(
+        api_client, user, business["id"], question, key="policy-with-source"
+    )
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["sources"][0]["label"] == "S1"
+    assert len(provider.requests) == 1
+    assert provider.requests[0].mode == "grounded"
+    assert provider.requests[0].reply_language == language
+
+
+def test_mixed_policy_and_product_price_does_not_bypass_approval():
+    assert not owner_chat._is_knowledge_policy_request(
+        "How much is delivery and what is Pepsi's price?"
+    )
+
+
+def test_historical_paid_si_document_count_is_not_inventory():
+    question = "How many historical Paid SI documents do we have?"
+    assert not owner_chat._is_product_quantity_request(question)
+    assert owner_chat._query_concepts(question) == frozenset({"sales"})
 
 
 def test_foreign_evidence_cannot_prevent_missing_knowledge_fallback(

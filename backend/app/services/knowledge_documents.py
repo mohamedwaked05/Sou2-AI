@@ -31,6 +31,11 @@ RETRYABLE_FAILURE_CODES = {
     "processing_unavailable",
     "storage_unavailable",
     "processing_timeout",
+    "embedding_unavailable",
+    "embedding_timeout",
+    "embedding_transport_error",
+    "embedding_model_missing",
+    "embedding_http_error",
 }
 
 
@@ -85,11 +90,16 @@ def _read_upload(upload: UploadFile, settings: Settings) -> tuple[Path, int, str
         raise
 
 
-def _queue(document_id: uuid.UUID, settings: Settings) -> None:
+def _queue(
+    document_id: uuid.UUID, settings: Settings, *, retry_failed: bool = False
+) -> None:
     from app.worker.knowledge import enqueue_document
 
     try:
-        enqueue_document(document_id, settings)
+        if retry_failed:
+            enqueue_document(document_id, settings, retry_failed=True)
+        else:
+            enqueue_document(document_id, settings)
     except Exception:
         raise _error("queue_unavailable", 503) from None
 
@@ -268,7 +278,7 @@ def retry(
     document.processing_attempts = 0
     session.commit()
     try:
-        _queue(document.id, settings)
+        _queue(document.id, settings, retry_failed=True)
     except ApplicationError:
         document.status = KnowledgeDocumentStatus.FAILED
         document.processing_started_at = utc_now()

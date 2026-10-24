@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.core.config import Settings
 from app.database.models import (
@@ -70,6 +70,17 @@ def retrieve(
     if business.status is not BusinessStatus.ACTIVE:
         raise PermissionError("business_not_active")
     try:
+        replacement = aliased(KnowledgeDocument)
+        superseded = (
+            select(replacement.id)
+            .where(
+                replacement.business_id == business_id,
+                replacement.replaces_document_id == KnowledgeDocument.id,
+                replacement.status == KnowledgeDocumentStatus.READY,
+            )
+            .correlate(KnowledgeDocument)
+            .exists()
+        )
         candidate_query = (
             select(KnowledgeDocumentChunk.id)
             .join(
@@ -79,6 +90,7 @@ def retrieve(
             .where(
                 KnowledgeDocumentChunk.business_id == business_id,
                 KnowledgeDocument.status == KnowledgeDocumentStatus.READY,
+                ~superseded,
                 KnowledgeDocumentChunk.embedding.is_not(None),
                 KnowledgeDocumentChunk.embedding_model == settings.embedding_model,
             )
@@ -102,7 +114,7 @@ def retrieve(
         vector = list(
             question_embedding
             if question_embedding is not None
-            else provider.embed([question]).vectors[0]
+            else provider.embed([question], task_type="RETRIEVAL_QUERY").vectors[0]
         )
         distance = KnowledgeDocumentChunk.embedding.cosine_distance(vector)
         similarity = (1 - distance).label("similarity")
@@ -115,6 +127,7 @@ def retrieve(
             .where(
                 KnowledgeDocumentChunk.business_id == business_id,
                 KnowledgeDocument.status == KnowledgeDocumentStatus.READY,
+                ~superseded,
                 KnowledgeDocumentChunk.embedding.is_not(None),
                 KnowledgeDocumentChunk.embedding_model == settings.embedding_model,
             )

@@ -10,7 +10,13 @@ from rq import Queue, Retry
 from rq.job import JobStatus
 from sqlalchemy import or_, select
 
+from app.core.admission import require_open_admission
 from app.core.config import Settings, get_settings
+from app.core.runtime import (
+    job_contract,
+    preserve_incompatible_failed_job,
+    validate_worker_job,
+)
 from app.core.security import utc_now
 from app.database.models import (
     Business,
@@ -32,6 +38,7 @@ def reembed_job_id(document_id: uuid.UUID, model: str) -> str:
 
 
 def enqueue_reembed(document_id: uuid.UUID, settings: Settings) -> None:
+    require_open_admission(settings)
     queue = Queue(
         settings.knowledge_queue_name, connection=Redis.from_url(settings.redis_url)
     )
@@ -45,13 +52,15 @@ def enqueue_reembed(document_id: uuid.UUID, settings: Settings) -> None:
     }:
         return
     if existing:
-        existing.delete()
+        preserve_incompatible_failed_job(existing, settings, "knowledge")
+        job_id = f"{job_id}-retry-{uuid.uuid4().hex}"
     queue.enqueue(
         process_reembed,
         str(document_id),
         job_id=job_id,
         job_timeout=settings.knowledge_worker_timeout_seconds,
         retry=Retry(max=2, interval=[2, 8]),
+        meta={"runtime_contract": job_contract(settings, "knowledge")},
     )
 
 
@@ -81,6 +90,7 @@ def enqueue_needed(business_id: uuid.UUID | None, settings: Settings) -> int:
 
 def process_reembed(document_id: str) -> None:
     settings = get_settings()
+    validate_worker_job(settings, "knowledge")
     identifier = uuid.UUID(document_id)
     with get_session_factory()() as session:
         document = session.scalar(
@@ -109,6 +119,10 @@ def process_reembed(document_id: str) -> None:
         ):
             return
         texts = [chunk.content for chunk in chunks]
+        snapshot = [
+            (chunk.id, chunk.content, chunk.embedding_model, chunk.embedded_at)
+            for chunk in chunks
+        ]
     try:
         vectors = embed_batched(
             create_embedding_provider(settings), texts, settings.embedding_batch_size
@@ -138,7 +152,10 @@ def process_reembed(document_id: str) -> None:
             .order_by(KnowledgeDocumentChunk.chunk_index)
             .with_for_update()
         ).all()
-        if len(chunks) != len(vectors):
+        if len(chunks) != len(vectors) or snapshot != [
+            (chunk.id, chunk.content, chunk.embedding_model, chunk.embedded_at)
+            for chunk in chunks
+        ]:
             return
         for chunk, vector in zip(chunks, vectors, strict=True):
             chunk.embedding = vector
