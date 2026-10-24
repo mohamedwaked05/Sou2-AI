@@ -6,7 +6,7 @@ Run with --confcutdir=tests/offline to exclude database integration fixtures.
 import json
 import socket
 import uuid
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -105,6 +105,36 @@ def test_count_only_report_preserves_reviewed_document_meaning():
     assert meaning in reply
     assert "gross_revenue:" not in reply
     assert "net_quantity:" not in reply
+
+
+@pytest.mark.parametrize("language", ["english", "arabic"])
+def test_empty_historical_period_does_not_claim_zero_actual_sales(language):
+    output = OperationalReport(
+        capability="sales",
+        status="not_found",
+        reason="no_records_in_requested_period",
+        business_id=uuid.uuid4(),
+        source_id=uuid.uuid4(),
+        mapping_revision=1,
+        catalogue_revision=0,
+        source_fingerprint="a" * 64,
+        schema_fingerprint="b" * 64,
+        timezone="Asia/Beirut",
+        source_first_date=date(2023, 1, 2),
+        source_last_date=date(2023, 2, 16),
+        start=datetime(2026, 8, 1, tzinfo=UTC),
+        end=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    view = build_presentation(output).model_copy(update={"language": language})
+    reply = render_operational(view, owner_chat._catalogue_field)
+    assert "2023-01-02" in reply and "2023-02-16" in reply
+    if language == "english":
+        assert "cannot establish business activity" in reply
+        assert "does not establish zero actual sales" in reply
+    else:
+        assert "لا تثبت هذه البيانات نشاط المتجر" in reply
+        assert "لا يعني أن مبيعات المتجر الفعلية كانت صفراً" in reply
+    assert "transaction_count: 0" not in reply
 
 
 def product(key="X-1", name="Cobalt Small", sku="CS", category="Beverages"):

@@ -27,6 +27,8 @@ from sqlalchemy import (
     and_,
     bindparam,
     case,
+    cast,
+    func,
     literal,
     or_,
     select,
@@ -767,15 +769,62 @@ class MappedOperationalSource:
                     )
             else:
                 rows, totals = self._sales(request)
+                if request.capability == "sales":
+                    base.update(self._sales_coverage(request))
             return OperationalReport(
                 **base,
                 status="ok" if rows else "not_found",
+                reason="no_records_in_requested_period"
+                if not rows and request.capability == "sales"
+                else None,
                 rows=tuple(rows[: request.limit]),
                 totals=totals,
                 truncated=len(rows) > request.limit,
             )
         except ValidationError, InvalidOperation, OverflowError:
             raise SourceMappingError("operational_value_invalid") from None
+
+    def _sales_coverage(self, request: OperationalRead) -> dict:
+        """Observed dates for the same approved scope, without a period filter."""
+        fact = self.mapping.sales
+        statement, params = compile_facts(
+            self.mapping,
+            self.catalogue.discovery,
+            self.catalogue.mapping,
+            fact,
+            request,
+            validation=True,
+        )
+        events = statement.order_by(None).subquery()
+        query = select(
+            func.min(events.c.occurred_at), func.max(events.c.occurred_at)
+        ).where(events.c.status.in_(fact.completed_statuses))
+        connector = self.catalogue.connector
+        current = getattr(self, "_execution_connection", None)
+        with (
+            nullcontext(current)
+            if current is not None
+            else connector.connection() as connection
+        ):
+            checks = (
+                {"dependencies": True} if getattr(self, "independent", False) else {}
+            )
+            connector.assert_schema(self.catalogue.discovery, connection, **checks)
+            first, last = connection.execute(query, params).one()
+            connector.assert_schema(self.catalogue.discovery, connection, **checks)
+
+        def source_date(value):
+            if isinstance(value, datetime):
+                if fact.timestamp_basis == "utc":
+                    value = value.replace(tzinfo=UTC) if value.tzinfo is None else value
+                    value = value.astimezone(ZoneInfo(self.mapping.timezone))
+                return value.date()
+            return value
+
+        return {
+            "source_first_date": source_date(first),
+            "source_last_date": source_date(last),
+        }
 
     def _stock(self, request: OperationalRead) -> list[OperationalRow]:
         fact = self.mapping.stock
@@ -892,6 +941,12 @@ class MappedOperationalSource:
         mapping = self.mapping
         if request.rank_by == "net_revenue" and not mapping.revenue:
             raise SourceMappingError("revenue_not_approved")
+        if (
+            mapping.sales.grain == "transaction_events"
+            and mapping.revenue is None
+            and mapping.refunds is None
+        ):
+            return self._transaction_counts(request)
         groups = {}
         money = bool(mapping.revenue)
 
@@ -1082,3 +1137,76 @@ class MappedOperationalSource:
                 key=lambda r: (-getattr(r, rank), r.product_id, r.location or "")
             )
         return result, tuple(totals)
+
+    def _transaction_counts(
+        self, request: OperationalRead
+    ) -> tuple[list[OperationalRow], tuple[OperationalTotal, ...]]:
+        """Count enforced header keys in SQL; never load an unbounded event set."""
+        fact = self.mapping.sales
+        statement, params = compile_facts(
+            self.mapping,
+            self.catalogue.discovery,
+            self.catalogue.mapping,
+            fact,
+            request,
+        )
+        # transaction_events requires the complete enforced root key, and all
+        # joins target enforced unique keys. Each selected row is one document.
+        events = statement.order_by(None).limit(None).subquery()
+        from app.integrations.operational_quality import bad_text
+
+        invalid = or_(
+            *(
+                bad_text(cast(events.c[f"key_{i}"], Unicode), 128)
+                for i in range(len(fact.key_columns))
+            ),
+            *(events.c[f"joined_key_{i}"].is_(None) for i in range(len(fact.joins))),
+        )
+        dimensions = [
+            name for name in ("location", "branch", "warehouse") if getattr(fact, name)
+        ]
+        columns = [events.c[name] for name in dimensions]
+        query = select(
+            *columns,
+            func.count().label("transaction_count"),
+            func.sum(case((invalid, 1), else_=0)).label("invalid_records"),
+        )
+        query = query.select_from(events)
+        if columns:
+            query = query.group_by(*columns).order_by(*columns)
+        connector = self.catalogue.connector
+        current = getattr(self, "_execution_connection", None)
+        with (
+            nullcontext(current)
+            if current is not None
+            else connector.connection() as connection
+        ):
+            checks = (
+                {"dependencies": True} if getattr(self, "independent", False) else {}
+            )
+            connector.assert_schema(self.catalogue.discovery, connection, **checks)
+            groups = (
+                connection.execute(query.limit(51), params).mappings().fetchmany(51)
+            )
+            connector.assert_schema(self.catalogue.discovery, connection, **checks)
+        if len(groups) > 50:
+            raise SourceMappingError("operational_group_budget_exceeded")
+        if any(row["invalid_records"] for row in groups):
+            raise SourceMappingError("operational_transaction_invalid")
+        rows = [
+            OperationalRow(
+                **{name: text_value(row[name]) for name in dimensions},
+                transaction_count=row["transaction_count"],
+            )
+            for row in groups
+            if row["transaction_count"]
+        ]
+        return rows, (
+            (
+                OperationalTotal(
+                    transaction_count=sum(r.transaction_count for r in rows)
+                ),
+            )
+            if rows
+            else ()
+        )

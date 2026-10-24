@@ -394,6 +394,71 @@ def test_current_price_is_not_receipt_price_and_scopes_are_explicit(source):
     )
 
 
+def test_sales_coverage_uses_full_approved_scope_and_not_requested_period():
+    source = fixture_source()
+    sales = source.tables[3]
+    with source.engine.begin() as connection:
+        existing = dict(connection.execute(sales.select()).mappings().first())
+        for key, tenant, state, at in (
+            (101, "A", "completed", NOW - timedelta(days=40)),
+            (102, "B", "completed", NOW + timedelta(days=40)),
+            (103, "A", "CANCELLED", NOW + timedelta(days=80)),
+        ):
+            connection.execute(
+                sales.insert(),
+                {**existing, "id": key, "tenant": tenant, "state": state, "at": at},
+            )
+    request = OperationalRead(
+        capability="sales",
+        catalogue_revision=1,
+        mapping_revision=1,
+        start=NOW + timedelta(days=100),
+        end=NOW + timedelta(days=101),
+    )
+    output = source.adapter.read(request)
+    assert output.status == "not_found"
+    assert output.reason == "no_records_in_requested_period"
+    assert not output.rows and not output.totals
+    assert output.source_first_date == (NOW - timedelta(days=40)).date()
+    assert output.source_last_date == NOW.date()
+    source.engine.dispose()
+
+
+def test_header_counts_exceed_fact_limit_without_loading_documents():
+    from app.integrations.mapped_operational import MAX_FACTS
+
+    source = fixture_source()
+    sales = source.tables[3]
+    payload = source.mapping.model_dump()
+    payload.update(revenue=None, refunds=None)
+    payload["sales"].update(
+        grain="transaction_events",
+        transaction_identity="enforced_header_key",
+        transaction_columns=[{"object_id": "o3", "column": "id"}],
+        product_columns=[],
+        product_reference="none",
+        quantity=None,
+        unit=None,
+        returns_semantics="unsupported",
+    )
+    source.adapter.mapping = OperationalMapping.model_validate(payload)
+    with source.engine.begin() as connection:
+        existing = dict(connection.execute(sales.select()).mappings().first())
+        connection.execute(
+            sales.insert(),
+            [{**existing, "id": key} for key in range(10, MAX_FACTS + 11)],
+        )
+    # This path must use a bounded aggregate, not increase the per-fact limit.
+    source.adapter._read = lambda *_: pytest.fail("Loaded individual headers")
+    output = read(source, "sales")
+    assert output.totals[0].transaction_count == MAX_FACTS + 2
+    assert output.rows[0].transaction_count == MAX_FACTS + 2
+    assert output.rows[0].gross_quantity is None
+    assert output.rows[0].gross_revenue is None
+    assert output.rows[0].currency is None
+    source.engine.dispose()
+
+
 @pytest.mark.parametrize("capability", ["prices", "revenue", "refunds"])
 def test_reviewed_currency_codes_translate_and_unknown_codes_fail(source, capability):
     product_id = (

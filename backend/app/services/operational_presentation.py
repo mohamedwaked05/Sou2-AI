@@ -2,6 +2,8 @@
 
 import re
 from collections.abc import Callable, Sequence
+from datetime import timedelta
+from zoneinfo import ZoneInfo
 
 from app.schemas.operational import (
     BestSellingProductsResult,
@@ -235,7 +237,10 @@ def render_operational(view: OperationalPresentation, safe: SafeField) -> str:
 
     ids = view.purpose.identifiers if view.purpose else view.identifiers
     if isinstance(output, OperationalReport):
-        if output.status in {"unsupported", "not_found"}:
+        if output.status in {"unsupported", "not_found"} and not (
+            output.capability == "sales"
+            and output.reason == "no_records_in_requested_period"
+        ):
             return text("No approved result: ", "لا توجد نتيجة معتمدة: ") + safe_text(
                 output.reason or output.status, "unavailable", safe
             )
@@ -278,6 +283,35 @@ def render_operational(view: OperationalPresentation, safe: SafeField) -> str:
             )
             rows.append(" | ".join(labels))
         scope = []
+        if output.source_first_date and output.source_last_date:
+            scope.append(
+                text("Recorded source dates: ", "تواريخ السجلات في المصدر: ")
+                + f"{output.source_first_date.isoformat()} — "
+                + output.source_last_date.isoformat()
+            )
+            if output.start and output.end:
+                zone = ZoneInfo(output.timezone)
+                first = output.start.astimezone(zone).date()
+                last = (output.end.astimezone(zone) - timedelta(microseconds=1)).date()
+                if first < output.source_first_date or last > output.source_last_date:
+                    scope.append(
+                        text(
+                            "The requested period extends beyond the recorded source "
+                            "dates. This dataset cannot establish business activity "
+                            "outside that range.",
+                            "الفترة المطلوبة تتجاوز تواريخ السجلات المتاحة. "
+                            "لا تثبت هذه البيانات نشاط المتجر خارج هذا النطاق.",
+                        )
+                    )
+        if output.reason == "no_records_in_requested_period":
+            scope.append(
+                text(
+                    "No matching documents are recorded in this dataset for the "
+                    "requested period. This does not establish zero actual sales.",
+                    "لا توجد مستندات مطابقة مسجلة في هذه البيانات للفترة المطلوبة. "
+                    "هذا لا يعني أن مبيعات المتجر الفعلية كانت صفراً.",
+                )
+            )
         for total in output.totals:
             values = total.model_dump(exclude_none=True)
             scope.append(

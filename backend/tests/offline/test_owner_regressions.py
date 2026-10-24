@@ -633,3 +633,29 @@ def test_unfamiliar_unsupported_intent_asks_instead_of_searching(system):
     assert not system.reads
     assert "Which business information" in result.reply
     assert "Inventory access" not in result.reply
+
+
+@pytest.mark.parametrize(
+    "question,label",
+    [
+        ("How much is Pepsi Diet Mini?", "Pricing"),
+        ("How many Paid SI documents are recorded in February 2023?", "Sales"),
+        ("Show the historical Paid SI document count.", "Sales"),
+        ("How many invoices were recorded?", "Sales"),
+        ("Adeh fi fwetir madfou3a bi February 2023?", "Sales"),
+        ("كم عدد فواتير البيع المدفوعة بشباط 2023", "المبيعات"),
+        ("How much did customers receive in refunds?", "Financial reporting"),
+        ("قديش كانت المبيعات الصافية بشباط 2023", "التقارير المالية"),
+        ("Is Pepsi 330ml currently available?", "Inventory"),
+        ("Which products need restocking?", "Restocking"),
+    ],
+)
+def test_known_unapproved_capability_bypasses_generation(system, question, label):
+    new_turn(system, question)
+    provider, calls = offline_provider(
+        {"decision": "final", "reply": "Invented result 999"}
+    )
+    result, usage = run(system, provider)
+    assert label in result.reply
+    assert "999" not in result.reply
+    assert not calls and not system.reads and usage.total_tokens == 0

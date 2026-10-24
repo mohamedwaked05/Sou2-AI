@@ -724,6 +724,12 @@ def _is_product_quantity_request(value: str) -> bool:
         r"\b(?:prices?|pricing|cost|se3er|si3r)\b|سعر|اسعار", text
     ) and not re.search(r"\b(?:stock|inventory|units?)\b|مخزون", text):
         return False
+    if re.search(
+        r"\b(?:sales?|revenue|refunds?|invoices?|fwetir|fawetir)\b"
+        r"|فواتير|مبيعات|المبيعات|ايراد",
+        text,
+    ) and not re.search(r"\b(?:stock|inventory)\b|مخزون", text):
+        return False
     patterns = (
         r"\bhow many (?P<product>.+?) (?:units? )?are (?:in stock|available|left)\b",
         r"\b(?:stock|inventory) (?:of|for) (?P<product>.+)$",
@@ -823,15 +829,20 @@ def _query_concepts(value: str) -> frozenset[str]:
         ),
         "inventory": (
             r"\b(?:inventory|stock)\b",
+            r"\b(?:currently available|availability)\b",
             r"مخزون",
             r"\bmakhzou?n\b",
         ),
         "prices": (
             r"\b(?:prices?|pricing|se3er|si3r)\b",
+            r"\bhow much is\b",
             r"سعر|اسعار",
         ),
         "sales": (
             r"\b(?:sales?|selling|sellers?|sold)\b",
+            r"\bpaid\s+si\s+(?:documents?|headers?|invoices?)\b",
+            r"\b(?:invoices?|fwetir|fawetir)\b",
+            r"فواتير",
             r"مبيعات",
             r"مبيعا",
             r"\bmabi3\w*\b",
@@ -844,6 +855,9 @@ def _query_concepts(value: str) -> frozenset[str]:
         ),
         "revenue": (
             r"\b(?:revenue|turnover|profit|earnings)\b",
+            r"\b(?:gross|net)\s+sales\b",
+            r"المبيعات الصافي",
+            r"\bhow much\b.{0,48}\brefund\w*\b",
             r"\bhow much\b.{0,40}\b(?:was|were|did we|have we)\b"
             r".{0,24}\brefund\w*\b",
             r"\b(?:total refunds?|refund\w*)\b.{0,32}\b(?:last|this|today)\b",
@@ -1853,7 +1867,47 @@ def _capability_unavailable_reply(
         ),
     }
     category = "validation" if reason == "revoked" else reason
-    return messages.get(category, messages["unavailable"])[int(ar)].format(label=label)
+    reply = messages.get(category, messages["unavailable"])[int(ar)].format(label=label)
+    if category == "unapproved":
+        prerequisites = {
+            "stock": (
+                "An authoritative balance, unit, location and freshness must be "
+                "verified. Outgoing movements alone cannot establish stock; "
+                "historical data cannot establish current stock.",
+                "يلزم رصيد موثوق مع الوحدة والموقع وتاريخ التحديث. "
+                "حركات الصرف وحدها لا تثبت الرصيد، "
+                "والبيانات التاريخية لا تثبت المخزون الحالي.",
+            ),
+            "availability": (
+                "Availability requires authoritative stock and reservation rules "
+                "with verified freshness. Historical data cannot establish "
+                "current availability.",
+                "يلزم مخزون موثوق وقواعد حجز مع تاريخ تحديث مثبت. "
+                "البيانات التاريخية لا تثبت التوفر الحالي.",
+            ),
+            "restocking": (
+                "Restocking requires authoritative stock and reviewed reorder "
+                "thresholds. Outgoing sales alone cannot establish a shortage.",
+                "إعادة التخزين تحتاج رصيداً موثوقاً وحدود طلب معتمدة. "
+                "المبيعات الصادرة وحدها لا تثبت وجود نقص.",
+            ),
+            "revenue": (
+                "Gross/net definitions, taxes, discounts, currency and complete "
+                "returns must be verified. Raw signed sums are not verified revenue.",
+                "يلزم إثبات تعريف الإجمالي والصافي والضرائب والخصومات والعملة "
+                "واكتمال المرتجعات. المجاميع الموقعة الخام ليست إيرادات مثبتة.",
+            ),
+            "refunds": (
+                "A complete refund ledger and reviewed signs, currency and "
+                "recognition rules are required. Negative sales alone do not "
+                "prove refunds.",
+                "يلزم سجل مرتجعات كامل مع قواعد معتمدة للإشارة والعملة والاعتراف. "
+                "المبيعات السالبة وحدها لا تثبت مبالغ مستردة.",
+            ),
+        }
+        if operation in prerequisites:
+            reply += " " + prerequisites[operation][int(ar)]
+    return reply
 
 
 def _is_capability_access_request(message: str) -> bool:
@@ -5160,6 +5214,24 @@ def _run_operational_loop(
             pending_sales_clarification=pending_sales,
         )
         explicit_concepts = _query_concepts(request.messages[-1].content)
+        # A date-only count follow-up retains the immediately preceding sales
+        # intent. It cannot grant a capability or inherit a product selection.
+        if not explicit_concepts and re.search(
+            r"\bhow many were recorded\b",
+            _normalized_classifier_text(request.messages[-1].content),
+        ):
+            previous = _previous_completed_exchange(session, owner.id)
+            if previous and "sales" in _query_concepts(previous[0].content):
+                explicit_concepts = frozenset({"sales"})
+        operational_concepts = explicit_concepts & {
+            "inventory",
+            "prices",
+            "sales",
+            "revenue",
+            "restocking",
+        }
+        if "revenue" in operational_concepts:
+            operational_concepts = frozenset({"revenue"})
         unavailable_operation = (
             "stock"
             if _is_product_quantity_request(request.messages[-1].content)
@@ -5168,8 +5240,9 @@ def _run_operational_loop(
                 "prices": "prices",
                 "sales": "sales",
                 "revenue": "revenue",
-            }.get(next(iter(explicit_concepts)))
-            if len(explicit_concepts) == 1
+                "restocking": "restocking",
+            }.get(next(iter(operational_concepts)))
+            if len(operational_concepts) == 1
             else None
         )
         if (
@@ -5197,6 +5270,7 @@ def _run_operational_loop(
                 "prices": "pricing",
                 "sales": "sales",
                 "revenue": "financial",
+                "restocking": "inventory",
             }[unavailable_operation]
             event = capability_event(session, source, family)
             reason = (

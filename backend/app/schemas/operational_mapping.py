@@ -5,7 +5,7 @@ amounts at an explicitly approved grain, never prices inferred from receipts.
 """
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -428,6 +428,8 @@ class OperationalTotal(MappingContract):
 
 class OperationalReport(MappingContract):
     business_meaning: str | None = Field(default=None, max_length=2000)
+    source_first_date: date | None = None
+    source_last_date: date | None = None
     start: datetime | None = None
     end: datetime | None = None
     as_of: datetime | None = None
