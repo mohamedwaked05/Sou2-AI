@@ -1200,7 +1200,7 @@ def test_default_provider_selection_is_mock_without_startup_io() -> None:
 
 def test_gemini_provider_selection_requires_key_only_when_selected() -> None:
     with pytest.raises(ValidationError, match="GEMINI_API_KEY"):
-        Settings(_env_file=None, owner_chat_provider="gemini")
+        Settings(_env_file=None, owner_chat_provider="gemini", gemini_api_key=None)
 
     provider = create_owner_chat_provider(
         Settings(

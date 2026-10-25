@@ -2627,7 +2627,9 @@ def test_connected_source_knowledge_route_preserves_grounding_and_citations(
         db_session,
         uuid.UUID(business["id"]),
         digest="4" * 64,
-        chunks=[("Returns are accepted within 14 days.", vector(1), "bge-m3")],
+        chunks=[
+            ("Returns are accepted within 14 days.", vector(1), "gemini-embedding-001")
+        ],
     )
     source = StubSource()
     provider = SequenceProvider(

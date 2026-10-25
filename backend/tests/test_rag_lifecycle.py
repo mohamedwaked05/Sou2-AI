@@ -33,7 +33,7 @@ def vector(value: float) -> list[float]:
 
 
 class Provider:
-    model = "bge-m3"
+    model = "gemini-embedding-001"
 
     def __init__(self, vectors: list[list[float]] | None = None) -> None:
         self.vectors = vectors or [vector(1.0)]
@@ -98,8 +98,8 @@ def test_retrieval_is_database_tenant_scoped_and_filtered(
         first_id,
         digest="a" * 64,
         chunks=[
-            ("first-one", vector(1.0), "bge-m3"),
-            ("first-two", vector(1.0), "bge-m3"),
+            ("first-one", vector(1.0), "gemini-embedding-001"),
+            ("first-two", vector(1.0), "gemini-embedding-001"),
         ],
     )
     ready_document(
@@ -118,7 +118,7 @@ def test_retrieval_is_database_tenant_scoped_and_filtered(
         db_session,
         second_id,
         digest="d" * 64,
-        chunks=[("foreign-secret", vector(1.0), "bge-m3")],
+        chunks=[("foreign-secret", vector(1.0), "gemini-embedding-001")],
     )
     result = retrieve(
         db_session, user, first_id, "question", Provider(), Settings(_env_file=None)
@@ -178,7 +178,7 @@ def test_document_worker_persists_all_embeddings_or_none(
     db_session.refresh(document)
     assert document.status is KnowledgeDocumentStatus.READY, document.failure_code
     assert len(document.chunks) == 1
-    assert document.chunks[0].embedding_model == "bge-m3"
+    assert document.chunks[0].embedding_model == "gemini-embedding-001"
     assert len(document.chunks[0].embedding or []) == 1024
     chunk_insert = next(
         index
@@ -241,12 +241,15 @@ def test_reembedding_replaces_only_complete_outdated_sets(
     monkeypatch.setattr(reembed, "create_embedding_provider", lambda _: provider)
     process_reembed(str(document.id))
     db_session.refresh(document)
-    assert [chunk.embedding_model for chunk in document.chunks] == ["bge-m3", "bge-m3"]
+    assert [chunk.embedding_model for chunk in document.chunks] == [
+        "gemini-embedding-001",
+        "gemini-embedding-001",
+    ]
     before = [list(chunk.embedding or []) for chunk in document.chunks]
     process_reembed(str(document.id))
     assert provider.calls == 1
-    assert reembed_job_id(document.id, "bge-m3") == reembed_job_id(
-        document.id, "bge-m3"
+    assert reembed_job_id(document.id, "gemini-embedding-001") == reembed_job_id(
+        document.id, "gemini-embedding-001"
     )
     for chunk in document.chunks:
         chunk.embedding_model = "old-model"
@@ -258,7 +261,8 @@ def test_reembedding_replaces_only_complete_outdated_sets(
             EmbeddingProviderError("embedding_invalid_response", retryable=False)
         ),
     )
-    process_reembed(str(document.id))
+    with pytest.raises(EmbeddingProviderError, match="embedding_invalid_response"):
+        process_reembed(str(document.id))
     db_session.refresh(document)
     assert [list(chunk.embedding or []) for chunk in document.chunks] == before
 
@@ -277,13 +281,13 @@ def test_database_evaluation_path_reports_no_cross_tenant_leakage(
         db_session,
         business_id,
         digest="1" * 64,
-        chunks=[("owned", vector(0.9), "bge-m3")],
+        chunks=[("owned", vector(0.9), "gemini-embedding-001")],
     )
     ready_document(
         db_session,
         uuid.UUID(str(foreign["id"])),
         digest="2" * 64,
-        chunks=[("foreign", vector(1.0), "bge-m3")],
+        chunks=[("foreign", vector(1.0), "gemini-embedding-001")],
     )
     retrieved = retrieve(
         db_session,
@@ -467,7 +471,7 @@ def test_ready_replacement_supersedes_old_chunks_without_deleting_history(
         db_session,
         business_id,
         digest="a" * 64,
-        chunks=[("Original return policy.", vector(1), "bge-m3")],
+        chunks=[("Original return policy.", vector(1), "gemini-embedding-001")],
     )
     replacement = KnowledgeDocument(
         **document_values(
@@ -492,7 +496,7 @@ def test_ready_replacement_supersedes_old_chunks_without_deleting_history(
             content="Updated return policy.",
             character_count=len("Updated return policy."),
             embedding=vector(1),
-            embedding_model="bge-m3",
+            embedding_model="gemini-embedding-001",
             embedded_at=datetime.now(UTC),
         )
     )
@@ -506,3 +510,179 @@ def test_ready_replacement_supersedes_old_chunks_without_deleting_history(
     assert {chunk.document_id for chunk in found.chunks} == {replacement.id}
     assert db_session.get(KnowledgeDocument, original.id) is not None
     assert original.chunks[0].content == "Original return policy."
+
+
+@pytest.mark.parametrize("chunk_count", [2, 80, 500])
+def test_ingestion_small_medium_and_maximum_chunk_scope(
+    api_client, db_session, database_engine, monkeypatch, chunk_count
+):
+    _, business = active_business(api_client, db_session)
+    paragraphs = [
+        f"Demonstration passage {i:04d}. " + "Policy example. " * 60
+        for i in range(chunk_count)
+    ]
+    content = "\n\n".join(paragraph[:900] for paragraph in paragraphs)
+    assert len(content) <= 500_000
+    document = KnowledgeDocument(
+        **document_values(
+            uuid.UUID(business["id"]),
+            original_filename="scope.txt",
+            mime_type="text/plain",
+        )
+    )
+    db_session.add(document)
+    db_session.commit()
+    monkeypatch.setattr(
+        knowledge,
+        "get_session_factory",
+        lambda: sessionmaker(bind=database_engine, expire_on_commit=False),
+    )
+    monkeypatch.setattr(
+        knowledge,
+        "get_knowledge_storage",
+        lambda _: type(
+            "Storage",
+            (),
+            {"open": lambda *_: nullcontext(io.BytesIO(content.encode()))},
+        )(),
+    )
+    provider = Provider()
+    monkeypatch.setattr(knowledge, "create_embedding_provider", lambda _: provider)
+    knowledge.process_document(str(document.id))
+    db_session.refresh(document)
+    assert document.status is KnowledgeDocumentStatus.READY
+    assert len(document.chunks) == chunk_count
+    assert {chunk.chunk_index for chunk in document.chunks} == set(range(chunk_count))
+    assert all(
+        chunk.embedding_model == "gemini-embedding-001" for chunk in document.chunks
+    )
+    assert provider.calls == (chunk_count + 15) // 16
+    knowledge.process_document(str(document.id))
+    assert provider.calls == (chunk_count + 15) // 16
+
+
+def test_reembed_failure_is_visible_preserves_vectors_and_excludes_old_model(
+    api_client, db_session, database_engine, monkeypatch
+):
+    from unittest.mock import Mock
+
+    from app.rag import reembed
+
+    user, business = active_business(api_client, db_session)
+    document = ready_document(
+        db_session,
+        uuid.UUID(business["id"]),
+        digest="c" * 64,
+        chunks=[("old return policy", vector(1), "old-model")],
+    )
+    original = [
+        (chunk.id, list(chunk.embedding), chunk.embedded_at)
+        for chunk in document.chunks
+    ]
+    monkeypatch.setattr(
+        reembed,
+        "get_session_factory",
+        lambda: sessionmaker(bind=database_engine, expire_on_commit=False),
+    )
+    job = Mock(meta={})
+    monkeypatch.setattr(knowledge, "get_current_job", lambda: job)
+    monkeypatch.setattr(
+        reembed,
+        "create_embedding_provider",
+        Mock(
+            side_effect=EmbeddingProviderError("embedding_dimension", retryable=False)
+        ),
+    )
+    with pytest.raises(EmbeddingProviderError, match="embedding_dimension"):
+        process_reembed(str(document.id))
+    assert job.meta == {
+        "embedding_failure_code": "embedding_dimension",
+        "embedding_failure_retryable": False,
+    }
+    job.save_meta.assert_called_once()
+    db_session.refresh(document)
+    assert document.status is KnowledgeDocumentStatus.READY
+    assert [
+        (chunk.id, list(chunk.embedding), chunk.embedded_at)
+        for chunk in document.chunks
+    ] == original
+    found = retrieve(
+        db_session,
+        user,
+        document.business_id,
+        "return policy",
+        Provider(),
+        Settings(_env_file=None),
+    )
+    assert found.chunks == ()
+    # A repaired provider can retry without recreating the source or its chunks.
+    monkeypatch.setattr(reembed, "create_embedding_provider", lambda _: Provider())
+    process_reembed(str(document.id))
+    db_session.refresh(document)
+    assert [chunk.id for chunk in document.chunks] == [row[0] for row in original]
+    assert document.chunks[0].embedding_model == "gemini-embedding-001"
+
+
+def test_duplicate_reembed_execution_does_not_repeat_provider_calls(
+    api_client, db_session, database_engine, monkeypatch
+):
+    from app.rag import reembed
+
+    _, business = active_business(api_client, db_session)
+    document = ready_document(
+        db_session,
+        uuid.UUID(business["id"]),
+        digest="c" * 64,
+        chunks=[("policy", vector(1), "old-model")],
+    )
+    monkeypatch.setattr(
+        reembed,
+        "get_session_factory",
+        lambda: sessionmaker(bind=database_engine, expire_on_commit=False),
+    )
+
+    class ReentrantProvider(Provider):
+        def embed(self, texts, **kwargs):
+            process_reembed(str(document.id))
+            return super().embed(texts, **kwargs)
+
+    provider = ReentrantProvider()
+    monkeypatch.setattr(reembed, "create_embedding_provider", lambda _: provider)
+    process_reembed(str(document.id))
+    assert provider.calls == 1
+
+
+def test_reembed_does_not_overwrite_a_document_replaced_during_provider_call(
+    api_client, db_session, database_engine, monkeypatch
+):
+    from app.rag import reembed
+
+    _, business = active_business(api_client, db_session)
+    document = ready_document(
+        db_session,
+        uuid.UUID(business["id"]),
+        digest="c" * 64,
+        chunks=[("old policy", vector(1), "old-model")],
+    )
+    factory = sessionmaker(bind=database_engine, expire_on_commit=False)
+    monkeypatch.setattr(reembed, "get_session_factory", lambda: factory)
+
+    class ReplacingProvider(Provider):
+        def embed(self, texts, **kwargs):
+            with factory() as session:
+                replacement = ready_document(
+                    session,
+                    document.business_id,
+                    digest="d" * 64,
+                    chunks=[("new policy", vector(1), "gemini-embedding-001")],
+                )
+                replacement.replaces_document_id = document.id
+                session.commit()
+            return super().embed(texts, **kwargs)
+
+    monkeypatch.setattr(
+        reembed, "create_embedding_provider", lambda _: ReplacingProvider()
+    )
+    process_reembed(str(document.id))
+    db_session.expire_all()
+    assert document.chunks[0].embedding_model == "old-model"

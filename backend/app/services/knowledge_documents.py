@@ -36,6 +36,7 @@ RETRYABLE_FAILURE_CODES = {
     "embedding_transport_error",
     "embedding_model_missing",
     "embedding_http_error",
+    "embedding_rate_limited",
 }
 
 

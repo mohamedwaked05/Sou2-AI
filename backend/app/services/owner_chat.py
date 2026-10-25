@@ -68,7 +68,11 @@ from app.database.models import (
     UserOperationalPreference,
 )
 from app.integrations.profiles import ConnectionProfileRegistry
-from app.rag.embeddings import create_embedding_provider, embed_batched
+from app.rag.embeddings import (
+    EmbeddingProviderError,
+    create_embedding_provider,
+    embed_batched,
+)
 from app.rag.retrieval import retrieve
 from app.schemas.operational import (
     BestSellingProductsResult,
@@ -8244,6 +8248,17 @@ def _generate_claimed_turn(
             reservation=reservation,
             outcome="uncertain" if reservation is not None else None,
         )
+        if (
+            isinstance(exc, EmbeddingProviderError)
+            and exc.code == "embedding_rate_limited"
+        ):
+            raise _safe_provider_failure(
+                OwnerChatProviderUnavailable(
+                    reason="rate_limited",
+                    retry_after_seconds=exc.retry_after_seconds,
+                    usage_uncertain=False,
+                )
+            ) from None
         raise _provider_unavailable() from None
     if budget is not None and budget.usage is not None:
         usage = budget.usage

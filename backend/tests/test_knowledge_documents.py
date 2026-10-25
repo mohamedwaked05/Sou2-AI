@@ -241,27 +241,31 @@ def test_replacements_and_chunk_constraints(api_client, db_session: Session) -> 
     db_session.rollback()
 
 
-def test_migration_downgrade_reupgrade_retains_vector(
-    alembic_config: Config, migration_engine: Engine
+def test_rejected_legacy_downgrade_retains_documents_and_vector(
+    alembic_config: Config, migration_engine: Engine, api_client, db_session: Session
 ) -> None:
-    command.downgrade(alembic_config, "20260813_04")
-    try:
-        with migration_engine.connect() as connection:
-            assert connection.scalar(
-                text(
-                    "SELECT EXISTS (SELECT 1 FROM pg_extension "
-                    "WHERE extname = 'vector')"
-                )
-            )
-            assert not connection.scalar(
-                text("SELECT to_regclass('public.knowledge_documents') IS NOT NULL")
-            )
-            assert not connection.scalar(
-                text(
-                    "SELECT EXISTS (SELECT 1 FROM pg_type "
-                    "WHERE typname = 'knowledge_document_status')"
-                )
-            )
-        command.upgrade(alembic_config, "20260815_01")
-    finally:
-        command.upgrade(alembic_config, "head")
+    from tests.test_owner_chat import active_business
+
+    _, business = active_business(api_client, db_session)
+    document = KnowledgeDocument(**document_values(uuid.UUID(business["id"])))
+    db_session.add(document)
+    db_session.commit()
+    original = (document.id, document.content_sha256, document.status)
+    with pytest.raises(RuntimeError, match="Quality evidence is permanent"):
+        command.downgrade(alembic_config, "20260813_04")
+    db_session.refresh(document)
+    assert (document.id, document.content_sha256, document.status) == original
+    with migration_engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname='vector')")
+        )
+        assert connection.scalar(
+            text("SELECT to_regclass('public.knowledge_documents') IS NOT NULL")
+        )
+        assert connection.scalar(
+            text("SELECT to_regclass('public.catalogue_quality_approvals') IS NOT NULL")
+        )
+        assert (
+            connection.scalar(text("SELECT version_num FROM alembic_version"))
+            == "20261018_19"
+        )

@@ -21,7 +21,7 @@ from tests.test_rag_lifecycle import Provider, ready_document, vector
 
 
 class _NoEvidenceProvider:
-    model = "bge-m3"
+    model = "gemini-embedding-001"
 
     def embed(
         self, texts: list[str], *, task_type: str = "RETRIEVAL_DOCUMENT"
@@ -240,7 +240,9 @@ def test_business_question_has_priority_over_thanks_and_uses_rag(
         db_session,
         business_id,
         digest="5" * 64,
-        chunks=[("Returns are accepted within 14 days.", vector(1), "bge-m3")],
+        chunks=[
+            ("Returns are accepted within 14 days.", vector(1), "gemini-embedding-001")
+        ],
     )
     provider = CapturingProvider(
         OwnerChatResult(reply="Returns take 14 days.", cited_source_ids=("S1",))

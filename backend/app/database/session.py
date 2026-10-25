@@ -3,7 +3,7 @@
 from collections.abc import Generator
 from functools import lru_cache
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Connection, Engine, create_engine, event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -15,6 +15,20 @@ def ensure_test_database_url(database_url: str) -> None:
     database_name = make_url(database_url).database or ""
     if database_name != "sou2ai_test":
         raise ValueError("Tests must use the isolated sou2ai_test database.")
+
+
+def validate_embedding_storage(connection: Connection) -> None:
+    """Check the existing pgvector column without DDL or provider requests."""
+    actual = connection.scalar(
+        text(
+            "SELECT pg_catalog.format_type(a.atttypid, a.atttypmod) "
+            "FROM pg_catalog.pg_attribute a "
+            "WHERE a.attrelid=to_regclass('public.knowledge_document_chunks') "
+            "AND a.attname='embedding' AND NOT a.attisdropped"
+        )
+    )
+    if actual != "vector(1024)":
+        raise RuntimeError("embedding_storage_dimension_mismatch")
 
 
 def _reject_privileged_runtime_connection(

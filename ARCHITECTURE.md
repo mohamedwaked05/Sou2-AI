@@ -31,7 +31,7 @@ flowchart TD
     RAG --> VECTOR[(PostgreSQL and pgvector)]
     OI[Operational Adapter] --> STORE[(External store PostgreSQL)]
 
-    EMBED --> BGE[BGE-M3 through Ollama]
+    EMBED --> GE[Gemini embedding-001, 1024 dimensions]
     LLM --> GEMINI[Gemini]
     LLM --> QWEN[Optional Qwen2.5 7B through Ollama]
 ```
@@ -48,8 +48,8 @@ one centralized executor; it adds no write tools or public query endpoint.
 * PostgreSQL holds platform-owned identity, business-profile, schedule, owner-chat,
   learned-knowledge, document/chunk, citation, and audit metadata. It does not
   mirror live operational business data.
-* pgvector stores BGE-M3 vectors and supports tenant-filtered cosine retrieval.
-* Ollama provides local BGE-M3 embeddings and optional Qwen2.5 7B generation.
+* pgvector stores normalized 1,024-dimensional Gemini vectors and supports tenant-filtered cosine retrieval.
+* Ollama provides optional Qwen2.5 7B chat generation.
 * Gemini is the implemented cloud generation provider used for grounded-chat
   development evaluation; deterministic mock remains available for offline tests.
 * Private local document storage retains uploaded source files; Redis/RQ performs
@@ -94,7 +94,7 @@ flowchart LR
     V --> X[Text Extraction]
     X --> C[Text Cleaning]
     C --> S[Chunking]
-    S --> E[BGE-M3 Embeddings]
+    S --> E[Gemini Embeddings]
     E --> P[(PostgreSQL and pgvector)]
 ```
 
@@ -529,13 +529,20 @@ implemented. Private S3 remains a future production storage provider.
 
 Each chunk carries the owning `business_id` and references its document through a
 same-business composite foreign key. Embeddings are nullable `vector(1024)` values.
-Milestone 13 creates them through a provider-neutral local Ollama BGE-M3 adapter,
+The Gemini `gemini-embedding-001` adapter requests 1,024 dimensions, uses distinct
+document/query retrieval tasks, normalizes vectors,
 validates every result, and writes all chunks/vectors atomically before marking a
 document `READY`. Internal exact cosine retrieval always filters by authorized
 business, `READY` documents, and the configured embedding model. It has no public
 endpoint; owner chat uses it internally for grounded answer generation.
 Re-embedding uses the same RQ queue and only replaces a complete valid vector set,
 retaining the prior set on failure.
+Permanent re-embedding errors are retained as sanitized RQ failures; old-model
+vectors remain excluded from current-model retrieval. Duplicate jobs use RQ's
+unique enqueueing and execution coordination. Knowledge jobs have a bounded
+900-second default budget; configuration must cover every permitted embedding
+batch plus extraction/storage overhead. Attempt fencing and bounded worker
+maintenance recover interrupted processing without overwriting a newer attempt.
 
 ## 13.4 API security and AI usage control
 
@@ -682,7 +689,7 @@ onboarding, database-controlled business lifecycle history, multiple retained
 private owner conversations, asynchronous rolling memory, ordered persistent owner
 chat, deterministic mock, Gemini, and
 optional local Ollama generation providers, managed permanent/temporary learned
-knowledge, pgvector/BGE-M3 retrieval, private document ingestion and processing,
+knowledge, pgvector/Gemini retrieval, private document ingestion and processing,
 grounded answers with persisted citations, PostgreSQL-backed API limits and AI
 budgets, the HTTP/logging security boundary, the React business interface,
 Milestone 16's provider-neutral contracts, fake-store PostgreSQL adapter,

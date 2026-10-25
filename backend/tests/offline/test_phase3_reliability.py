@@ -379,7 +379,7 @@ def test_worker_mock_is_rejected_even_when_other_providers_are_explicit_and_real
 )
 def test_worker_provider_validates_keys_and_deadlines(field):
     with pytest.raises(ValidationError, match="GEMINI_API_KEY"):
-        Settings(_env_file=None, **{field: "gemini"})
+        Settings(_env_file=None, gemini_api_key=None, **{field: "gemini"})
     with pytest.raises(ValidationError, match="lease must exceed"):
         Settings(
             _env_file=None,

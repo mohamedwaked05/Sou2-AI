@@ -26,7 +26,7 @@ from tests.test_rag_lifecycle import Provider, ready_document, vector
 
 
 class _MissingEvidenceEmbeddingProvider:
-    model = "bge-m3"
+    model = "gemini-embedding-001"
 
     def embed(
         self, texts: list[str], *, task_type: str = "RETRIEVAL_DOCUMENT"
@@ -207,13 +207,13 @@ def test_live_operational_turn_bypasses_all_ai_work_persists_and_replays(
         db_session,
         uuid.UUID(str(business["id"])),
         digest="0" * 64,
-        chunks=[("Current inventory is 55 units.", vector(1), "bge-m3")],
+        chunks=[("Current inventory is 55 units.", vector(1), "gemini-embedding-001")],
     )
     ready_document(
         db_session,
         uuid.UUID(str(foreign_business["id"])),
         digest="1" * 64,
-        chunks=[("Current inventory is 77 units.", vector(1), "bge-m3")],
+        chunks=[("Current inventory is 77 units.", vector(1), "gemini-embedding-001")],
     )
     provider = CapturingProvider(
         OwnerChatResult(
@@ -379,7 +379,7 @@ def test_cited_policy_followup_keeps_knowledge_context_and_explicit_operations_e
             (
                 "Frozen goods are not eligible for change-of-mind returns.",
                 vector(1),
-                "bge-m3",
+                "gemini-embedding-001",
             )
         ],
     )
@@ -436,12 +436,12 @@ def test_conflict_clarification_enforces_every_authorized_source(
             (
                 "Returns are accepted within 14 days with a receipt.",
                 vector(1),
-                "bge-m3",
+                "gemini-embedding-001",
             ),
             (
                 "Returns are accepted within 30 days with a receipt.",
                 vector(1),
-                "bge-m3",
+                "gemini-embedding-001",
             ),
         ],
     )
@@ -496,7 +496,11 @@ def test_foreign_conflict_source_cannot_trigger_clarification(
         business_id,
         digest="3" * 64,
         chunks=[
-            ("Returns are accepted within 14 days with a receipt.", vector(1), "bge-m3")
+            (
+                "Returns are accepted within 14 days with a receipt.",
+                vector(1),
+                "gemini-embedding-001",
+            )
         ],
     )
     ready_document(
@@ -504,7 +508,11 @@ def test_foreign_conflict_source_cannot_trigger_clarification(
         uuid.UUID(str(foreign_business["id"])),
         digest="4" * 64,
         chunks=[
-            ("Returns are accepted within 30 days with a receipt.", vector(1), "bge-m3")
+            (
+                "Returns are accepted within 30 days with a receipt.",
+                vector(1),
+                "gemini-embedding-001",
+            )
         ],
     )
     provider = CapturingProvider(
@@ -550,7 +558,9 @@ def test_lebanese_and_franco_supported_answers_retrieve_and_cite(
         db_session,
         business_id,
         digest=uuid.uuid4().hex * 2,
-        chunks=[("Returns are accepted within 14 days.", vector(1), "bge-m3")],
+        chunks=[
+            ("Returns are accepted within 14 days.", vector(1), "gemini-embedding-001")
+        ],
     )
     provider = CapturingProvider(OwnerChatResult(reply=reply, cited_source_ids=("S1",)))
     monkeypatch.setattr(owner_chat, "create_embedding_provider", lambda _: Provider())
@@ -624,7 +634,11 @@ def test_clear_policy_uses_rag_with_active_operational_source(
         uuid.UUID(business["id"]),
         digest="f" * 64,
         chunks=[
-            ("Demo delivery and return policy for frozen food.", vector(1), "bge-m3")
+            (
+                "Demo delivery and return policy for frozen food.",
+                vector(1),
+                "gemini-embedding-001",
+            )
         ],
     )
 
@@ -683,7 +697,13 @@ def test_foreign_evidence_cannot_prevent_missing_knowledge_fallback(
         db_session,
         uuid.UUID(str(foreign_business["id"])),
         digest="e" * 64,
-        chunks=[("Private antique clock repairs are available.", vector(1), "bge-m3")],
+        chunks=[
+            (
+                "Private antique clock repairs are available.",
+                vector(1),
+                "gemini-embedding-001",
+            )
+        ],
     )
     provider = CapturingProvider()
     monkeypatch.setattr(
@@ -724,7 +744,7 @@ def test_irrelevant_retrieved_chunk_does_not_authorize_generation(
             (
                 "Daily inventory quantities change frequently.",
                 _similarity_vector(0.55),
-                "bge-m3",
+                "gemini-embedding-001",
             )
         ],
     )
@@ -796,7 +816,7 @@ def _persisted_citation(
         db_session,
         business_id,
         digest=uuid.uuid4().hex * 2,
-        chunks=[("Grounded source", vector(1), "bge-m3")],
+        chunks=[("Grounded source", vector(1), "gemini-embedding-001")],
     )
     monkeypatch.setattr(owner_chat, "create_embedding_provider", lambda _: Provider())
     from app.agent.owner_chat_provider import get_owner_chat_provider
@@ -825,7 +845,7 @@ def test_grounded_turn_persists_replays_and_histories_safe_citations(
         db_session,
         business_id,
         digest="7" * 64,
-        chunks=[("Grounded return policy", vector(1), "bge-m3")],
+        chunks=[("Grounded return policy", vector(1), "gemini-embedding-001")],
     )
     provider = CapturingProvider(
         OwnerChatResult(reply="Returns are accepted.", cited_source_ids=("S1",))
@@ -886,7 +906,7 @@ def test_invalid_citations_leave_no_assistant(
         db_session,
         business_id,
         digest=uuid.uuid4().hex * 2,
-        chunks=[("source", vector(1), "bge-m3")],
+        chunks=[("source", vector(1), "gemini-embedding-001")],
     )
     monkeypatch.setattr(owner_chat, "create_embedding_provider", lambda _: Provider())
     from app.agent.owner_chat_provider import get_owner_chat_provider
@@ -906,8 +926,15 @@ def test_invalid_citations_leave_no_assistant(
     assert db_session.scalars(select(OwnerChatMessage)).all()[0].role == "owner"
 
 
+@pytest.mark.parametrize(
+    "code,error_code,delay",
+    [
+        ("embedding_timeout", "assistant_unavailable", None),
+        ("embedding_rate_limited", "assistant_rate_limited", 15647),
+    ],
+)
 def test_retrieval_failure_leaves_no_assistant_and_documents_never_learned(
-    api_client, db_session: Session, monkeypatch
+    api_client, db_session: Session, monkeypatch, code, error_code, delay
 ) -> None:
     user, business = active_business(
         api_client, db_session, email="failure@example.com"
@@ -917,13 +944,13 @@ def test_retrieval_failure_leaves_no_assistant_and_documents_never_learned(
         db_session,
         business_id,
         digest="8" * 64,
-        chunks=[("document only", vector(1), "bge-m3")],
+        chunks=[("document only", vector(1), "gemini-embedding-001")],
     )
     monkeypatch.setattr(
         owner_chat,
         "create_embedding_provider",
         lambda _: (_ for _ in ()).throw(
-            EmbeddingProviderError("embedding_timeout", retryable=True)
+            EmbeddingProviderError(code, retryable=True, retry_after_seconds=delay)
         ),
     )
     response = submit(
@@ -934,6 +961,9 @@ def test_retrieval_failure_leaves_no_assistant_and_documents_never_learned(
         key="retrieval-failure",
     )
     assert response.status_code == 503
+    assert response.json()["error"]["code"] == error_code
+    if delay is not None:
+        assert response.headers["Retry-After"] == str(delay)
     assert len(db_session.scalars(select(OwnerChatMessage)).all()) == 1
     from app.database.models import BusinessKnowledge
 
@@ -1005,7 +1035,7 @@ def test_citation_database_trigger_rejects_foreign_source_and_delete_keeps_safe_
         db_session,
         business_id,
         digest="9" * 64,
-        chunks=[("Our returns policy", vector(1), "bge-m3")],
+        chunks=[("Our returns policy", vector(1), "gemini-embedding-001")],
     )
     foreign_user, foreign_business = active_business(
         api_client, db_session, email="foreign-citation-db@example.com"
@@ -1014,7 +1044,7 @@ def test_citation_database_trigger_rejects_foreign_source_and_delete_keeps_safe_
         db_session,
         uuid.UUID(str(foreign_business["id"])),
         digest="a" * 64,
-        chunks=[("Foreign private details", vector(1), "bge-m3")],
+        chunks=[("Foreign private details", vector(1), "gemini-embedding-001")],
     )
     monkeypatch.setattr(owner_chat, "create_embedding_provider", lambda _: Provider())
     from app.agent.owner_chat_provider import get_owner_chat_provider
@@ -1108,7 +1138,7 @@ def test_citation_trigger_rejects_mismatched_document_and_chunk(
         db_session,
         business_id,
         digest=uuid.uuid4().hex * 2,
-        chunks=[("Different source", vector(1), "bge-m3")],
+        chunks=[("Different source", vector(1), "gemini-embedding-001")],
     )
     citation.chunk_id = other_document.chunks[0].id
 
@@ -1127,7 +1157,7 @@ def test_citation_and_assistant_roll_back_together_on_persistence_failure(
         db_session,
         business_id,
         digest="b" * 64,
-        chunks=[("Grounded source", vector(1), "bge-m3")],
+        chunks=[("Grounded source", vector(1), "gemini-embedding-001")],
     )
     monkeypatch.setattr(owner_chat, "create_embedding_provider", lambda _: Provider())
     monkeypatch.setattr(
@@ -1172,7 +1202,7 @@ def test_unsafe_retrieved_chunk_never_enters_provider_request(
         db_session,
         business_id,
         digest=uuid.uuid4().hex * 2,
-        chunks=[(content, vector(1), "bge-m3")],
+        chunks=[(content, vector(1), "gemini-embedding-001")],
     )
     provider = CapturingProvider()
     monkeypatch.setattr(owner_chat, "create_embedding_provider", lambda _: Provider())
@@ -1220,7 +1250,7 @@ def test_unsafe_output_is_not_persisted(
         db_session,
         business_id,
         digest="c" * 64,
-        chunks=[("Normal returns policy", vector(1), "bge-m3")],
+        chunks=[("Normal returns policy", vector(1), "gemini-embedding-001")],
     )
     monkeypatch.setattr(owner_chat, "create_embedding_provider", lambda _: Provider())
     from app.agent.owner_chat_provider import get_owner_chat_provider

@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import time
 import uuid
 
-from redis import Redis
-from rq import Queue, Retry
-from rq.job import JobStatus
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
+from sqlalchemy.orm import Session
 
-from app.core.admission import require_open_admission
 from app.core.config import Settings, get_settings
 from app.core.runtime import (
-    job_contract,
-    preserve_incompatible_failed_job,
     validate_worker_job,
 )
 from app.core.security import utc_now
@@ -31,6 +28,13 @@ from app.rag.embeddings import (
     create_embedding_provider,
     embed_batched,
 )
+from app.worker.knowledge import (
+    clear_embedding_failure,
+    enqueue_knowledge_job,
+    record_embedding_failure,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def reembed_job_id(document_id: uuid.UUID, model: str) -> str:
@@ -38,29 +42,11 @@ def reembed_job_id(document_id: uuid.UUID, model: str) -> str:
 
 
 def enqueue_reembed(document_id: uuid.UUID, settings: Settings) -> None:
-    require_open_admission(settings)
-    queue = Queue(
-        settings.knowledge_queue_name, connection=Redis.from_url(settings.redis_url)
-    )
-    job_id = reembed_job_id(document_id, settings.embedding_model)
-    existing = queue.fetch_job(job_id)
-    if existing and existing.get_status(refresh=True) in {
-        JobStatus.QUEUED,
-        JobStatus.STARTED,
-        JobStatus.DEFERRED,
-        JobStatus.SCHEDULED,
-    }:
-        return
-    if existing:
-        preserve_incompatible_failed_job(existing, settings, "knowledge")
-        job_id = f"{job_id}-retry-{uuid.uuid4().hex}"
-    queue.enqueue(
+    enqueue_knowledge_job(
+        document_id,
+        settings,
         process_reembed,
-        str(document_id),
-        job_id=job_id,
-        job_timeout=settings.knowledge_worker_timeout_seconds,
-        retry=Retry(max=2, interval=[2, 8]),
-        meta={"runtime_contract": job_contract(settings, "knowledge")},
+        reembed_job_id(document_id, settings.embedding_model),
     )
 
 
@@ -91,14 +77,46 @@ def enqueue_needed(business_id: uuid.UUID | None, settings: Settings) -> int:
 def process_reembed(document_id: str) -> None:
     settings = get_settings()
     validate_worker_job(settings, "knowledge")
+    clear_embedding_failure()
     identifier = uuid.UUID(document_id)
+    # A transaction-scoped advisory lock coordinates duplicate executions without
+    # holding document row locks during provider requests. A dead process releases it.
+    with get_session_factory()() as coordination:
+        if not coordination.scalar(
+            text("SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": f"knowledge-reembed:{identifier}"},
+        ):
+            return
+        _process_reembed(identifier, settings)
+
+
+def _has_ready_replacement(session: Session, identifier: uuid.UUID) -> bool:
+    return (
+        session.scalar(
+            select(KnowledgeDocument.id)
+            .where(
+                KnowledgeDocument.replaces_document_id == identifier,
+                KnowledgeDocument.status == KnowledgeDocumentStatus.READY,
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
+def _process_reembed(identifier: uuid.UUID, settings: Settings) -> None:
+    deadline = time.monotonic() + settings.knowledge_worker_timeout_seconds - 30
     with get_session_factory()() as session:
         document = session.scalar(
             select(KnowledgeDocument)
             .where(KnowledgeDocument.id == identifier)
             .with_for_update()
         )
-        if document is None or document.status is not KnowledgeDocumentStatus.READY:
+        if (
+            document is None
+            or document.status is not KnowledgeDocumentStatus.READY
+            or _has_ready_replacement(session, identifier)
+        ):
             return
         business = session.scalar(
             select(Business)
@@ -125,19 +143,28 @@ def process_reembed(document_id: str) -> None:
         ]
     try:
         vectors = embed_batched(
-            create_embedding_provider(settings), texts, settings.embedding_batch_size
+            create_embedding_provider(settings),
+            texts,
+            settings.embedding_batch_size,
+            deadline=deadline,
         )
     except EmbeddingProviderError as exc:
-        if exc.retryable:
-            raise
-        return
+        record_embedding_failure(exc)
+        logger.error(
+            "knowledge_reembed_failed code=%s retryable=%s", exc.code, exc.retryable
+        )
+        raise
     with get_session_factory()() as session:
         document = session.scalar(
             select(KnowledgeDocument)
             .where(KnowledgeDocument.id == identifier)
             .with_for_update()
         )
-        if document is None or document.status is not KnowledgeDocumentStatus.READY:
+        if (
+            document is None
+            or document.status is not KnowledgeDocumentStatus.READY
+            or _has_ready_replacement(session, identifier)
+        ):
             return
         business = session.scalar(
             select(Business)

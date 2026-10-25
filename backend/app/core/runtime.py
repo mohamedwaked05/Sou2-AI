@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 def validate_release_settings(settings: Settings) -> None:
     """Deployment boundaries require deliberate selections, including local mocks."""
+    validate_embedding_configuration(settings)
     if "environment" not in settings.model_fields_set:
         raise RuntimeError("release_configuration_missing_environment")
     providers = (
@@ -31,6 +32,7 @@ def validate_release_settings(settings: Settings) -> None:
     for field in providers:
         if field not in settings.model_fields_set or getattr(settings, field) is None:
             raise RuntimeError(f"release_configuration_missing_{field}")
+
     selected = {getattr(settings, field) for field in providers}
     if "mock" in selected and settings.environment.casefold() not in {
         "development",
@@ -48,6 +50,35 @@ def validate_release_settings(settings: Settings) -> None:
             raise RuntimeError(f"release_configuration_missing_{field}")
 
 
+def validate_embedding_configuration(settings: Settings) -> None:
+    """Validate the embedding release locally, without a provider API call."""
+    if (
+        settings.embedding_provider != "gemini"
+        or settings.embedding_model != "gemini-embedding-001"
+    ):
+        raise RuntimeError("release_embedding_model_invalid")
+    if (
+        settings.gemini_api_key is None
+        or not settings.gemini_api_key.get_secret_value().strip()
+    ):
+        raise RuntimeError("release_embedding_credentials_missing")
+    if (
+        not 1 <= settings.embedding_batch_size <= 100
+        or not 1 <= settings.embedding_request_timeout_seconds <= 30
+        or not 1 <= settings.knowledge_max_chunks <= 500
+    ):
+        raise RuntimeError("release_embedding_execution_budget_invalid")
+    batches = (
+        settings.knowledge_max_chunks + settings.embedding_batch_size - 1
+    ) // settings.embedding_batch_size
+    if (
+        not batches * settings.embedding_request_timeout_seconds + 60
+        <= settings.knowledge_worker_timeout_seconds
+        <= 1200
+    ):
+        raise RuntimeError("release_embedding_execution_budget_invalid")
+
+
 def validate_worker_release(settings: Settings, queues: list[str]) -> None:
     validate_release_settings(settings)
     expected = settings.worker_expected_source_version
@@ -60,6 +91,14 @@ def validate_worker_release(settings: Settings, queues: list[str]) -> None:
     required = [settings.knowledge_queue_name, settings.customer_message_queue_name]
     if len(set(required)) != 2 or sorted(queues) != sorted(required):
         raise RuntimeError("worker_release_queue_mismatch")
+    if settings.environment.casefold() != "testing":
+        from app.database.session import get_engine, validate_embedding_storage
+
+        try:
+            with get_engine().connect() as connection:
+                validate_embedding_storage(connection)
+        except Exception:
+            raise RuntimeError("worker_embedding_storage_invalid") from None
 
 
 def preserve_incompatible_failed_job(
@@ -142,12 +181,14 @@ def job_contract(settings: Settings, responsibility: str) -> dict[str, object]:
     if responsibility in {"knowledge", "customer"}:
         contract["embedding_provider"] = settings.embedding_provider
         contract["embedding_model"] = settings.embedding_model
-        contract["ollama_embedding_model"] = settings.ollama_embedding_model
         contract["embedding_dimensions"] = 1024
         contract["embedding_timeout_seconds"] = (
             settings.embedding_request_timeout_seconds
-            if settings.embedding_provider == "gemini"
-            else settings.ollama_request_timeout_seconds
+        )
+        contract["embedding_batch_size"] = settings.embedding_batch_size
+        contract["knowledge_max_chunks"] = settings.knowledge_max_chunks
+        contract["knowledge_job_timeout_seconds"] = (
+            settings.knowledge_worker_timeout_seconds
         )
     if responsibility == "outbound":
         contract["provider"] = "meta_whatsapp"

@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import time
 import uuid
-from datetime import timedelta
+from collections.abc import Callable
+from datetime import datetime, timedelta
 
 from redis import Redis
-from rq import Queue, Retry
+from rq import Queue, Retry, get_current_job
+from rq.exceptions import DuplicateJobError
 from rq.job import JobStatus
+from rq.timeouts import JobTimeoutException
 from sqlalchemy import delete, select
 
 from app.core.admission import require_open_admission
@@ -68,42 +73,72 @@ def document_job_id(document_id: uuid.UUID) -> str:
 def enqueue_document(
     document_id: uuid.UUID, settings: Settings, *, retry_failed: bool = False
 ) -> None:
+    enqueue_knowledge_job(
+        document_id,
+        settings,
+        process_document,
+        document_job_id(document_id),
+        reviewed_retry=retry_failed,
+        on_failure=document_job_failed,
+    )
+
+
+def enqueue_knowledge_job(
+    document_id: uuid.UUID,
+    settings: Settings,
+    function: Callable[[str], None],
+    job_id: str,
+    *,
+    reviewed_retry: bool = False,
+    on_failure: Callable | None = None,
+) -> None:
+    """Atomically deduplicate work while retaining every terminal job record."""
     require_open_admission(settings)
     queue = Queue(
         settings.knowledge_queue_name, connection=Redis.from_url(settings.redis_url)
     )
-    job_id = document_job_id(document_id)
-    existing = queue.fetch_job(job_id)
+    base_job_id = job_id
     active_statuses = {
         JobStatus.QUEUED,
         JobStatus.STARTED,
         JobStatus.DEFERRED,
         JobStatus.SCHEDULED,
     }
-    if existing is not None:
+    for _ in range(100):
+        existing = queue.fetch_job(job_id)
+        if existing is None:
+            break
         if existing.get_status(refresh=True) in active_statuses:
             return
-        if retry_failed:
-            # An explicit owner retry creates new work under the current contract;
-            # the previous job and its failure evidence remain untouched.
-            job_id = f"{job_id}-retry-{uuid.uuid4().hex}"
-        else:
+        if not reviewed_retry:
             preserve_incompatible_failed_job(existing, settings, "knowledge")
-            existing.delete()
-    queue.enqueue(
-        process_document,
-        str(document_id),
-        job_id=job_id,
-        job_timeout=settings.knowledge_worker_timeout_seconds,
-        retry=Retry(max=2, interval=[2, 8]),
-        meta={"runtime_contract": job_contract(settings, "knowledge")},
-    )
+        # Each retained terminal attempt has one deterministic successor. Two
+        # simultaneous retry requests therefore choose the same unique RQ job.
+        suffix = hashlib.sha256(job_id.encode()).hexdigest()[:24]
+        job_id = f"{base_job_id}-retry-{suffix}"
+    else:
+        raise RuntimeError("knowledge_retry_history_review_required")
+    try:
+        queue.enqueue(
+            function,
+            str(document_id),
+            job_id=job_id,
+            job_timeout=settings.knowledge_worker_timeout_seconds,
+            retry=Retry(max=2, interval=[2, 8]),
+            on_failure=on_failure,
+            unique=True,
+            meta={"runtime_contract": job_contract(settings, "knowledge")},
+        )
+    except DuplicateJobError:
+        return
 
 
 def process_document(document_id: str) -> None:
     settings = get_settings()
     validate_worker_job(settings, "knowledge")
+    clear_embedding_failure()
     identifier = uuid.UUID(document_id)
+    deadline = time.monotonic() + settings.knowledge_worker_timeout_seconds - 30
     with get_session_factory()() as session:
         document = session.scalar(
             select(KnowledgeDocument)
@@ -147,6 +182,12 @@ def process_document(document_id: str) -> None:
         document.processing_started_at = utc_now()
         document.processing_attempts += 1
         session.commit()
+        claim = (document.processing_started_at, document.processing_attempts)
+        job = get_current_job()
+        if job is not None:
+            job.meta["document_attempt_started_at"] = claim[0].isoformat()
+            job.meta["document_attempt"] = claim[1]
+            job.save_meta()
     try:
         storage = get_knowledge_storage(settings)
         with storage.open(
@@ -163,7 +204,10 @@ def process_document(document_id: str) -> None:
         if len(pieces) > settings.knowledge_max_chunks:
             raise DocumentProcessingError("chunk_limit_exceeded")
         embeddings = embed_batched(
-            create_embedding_provider(settings), pieces, settings.embedding_batch_size
+            create_embedding_provider(settings),
+            pieces,
+            settings.embedding_batch_size,
+            deadline=deadline,
         )
         with get_session_factory()() as session:
             current = session.scalar(
@@ -174,6 +218,7 @@ def process_document(document_id: str) -> None:
             if (
                 current is None
                 or current.status is not KnowledgeDocumentStatus.PROCESSING
+                or (current.processing_started_at, current.processing_attempts) != claim
             ):
                 return
             business = session.get(Business, current.business_id)
@@ -215,18 +260,28 @@ def process_document(document_id: str) -> None:
             current.processing_completed_at = utc_now()
             session.commit()
     except DocumentProcessingError as exc:
-        _fail(identifier, exc.code)
+        _fail(identifier, exc.code, claim=claim)
     except EmbeddingProviderError as exc:
-        retry = _fail(identifier, exc.code, retryable=exc.retryable)
+        record_embedding_failure(exc)
+        retry = _fail(identifier, exc.code, retryable=exc.retryable, claim=claim)
         if retry and exc.retryable:
             raise
+    except JobTimeoutException:
+        if _fail(identifier, "processing_timeout", retryable=True, claim=claim):
+            raise
     except Exception:
-        retry = _fail(identifier, "processing_unavailable")
+        retry = _fail(identifier, "processing_unavailable", claim=claim)
         if retry:
             raise
 
 
-def _fail(identifier: uuid.UUID, code: str, *, retryable: bool | None = None) -> bool:
+def _fail(
+    identifier: uuid.UUID,
+    code: str,
+    *,
+    retryable: bool | None = None,
+    claim: tuple[datetime, int] | None = None,
+) -> bool:
     with get_session_factory()() as session:
         document = session.scalar(
             select(KnowledgeDocument)
@@ -236,6 +291,11 @@ def _fail(identifier: uuid.UUID, code: str, *, retryable: bool | None = None) ->
         if (
             document is None
             or document.status is not KnowledgeDocumentStatus.PROCESSING
+            or (
+                claim is not None
+                and (document.processing_started_at, document.processing_attempts)
+                != claim
+            )
         ):
             return False
         session.execute(
@@ -256,3 +316,74 @@ def _fail(identifier: uuid.UUID, code: str, *, retryable: bool | None = None) ->
             document.processing_completed_at = utc_now()
         session.commit()
         return retry
+
+
+def record_embedding_failure(error: EmbeddingProviderError) -> None:
+    job = get_current_job()
+    if job is None:
+        return
+    job.meta["embedding_failure_code"] = error.code
+    job.meta["embedding_failure_retryable"] = error.retryable
+    job.meta.pop("embedding_http_status", None)
+    job.meta.pop("embedding_retry_after_seconds", None)
+    if error.http_status is not None:
+        job.meta["embedding_http_status"] = error.http_status
+    if error.retry_after_seconds is not None:
+        job.meta["embedding_retry_after_seconds"] = error.retry_after_seconds
+    job.save_meta()
+
+
+def clear_embedding_failure() -> None:
+    """A retry must not inherit the previous attempt's delay or failure class."""
+    job = get_current_job()
+    if job is None:
+        return
+    keys = (
+        "embedding_failure_code",
+        "embedding_failure_retryable",
+        "embedding_http_status",
+        "embedding_retry_after_seconds",
+    )
+    if any(key in job.meta for key in keys):
+        for key in keys:
+            job.meta.pop(key, None)
+        job.save_meta()
+
+
+def document_job_failed(job, connection, exception_type, exception, traceback) -> None:
+    """RQ invokes this even when the work process times out or is abandoned."""
+    started = job.meta.get("document_attempt_started_at")
+    attempt = job.meta.get("document_attempt")
+    if not isinstance(started, str) or not isinstance(attempt, int):
+        return
+    _fail(
+        uuid.UUID(job.args[0]),
+        "processing_timeout",
+        retryable=bool(job.retries_left),
+        claim=(datetime.fromisoformat(started), attempt),
+    )
+
+
+def recover_stale_documents(settings: Settings, *, batch_size: int = 25) -> int:
+    """Bounded recovery for interrupted jobs whose callback could not run."""
+    require_open_admission(settings)
+    cutoff = utc_now() - timedelta(
+        seconds=settings.knowledge_worker_timeout_seconds + 30
+    )
+    with get_session_factory()() as session:
+        documents = session.scalars(
+            select(KnowledgeDocument)
+            .where(
+                KnowledgeDocument.status == KnowledgeDocumentStatus.PROCESSING,
+                KnowledgeDocument.processing_started_at < cutoff,
+            )
+            .order_by(KnowledgeDocument.processing_started_at, KnowledgeDocument.id)
+            .limit(min(max(batch_size, 1), 100))
+            .with_for_update(skip_locked=True)
+        ).all()
+        for document in documents:
+            document.status = KnowledgeDocumentStatus.FAILED
+            document.failure_code = "processing_timeout"
+            document.processing_completed_at = utc_now()
+        session.commit()
+        return len(documents)

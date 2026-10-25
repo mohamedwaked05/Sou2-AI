@@ -142,7 +142,7 @@ class Settings(BaseSettings):
     knowledge_queue_name: str = "knowledge"
     customer_message_queue_name: str = "customer-messages"
     worker_expected_source_version: str | None = None
-    knowledge_worker_timeout_seconds: int = Field(default=120, ge=1, le=120)
+    knowledge_worker_timeout_seconds: int = Field(default=900, ge=1, le=1200)
     api_docs_enabled: bool | None = None
     hsts_enabled: bool = False
     trusted_https_termination: bool = False
@@ -157,11 +157,10 @@ class Settings(BaseSettings):
     gemini_chat_model: str = "gemini-3.1-flash-lite"
     gemini_request_timeout_seconds: int = Field(default=120, ge=1)
     gemini_api_key: SecretStr | None = None
-    ollama_embedding_model: str = "bge-m3"
-    embedding_provider: Literal["ollama", "gemini"] = "ollama"
-    embedding_model: str = "bge-m3"
+    embedding_provider: Literal["gemini"] = "gemini"
+    embedding_model: str = "gemini-embedding-001"
     embedding_request_timeout_seconds: int = Field(default=20, ge=1, le=30)
-    embedding_batch_size: int = Field(default=16, ge=1, le=128)
+    embedding_batch_size: int = Field(default=16, ge=1, le=100)
     retrieval_candidate_limit: int = Field(default=10, ge=1, le=100)
     retrieval_minimum_similarity: float = Field(default=0.50, ge=-1, le=1)
     rag_context_max_chunks: int = Field(default=6, ge=1, le=10)
@@ -318,7 +317,6 @@ class Settings(BaseSettings):
             self.conversation_summary_provider,
             self.customer_chat_provider,
             self.source_mapping_provider,
-            self.embedding_provider,
         )
         if self.environment.casefold() not in {"development", "testing"}:
             if "mock" in generation_providers:
@@ -349,12 +347,20 @@ class Settings(BaseSettings):
             or not self.gemini_api_key.get_secret_value().strip()
         ):
             raise ValueError("GEMINI_API_KEY is required when using Gemini.")
-        if (
-            self.embedding_provider == "gemini"
-            and self.embedding_model != "gemini-embedding-001"
-        ):
+        if self.embedding_model != "gemini-embedding-001":
             raise ValueError(
                 "Gemini embeddings require EMBEDDING_MODEL=gemini-embedding-001."
+            )
+        batches = (
+            self.knowledge_max_chunks + self.embedding_batch_size - 1
+        ) // self.embedding_batch_size
+        if (
+            batches * self.embedding_request_timeout_seconds + 60
+            > self.knowledge_worker_timeout_seconds
+        ):
+            raise ValueError(
+                "KNOWLEDGE_WORKER_TIMEOUT_SECONDS must cover all permitted "
+                "embedding batches plus 60 seconds for extraction and storage."
             )
         if (
             self.source_mapping_provider == "gemini"

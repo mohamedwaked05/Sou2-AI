@@ -34,13 +34,14 @@ Sou2AI aims to provide one natural-language interface for finding information an
 
 ## Local-first principle
 
-During development, the application runs locally without paid AI APIs.
+The application runs locally. Embeddings use the private Gemini API; optional
+Ollama chat generation remains supported.
 
-Planned local AI stack:
+Configured AI providers:
 
 * Ollama
 * Qwen2.5 7B
-* BGE-M3
+* Gemini embedding-001 (1,024 dimensions)
 
 ## Technical stack
 
@@ -57,7 +58,7 @@ AI:
 * Ollama
 * Qwen2.5 7B
 * Gemini
-* BGE-M3
+* Gemini embedding-001
 * Custom RAG pipeline
 * Agent tools in later milestones
 
@@ -75,7 +76,7 @@ Testing and quality:
 
 Milestones 1–13, 15, and 16 are implemented. The repository includes the authenticated
 PostgreSQL platform, tenant lifecycle and AI-budget controls, private document
-storage and processing, pgvector with local BGE-M3 embeddings, tenant-authorized
+storage and processing, pgvector with Gemini embeddings, tenant-authorized
 retrieval, replaceable mock/Ollama/Gemini generation providers, grounded owner
 chat with persisted citations, and the React/Vite business interface.
 
@@ -256,7 +257,7 @@ evaluation; production provider approval remains future work.
 
 ### Milestone 13: Embeddings and vector retrieval  Complete
 
-* Connect BGE-M3 locally behind an embedding-provider interface.
+* Gemini embedding-001 now supplies document and query embeddings through the existing interface.
 * Generate and store chunk embeddings in pgvector.
 * Implement similarity search that always filters by authorized `business_id`.
 * Configure result count, similarity threshold, and embedding model.

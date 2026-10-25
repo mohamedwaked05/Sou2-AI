@@ -7,6 +7,7 @@ os.environ.setdefault("ENVIRONMENT", "testing")
 os.environ.setdefault("CONVERSATION_SUMMARY_PROVIDER", "mock")
 os.environ.setdefault("CUSTOMER_CHAT_PROVIDER", "mock")
 os.environ.setdefault("TRUSTED_HOSTS", "localhost,127.0.0.1,testserver")
+os.environ.setdefault("GEMINI_API_KEY", "offline-test-key")
 
 import pytest
 from alembic import command
@@ -178,7 +179,7 @@ class MockEmailService:
 
 
 class MockEmbeddingProvider:
-    model = "bge-m3"
+    model = "gemini-embedding-001"
 
     def embed(
         self, texts: list[str], *, task_type: str = "RETRIEVAL_DOCUMENT"

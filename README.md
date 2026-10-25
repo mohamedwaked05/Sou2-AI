@@ -55,7 +55,7 @@ PostgreSQL function with permanent append-only audit. Owners cannot change their
 allowance through the API.
 
 The application uses a FastAPI backend, PostgreSQL with pgvector, Gemini or local
-Ollama providers, and a React frontend. Setup details are in
+Ollama chat providers, and a React frontend. Setup details are in
 [`backend/`](backend/README.md) and [`frontend/`](frontend/README.md).
 
 PostgreSQL development uses pgvector. Tenant-owned document metadata and normalized
@@ -66,7 +66,7 @@ persisted source citations are implemented.
 
 Embedding configuration is shared by the API and knowledge worker. Gemini
 `gemini-embedding-001` supports the existing 1,024-dimensional vector storage;
-Ollama remains an optional provider. Retrieval excludes vectors from other models
+Gemini is the required embedding provider. Retrieval excludes vectors from other models
 until the safe re-embedding workflow replaces them. The mock provider is explicit
 and offline-only; provider failures never silently switch models.
 

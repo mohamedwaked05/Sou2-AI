@@ -122,7 +122,7 @@ def test_authentication_maintenance_model_has_one_unique_task_key() -> None:
     assert table.indexes == set()
 
 
-def test_authentication_event_index_migration_downgrades_only_new_indexes(
+def test_authentication_event_indexes_survive_rejected_legacy_downgrade(
     database_engine: Engine,
     alembic_config: Config,
 ) -> None:
@@ -131,16 +131,8 @@ def test_authentication_event_index_migration_downgrades_only_new_indexes(
         index["name"]
         for index in inspect(database_engine).get_indexes("authentication_events")
     }
-    try:
+    with pytest.raises(RuntimeError, match="Quality evidence is permanent"):
         command.downgrade(alembic_config, "20260811_01")
-        after_downgrade = {
-            index["name"]
-            for index in inspect(database_engine).get_indexes("authentication_events")
-        }
-        assert before - after_downgrade == NEW_INDEXES
-        assert after_downgrade == before - NEW_INDEXES
-    finally:
-        command.upgrade(alembic_config, "head")
 
     after_upgrade = {
         index["name"]
@@ -149,7 +141,7 @@ def test_authentication_event_index_migration_downgrades_only_new_indexes(
     assert after_upgrade == before
 
 
-def test_cleanup_throttle_migration_round_trip(
+def test_cleanup_throttle_survives_rejected_legacy_downgrade(
     database_engine: Engine,
     alembic_config: Config,
 ) -> None:
@@ -161,18 +153,12 @@ def test_cleanup_throttle_migration_round_trip(
         index["name"]
         for index in inspect(database_engine).get_indexes("authentication_events")
     }
-    try:
+    with pytest.raises(RuntimeError, match="Quality evidence is permanent"):
         command.downgrade(alembic_config, "20260811_02")
-        assert (
-            "authentication_maintenance_tasks"
-            not in inspect(database_engine).get_table_names()
-        )
-        assert {
-            index["name"]
-            for index in inspect(database_engine).get_indexes("authentication_events")
-        } == authentication_indexes
-    finally:
-        command.upgrade(alembic_config, "head")
+    assert {
+        index["name"]
+        for index in inspect(database_engine).get_indexes("authentication_events")
+    } == authentication_indexes
 
     inspector = inspect(database_engine)
     assert "authentication_maintenance_tasks" in inspector.get_table_names()

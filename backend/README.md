@@ -7,8 +7,8 @@ Arabic, Franco-Arabic, and mixed-language owner conversations.
 
 Milestone 14 is in progress. It adds tenant-scoped grounded owner-chat retrieval,
 safe persisted citations, and Gemini development generation through the existing
-replaceable provider boundary. Embeddings support Gemini `gemini-embedding-001`
-and local Ollama `bge-m3`, using the existing 1,024-dimensional pgvector storage.
+replaceable provider boundary. Embeddings require Gemini `gemini-embedding-001`,
+using the existing 1,024-dimensional pgvector storage.
 
 Milestone 17 adds controlled owner-chat execution of four read-only operations on
 top of Milestone 16's strict provider-neutral operational contracts, a predefined
@@ -24,7 +24,7 @@ request IDs, safe errors, security headers, environment-aware documentation, and
 redacted console/JSON logging. Milestone 6 lifecycle controls and the verified
 mock/local-Ollama owner chat remain intact.
 
-Milestone 13 adds local BGE-M3 embeddings, atomic document embedding, internal
+Milestone 13 introduced embedding retrieval; the current Gemini adapter provides embeddings, atomic document embedding, internal
 tenant-scoped exact pgvector retrieval, and an internal re-embedding queue/CLI.
 Milestone 14 connects that retrieval to grounded owner chat and Gemini; Milestone
 15 provides the React interface. Customer chat, activation/admin APIs,
@@ -107,7 +107,7 @@ request UUID; client request IDs are ignored.
 The compose service uses `pgvector/pgvector:0.8.0-pg17`. The Milestone 11
 migration enables `vector` in development and test databases. Documents store
 tenant-scoped metadata and provider-neutral storage keys; private local storage
-holds file bytes. Secure upload, parsing, deterministic chunking, BGE-M3
+holds file bytes. Secure upload, parsing, deterministic chunking, Gemini
 embeddings, exact cosine retrieval, grounded generation, and persisted citations
 are implemented. Migration downgrade intentionally retains the extension while
 later objects depend on it.
@@ -338,8 +338,8 @@ Gemini embeddings use the same private credential loader and API key. Select
 and worker configuration. Requests use 1,024 output dimensions, separate
 `RETRIEVAL_DOCUMENT`/`RETRIEVAL_QUERY` tasks, and L2 normalization. The provider
 contract is documented by [Google](https://ai.google.dev/gemini-api/docs/embeddings).
-Ollama is optional when Gemini embeddings are selected; failures never silently
-switch embedding models. After a protected release is OPEN with matching API and
+Ollama remains optional for chat generation. Embedding failures never switch
+models. After a protected release is OPEN with matching API and
 worker configuration, use the existing `python -m app.rag.reembed --all` workflow
 to replace old-model vectors atomically. Until then, retrieval excludes them.
 Explicit owner retries retain previous queue-job failure evidence.
@@ -349,7 +349,6 @@ Configure the backend before starting it:
 $env:OWNER_CHAT_PROVIDER = "gemini"
 $env:GEMINI_CHAT_MODEL = "gemini-3-flash-preview"
 $env:GEMINI_REQUEST_TIMEOUT_SECONDS = "120"
-$env:OLLAMA_EMBEDDING_MODEL = "bge-m3"
 $env:EMBEDDING_PROVIDER = "gemini"
 $env:EMBEDDING_MODEL = "gemini-embedding-001"
 $env:EMBEDDING_REQUEST_TIMEOUT_SECONDS = "20"
@@ -687,11 +686,11 @@ equivalent cancellable enforcement before they can validate and activate.
 ## Implementation boundary
 
 Milestone 10 completes the owner-chat-specific provider boundary. Gemini is the
-temporary development generator; local Ollama `bge-m3` provides embeddings. OpenAI
+configured generator; Gemini `gemini-embedding-001` provides embeddings. OpenAI
 remains the planned production replacement through this boundary and is not yet
 implemented. Authoritative provider token counts are preferred; otherwise the existing
 conservative estimate is recorded as non-authoritative. Private documents,
-BGE-M3/pgvector retrieval, grounded RAG with citations, and the React frontend are
+Gemini/pgvector retrieval, grounded RAG with citations, and the React frontend are
 implemented. Milestone 16's operational contracts, read-only PostgreSQL adapter,
 tenant lifecycle management, and Data Sources UI are implemented. Milestone 17's
 bounded read-only tool loop and privacy-minimal auditing are implemented. Customer
@@ -710,13 +709,13 @@ or chunk endpoints. Validation checks filename, declared MIME type, signature,
 structure, encryption, scanned PDFs, and limits (5 MiB, 100 pages, 500,000 text
 characters, 500 chunks). Errors use safe stable codes.
 
-Start infrastructure from the repository root with `docker compose up -d redis
-postgres worker`. For Windows local development, run the API normally and, from
-`backend`, run `.\.venv\Scripts\rq.exe worker --with-scheduler --url
-redis://127.0.0.1:6379/0 knowledge`; one normal RQ worker processes one job at a
-time and promotes delayed retries. The Compose worker shares `./data` with the
-host API and defaults `OLLAMA_BASE_URL` to `http://host.docker.internal:11434`
-so it can use the host's `bge-m3` model. `KNOWLEDGE_STORAGE_ROOT` is private local
+The existing local release must use its protected launcher; do not start another
+API or worker with generic development commands. For a separate, freshly configured
+development installation, Compose defines the privacy-safe RQ worker, its two
+queues, scheduler and shared configuration. One worker processes one job at a
+time and promotes delayed retries. The Compose worker shares `./data` with the host API and
+uses the same private Gemini credential and embedding configuration.
+`KNOWLEDGE_STORAGE_ROOT` is private local
 development storage. Future S3 will use the same storage interface but is not
 implemented. Run focused checks with
 `python -m pytest tests/test_knowledge_documents.py` and the full suite with
@@ -724,17 +723,37 @@ implemented. Run focused checks with
 
 ## Milestone 13 embeddings and retrieval
 
-Ollama embeddings use `POST /api/embed`, `EMBEDDING_PROVIDER=ollama`, and the
-configured `EMBEDDING_MODEL=bge-m3`. Chunk/query content and vectors are never
+Embeddings require `EMBEDDING_PROVIDER=gemini` and
+`EMBEDDING_MODEL=gemini-embedding-001`. Chunk/query content and vectors are never
 logged. Documents become ready only after every deterministic chunk has a valid
 1024-dimension embedding. To queue replacement embeddings without re-reading source
 files, run `python -m app.rag.reembed --business-id <uuid>` or `--all` from
 `backend`; this uses the existing `knowledge` RQ queue.
 
-The local BGE-M3 evaluation uses a 16-document tenant corpus plus separate-tenant
-leakage distractors and 30 multilingual questions. The repaired recorded result is
+Knowledge jobs default to 900 seconds (maximum 1,200). With 500 permitted chunks,
+16 per batch and a 20-second request timeout, configuration reserves all 32
+batches plus at least 60 seconds for extraction/storage. Invalid combinations
+fail startup locally without a provider call. API/worker startup also verifies
+the existing `vector(1024)` column. Interrupted processing is recovered by the
+worker's existing maintenance cycle and remains retryable through Knowledge Base.
+Late results cannot overwrite a newer processing attempt. RQ unique enqueueing
+requires the already-used RQ 2.11 API; terminal job evidence is retained.
+
+Re-embedding failures retain READY documents, source files, citations and prior
+vectors. Safe error codes and retryability are recorded in RQ failure evidence;
+permanent errors do not trigger repeated provider retries. Current-model retrieval
+excludes incompatible vectors until a complete re-embedding succeeds.
+Short provider backoffs retry only the failed batch within the remaining job
+budget. Longer `Retry-After` or Gemini `RetryInfo` delays use scheduled RQ retries,
+leaving the document pending and the worker free for other work.
+Provider delays beyond the one-day scheduling bound retain a terminal failure for
+explicit review rather than making another request earlier than allowed.
+
+The historical BGE-M3 evaluation used a 16-document tenant corpus plus separate-tenant
+leakage distractors and 30 multilingual questions. Its recorded result was
 100% Recall@5/Recall@10 for every language group, 98.3% overall MRR, zero execution
-failures, and zero leakage. Run it with `python -m app.rag.evaluate_retrieval`; it
+failures, and zero leakage. Those are historical model results. Run the current
+Gemini evaluation with `python -m app.rag.evaluate_retrieval`; it
 exits unsuccessfully when a completion gate fails.
 
 ## Milestone 14 grounded owner chat

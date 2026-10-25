@@ -1,4 +1,4 @@
-"""Run the fixed Milestone 13 BGE-M3 retrieval evaluation locally."""
+"""Run the fixed multilingual retrieval evaluation with Gemini embeddings."""
 
 from __future__ import annotations
 

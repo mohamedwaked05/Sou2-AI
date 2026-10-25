@@ -15,6 +15,7 @@ from app.core.middleware import RequestSecurityMiddleware
 from app.core.runtime import (
     WORKER_CONTRACT_VERSION,
     source_version,
+    validate_embedding_configuration,
     worker_configuration_identity,
 )
 
@@ -33,6 +34,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        validate_embedding_configuration(app_settings)
+        if app_settings.environment.casefold() != "testing":
+            from app.database.session import get_engine, validate_embedding_storage
+
+            try:
+                with get_engine().connect() as connection:
+                    validate_embedding_storage(connection)
+            except Exception:
+                raise RuntimeError("api_embedding_storage_invalid") from None
         logger.info(
             "Starting %s version %s in %s environment",
             app_settings.app_name,
