@@ -9,6 +9,7 @@
     "lint": "eslint .",
     "format:check": "prettier --check .",
     "test": "vitest run",
+    "test:conversation-browser": "node tests/conversation-browser.mjs",
     "typecheck": "tsc -b"
   },
   "dependencies": {

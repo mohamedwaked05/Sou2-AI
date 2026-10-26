@@ -1840,6 +1840,7 @@ textarea::placeholder {
   gap: 8px;
 }
 .conversation-index-list > button {
+  min-width: 0;
   width: 100%;
   border: 1px solid transparent;
   border-radius: 12px;

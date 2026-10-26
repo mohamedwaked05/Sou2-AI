@@ -23,4 +23,11 @@ identities are shown only as masked labels; raw phone numbers are never displaye
 
 Run `npm install`, then `npm run dev`. Checks: `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm test`, and `npm run build`.
 
+After building, `npm run test:conversation-browser` checks conversation selection
+against the production bundle in headless Chrome at desktop, tablet and mobile
+widths. It uses synthetic API responses and a temporary browser profile, without
+connecting to the live application. Set `CHROME_PATH` if Chrome is not installed
+at a standard location. This checks layout hit targets that jsdom cannot model;
+it does not replace acceptance testing in the owner's authenticated browser.
+
 Place the user-provided final transparent royal-blue logo at `public/sou2ai-logo.png`; no replacement logo is included here.
