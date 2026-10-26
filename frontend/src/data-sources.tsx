@@ -19,6 +19,7 @@ import {
 } from "react";
 import {
   api,
+  catalogueApprovalStatus,
   ApiError,
   Business,
   ConnectionProfile,
@@ -418,6 +419,10 @@ function SourceCard({
           )}
         />
       </header>
+      <p>
+        Connection: {statusLabels[source.status]}. Catalogue:{" "}
+        {catalogueApprovalStatus(source)}.
+      </p>
 
       {source.status === "UNHEALTHY" ? (
         <div className="source-warning" role="status">
@@ -574,17 +579,21 @@ export function DataSourcesPage({ business }: { business: Business }) {
   const [busyAction, setBusyAction] = useState("");
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
+  const loadVersion = useRef(0);
 
   const load = useCallback(async () => {
+    const version = ++loadVersion.current;
     setError("");
     try {
       const [configured, available] = await Promise.all([
         api.dataSources(business.id),
         api.dataSourceProfiles(business.id),
       ]);
+      if (version !== loadVersion.current) return;
       setSources(configured);
       setProfiles(available);
     } catch (caught) {
+      if (version !== loadVersion.current) return;
       setSources([]);
       setProfiles([]);
       setError(safeErrorMessage(caught));
@@ -597,7 +606,35 @@ export function DataSourcesPage({ business }: { business: Business }) {
     setDisableTarget(null);
     setSuccess("");
     void load();
+    return () => {
+      loadVersion.current += 1;
+    };
   }, [load]);
+
+  useEffect(() => {
+    const refresh = () => {
+      void load();
+    };
+    window.addEventListener("focus", refresh);
+    const expiries = (sources ?? [])
+      .map(
+        (source) =>
+          source.catalogue_approval_expires_at ?? source.catalogue_coverage?.expires_at,
+      )
+      .filter((value): value is string => !!value)
+      .map((value) => new Date(value).getTime())
+      .filter((value) => value > Date.now());
+    const timer = expiries.length
+      ? window.setTimeout(
+          refresh,
+          Math.min(Math.max(0, Math.min(...expiries) - Date.now() + 25), 2_147_483_647),
+        )
+      : undefined;
+    return () => {
+      window.removeEventListener("focus", refresh);
+      window.clearTimeout(timer);
+    };
+  }, [sources, load]);
 
   async function create(displayName: string) {
     const profile =
@@ -613,6 +650,7 @@ export function DataSourcesPage({ business }: { business: Business }) {
         mapping_profile_key: profile.mapping?.key ?? "discovered_products",
         mapping_profile_version: profile.mapping?.version ?? 1,
       });
+      loadVersion.current += 1;
       setSources((current) => [...(current ?? []), created]);
       setShowConnect(false);
       setSuccess("Data source configured. Validate it before activation.");
@@ -637,6 +675,7 @@ export function DataSourcesPage({ business }: { business: Business }) {
         health: api.checkDataSource,
       };
       const updated = await handlers[action](business.id, source.id);
+      loadVersion.current += 1;
       setSources(
         (current) =>
           current?.map((item) => (item.id === updated.id ? updated : item)) ?? [
@@ -671,10 +710,8 @@ export function DataSourcesPage({ business }: { business: Business }) {
     setError("");
     setSuccess("");
     try {
-      const updated = await api.disableDataSource(
-        business.id,
-        disableTarget.id,
-      );
+      const updated = await api.disableDataSource(business.id, disableTarget.id);
+      loadVersion.current += 1;
       setSources(
         (current) =>
           current?.map((item) => (item.id === updated.id ? updated : item)) ?? [

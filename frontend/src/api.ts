@@ -68,6 +68,7 @@ export interface ChatMessage {
     page_end: number | null;
     section_title: string | null;
     available: boolean;
+    excerpt?: string | null;
   }[];
 }
 
@@ -133,6 +134,7 @@ export interface ConnectionProfile {
 export interface DataSource {
   catalogue_coverage?: CatalogueCoverage | null;
   quality_approval_status?: string | null;
+  catalogue_approval_expires_at?: string | null;
   id: string;
   display_name: string;
   adapter_type: string;
@@ -146,6 +148,22 @@ export interface DataSource {
   capabilities: string[];
   created_at: string;
   updated_at: string;
+}
+
+export function catalogueApprovalStatus(source: DataSource, now = Date.now()) {
+  const expiry =
+    source.catalogue_approval_expires_at ?? source.catalogue_coverage?.expires_at;
+  if (
+    source.quality_approval_status?.includes("expired") ||
+    (expiry && new Date(expiry).getTime() <= now)
+  )
+    return "Approval expired — revalidation required";
+  if (source.quality_approval_status?.startsWith("catalogue_"))
+    return "Catalogue review required";
+  if (source.status !== "ACTIVE") return "Review required";
+  if (source.quality_approval_status === "partial") return "Active — partial catalogue";
+  if (source.quality_approval_status === "full" || source.mapping) return "Active";
+  return "Approval required";
 }
 
 export type WhatsAppConnectionStatus =

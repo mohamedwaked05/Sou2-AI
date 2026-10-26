@@ -74,6 +74,7 @@ class CitationResponse(BaseModel):
     page_end: int | None
     section_title: str | None
     available: bool
+    excerpt: str | None = None
 
 
 class OwnerTurnResponse(BaseModel):

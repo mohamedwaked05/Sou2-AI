@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import {
   api,
+  catalogueApprovalStatus,
   ApiError,
   CapabilityFamily,
   CapabilityQualityReport,
@@ -141,7 +142,7 @@ export function CapabilityDashboard({
         <button
           className="btn-secondary"
           disabled={busy}
-          onClick={() => void load()}
+          onClick={() => void Promise.all([load(), onRefresh()])}
         >
           <BusyLabel busy={busy} idle="Refresh capabilities" />
         </button>
@@ -159,11 +160,7 @@ export function CapabilityDashboard({
               <div>
                 <h4>Catalogue</h4>
                 <span className="quality-state">
-                  {source.status === "ACTIVE"
-                    ? source.catalogue_coverage?.approval_type === "partial"
-                      ? "active — partial catalogue"
-                      : "active"
-                    : "review required"}
+                  {catalogueApprovalStatus(source)}
                 </span>
               </div>
               <p>

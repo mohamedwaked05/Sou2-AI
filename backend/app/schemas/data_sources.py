@@ -60,6 +60,7 @@ class DataSourceCreateRequest(BaseModel):
 class DataSourceResponse(BaseModel):
     catalogue_coverage: CatalogueCoverage | None = None
     quality_approval_status: str | None = None
+    catalogue_approval_expires_at: datetime | None = None
     id: uuid.UUID
     display_name: str
     adapter_type: str

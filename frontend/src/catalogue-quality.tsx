@@ -130,8 +130,10 @@ export function CatalogueQuality({
                 revisionId,
                 mapping,
               );
-              if (generation === epoch.current) setReport(value);
+              if (generation !== epoch.current) return;
+              setReport(value);
               setConfirmed(false);
+              await onRefresh();
             })
           }
         >

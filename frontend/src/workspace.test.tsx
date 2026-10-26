@@ -96,6 +96,7 @@ function Navigation() {
       <button onClick={() => navigate("/businesses/B/chat?conversation=second")}>
         Business B
       </button>
+      <button onClick={() => navigate(-1)}>Browser back</button>
     </>
   );
 }
@@ -266,6 +267,86 @@ it("conversation history selection rejects an out-of-order response", async () =
   await screen.findByText("Selected history");
   await act(async () => old.resolve(history("Old history")));
   expect(screen.queryByText("Old history")).not.toBeInTheDocument();
+});
+
+it("keeps an older conversation selected when opening chat, returning and navigating away", async () => {
+  vi.spyOn(api, "conversations").mockResolvedValue({
+    items: [conversation("newest"), conversation("older")],
+    next_cursor: null,
+  });
+  workspace("/businesses/A/conversations");
+  await screen.findByText("A-newest history");
+  fireEvent.click(screen.getByRole("button", { name: /^older/ }));
+  await screen.findByText("A-older history");
+  expect(screen.getByRole("button", { name: /^older/ })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  expect(screen.getByRole("link", { name: "Open chat" })).toHaveAttribute(
+    "href",
+    "/businesses/A/chat?conversation=older",
+  );
+  fireEvent.click(screen.getByRole("link", { name: "Open chat" }));
+  await screen.findByRole("textbox", { name: "Message Sou2AI" });
+  expect(api.conversation).toHaveBeenLastCalledWith("A", "older");
+  fireEvent.click(screen.getByRole("link", { name: "All conversations" }));
+  await screen.findByRole("link", { name: "Open chat" });
+  expect(screen.getByRole("button", { name: /^older/ })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  fireEvent.click(screen.getByRole("link", { name: "Business Settings" }));
+  await screen.findByRole("heading", { name: "Business Settings" });
+  fireEvent.click(screen.getByRole("link", { name: "Conversations" }));
+  await screen.findByText("A-older history");
+  expect(screen.getByRole("link", { name: "Open chat" })).toHaveAttribute(
+    "href",
+    "/businesses/A/chat?conversation=older",
+  );
+});
+
+it("restores the selected conversation from the URL and browser back history", async () => {
+  vi.spyOn(api, "conversations").mockResolvedValue({
+    items: [conversation("newest"), conversation("older")],
+    next_cursor: null,
+  });
+  workspace("/businesses/A/conversations?conversation=older");
+  await screen.findByText("A-older history");
+  expect(api.conversationMessages).not.toHaveBeenCalledWith("A", "newest");
+  fireEvent.click(screen.getByRole("button", { name: /^newest/ }));
+  await screen.findByText("A-newest history");
+  fireEvent.click(screen.getByRole("button", { name: "Browser back" }));
+  await screen.findByText("A-older history");
+  expect(screen.getByRole("button", { name: /^older/ })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+});
+
+it("shows recorded source metadata and passages and marks missing historical labels honestly", async () => {
+  const response = history("Published policy [S1]. Additional claim [S5].");
+  response.items[0].sources = [
+    {
+      label: "S1",
+      document_id: "doc",
+      filename: "policy.pdf",
+      page_start: 3,
+      page_end: 4,
+      section_title: "Opening hours",
+      available: true,
+      excerpt: "Monday 08:15 - 19:45",
+    },
+  ];
+  vi.mocked(api.conversationMessages).mockResolvedValue(response);
+  workspace();
+  await screen.findByRole("link", { name: "S1" });
+  expect(screen.getByText(/S1 · policy.pdf/)).toHaveTextContent(
+    "page 3–4 · Opening hours",
+  );
+  fireEvent.click(screen.getByRole("link", { name: "S1" }));
+  expect(screen.getByText("Monday 08:15 - 19:45")).toBeVisible();
+  expect(screen.getByText(/S5: source was not recorded/)).toBeVisible();
+  expect(screen.queryByRole("link", { name: "S5" })).toBeNull();
 });
 
 it("pins default-chat retries to the original conversation even when the default changes", async () => {

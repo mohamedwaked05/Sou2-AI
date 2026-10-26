@@ -1729,12 +1729,20 @@ textarea::placeholder {
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
-.citations > div {
+.citations summary {
   display: flex;
   align-items: center;
   gap: 6px;
   color: #334155;
   font-size: 0.76rem;
+}
+.citations summary {
+  cursor: pointer;
+}
+.citations blockquote {
+  margin: 10px 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .citations svg {
   width: 14px;
@@ -1965,7 +1973,7 @@ textarea::placeholder {
   background: rgba(30, 58, 138, 0.12);
 }
 .dark .citations > strong,
-.dark .citations > div {
+.dark .citations summary {
   color: #cbd5e1;
 }
 .dark .composer {

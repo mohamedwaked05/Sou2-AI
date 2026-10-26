@@ -4,6 +4,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
@@ -140,6 +141,44 @@ it("separates connection health and five independently reviewed capabilities", a
   expect(
     screen.queryByRole("button", { name: "Approve and enable inventory" }),
   ).toBeNull();
+});
+
+it("shows expired Catalogue approval separately from an active source connection", async () => {
+  render(
+    <CapabilityDashboard
+      businessId="business"
+      source={{
+        ...source,
+        status: "ACTIVE",
+        mapping_version: 5,
+        quality_approval_status: "catalogue_partial_approval_expired",
+        catalogue_approval_expires_at: new Date(Date.now() - 1000).toISOString(),
+      }}
+      onRefresh={vi.fn()}
+    />,
+  );
+  expect(await screen.findByText("connected")).toBeVisible();
+  const catalogue = screen
+    .getByRole("heading", { name: "Catalogue" })
+    .closest("article")!;
+  expect(
+    within(catalogue).getByText("Approval expired — revalidation required"),
+  ).toBeVisible();
+  expect(within(catalogue).queryByText(/^active/i)).toBeNull();
+  expect(
+    screen.queryByRole("button", { name: /Approve and enable catalogue/i }),
+  ).toBeNull();
+});
+
+it("refreshes source approval state along with the capabilities", async () => {
+  const refresh = vi.fn().mockResolvedValue(undefined);
+  render(
+    <CapabilityDashboard businessId="business" source={source} onRefresh={refresh} />,
+  );
+  await screen.findByText("connected");
+  fireEvent.click(screen.getByRole("button", { name: "Refresh capabilities" }));
+  await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(api.capabilityWorkspace).toHaveBeenCalledTimes(2));
 });
 
 it("shows a business review guide before collapsed technical fields", async () => {

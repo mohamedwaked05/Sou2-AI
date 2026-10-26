@@ -471,7 +471,9 @@ it("creates and selects a new private owner conversation", async () => {
   expect(
     await screen.findByRole("heading", { name: "New conversation" }),
   ).toBeVisible();
-  expect(screen.getByRole("heading", { name: "No messages yet" })).toBeInTheDocument();
+  expect(
+    await screen.findByRole("heading", { name: "No messages yet" }),
+  ).toBeInTheDocument();
   expect(api.createConversation).toHaveBeenCalledWith("business-1");
 });
 

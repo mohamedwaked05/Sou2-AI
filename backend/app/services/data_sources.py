@@ -109,19 +109,34 @@ def _response(
             if session is not None
             else ()
         )
-        coverage, quality_status = None, None
+        coverage, quality_status, approval_expires_at = None, None, None
         if revision is not None:
+            from app.database.models import CatalogueQualityReportRecord
             from app.integrations.discovery import SourceMappingError
-            from app.services.catalogue_quality import approved_coverage
+            from app.services.catalogue_quality import approved_coverage, latest_event
 
             try:
                 _, coverage = approved_coverage(session, source, revision)
                 quality_status = "partial" if coverage else "full"
             except SourceMappingError as exc:
                 quality_status = exc.code
+            event = latest_event(session, source)
+            record = (
+                session.get(CatalogueQualityReportRecord, event.report_id)
+                if event
+                else None
+            )
+            if record is not None and record.revision_id == revision.id:
+                approval_expires_at = event.expires_at
+                if (
+                    event.approval_type == "partial"
+                    and event.expires_at <= datetime.now(UTC)
+                ):
+                    quality_status = "catalogue_partial_approval_expired"
         return DataSourceResponse(
             catalogue_coverage=coverage,
             quality_approval_status=quality_status,
+            catalogue_approval_expires_at=approval_expires_at,
             id=source.id,
             display_name=source.display_name,
             adapter_type=source.adapter_type,
@@ -132,7 +147,12 @@ def _response(
             last_validated_at=source.last_validated_at,
             last_successful_health_check_at=source.last_successful_health_check_at,
             failure_code=source.failure_code,
-            capabilities=(["products"] if revision else []) + list(operational),
+            capabilities=(
+                ["products"]
+                if revision and quality_status in {"full", "partial"}
+                else []
+            )
+            + list(operational),
             created_at=source.created_at,
             updated_at=source.updated_at,
         )

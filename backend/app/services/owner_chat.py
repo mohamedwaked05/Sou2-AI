@@ -58,6 +58,8 @@ from app.database.models import (
     BusinessStatus,
     ChatGenerationState,
     ChatMessageRole,
+    KnowledgeDocument,
+    KnowledgeDocumentChunk,
     OperationalDataSourceConfig,
     OwnerChatCitation,
     OwnerChatMessage,
@@ -570,7 +572,46 @@ def _create_or_reuse_owner_message(
     return existing, replayed, _Claim(message_id=message_id, token=token)
 
 
-def _message_response(message: OwnerChatMessage) -> ChatMessageResponse:
+def _citation_passages(
+    session: Session, messages: list[OwnerChatMessage]
+) -> dict[uuid.UUID, str]:
+    if not any(message.citations for message in messages):
+        return {}
+    return dict(
+        session.execute(
+            select(OwnerChatCitation.id, KnowledgeDocumentChunk.content)
+            .join(
+                OwnerChatMessage,
+                OwnerChatMessage.id == OwnerChatCitation.assistant_message_id,
+            )
+            .join(
+                OwnerConversation,
+                OwnerConversation.id == OwnerChatMessage.conversation_id,
+            )
+            .join(
+                KnowledgeDocumentChunk,
+                and_(
+                    KnowledgeDocumentChunk.id == OwnerChatCitation.chunk_id,
+                    KnowledgeDocumentChunk.document_id == OwnerChatCitation.document_id,
+                    KnowledgeDocumentChunk.business_id == OwnerChatCitation.business_id,
+                    KnowledgeDocumentChunk.business_id == OwnerConversation.business_id,
+                ),
+            )
+            .join(
+                KnowledgeDocument,
+                and_(
+                    KnowledgeDocument.id == KnowledgeDocumentChunk.document_id,
+                    KnowledgeDocument.business_id == OwnerConversation.business_id,
+                ),
+            )
+            .where(OwnerChatMessage.id.in_([message.id for message in messages]))
+        ).all()
+    )
+
+
+def _message_response(
+    message: OwnerChatMessage, passages: dict[uuid.UUID, str]
+) -> ChatMessageResponse:
     return ChatMessageResponse(
         id=message.id,
         sequence_number=message.sequence_number,
@@ -588,6 +629,7 @@ def _message_response(message: OwnerChatMessage) -> ChatMessageResponse:
                 "page_end": citation.page_end,
                 "section_title": citation.section_title,
                 "available": citation.document_id is not None,
+                "excerpt": passages.get(citation.id),
             }
             for citation in sorted(
                 message.citations, key=lambda item: item.citation_order
@@ -610,9 +652,10 @@ def _completed_turn(
     )
     if assistant is None:
         return None
+    passages = _citation_passages(session, [assistant])
     return OwnerTurnResponse(
-        owner_message=_message_response(owner_message),
-        assistant_message=_message_response(assistant),
+        owner_message=_message_response(owner_message, passages),
+        assistant_message=_message_response(assistant, passages),
         replayed=replayed,
     )
 
@@ -842,7 +885,7 @@ def _query_concepts(value: str) -> frozenset[str]:
             r"دوام",
             r"فتح",
             r"سكر",
-            r"\b(?:wa2et|fte7|fta7|btefta\w*|bteskar\w*)\b",
+            r"\b(?:wa2et|aw2at|dawam|dosem|fte7|fta7|btefta\w*|bteskar\w*)\b",
         ),
         "location": (
             r"\b(?:address|location|located|where)\b",
@@ -2705,6 +2748,92 @@ def _operational_result_with_usage(
     )
 
 
+def _enforce_grounded_clock_values(
+    result: OwnerChatResult, request: OwnerChatRequest
+) -> OwnerChatResult:
+    """Keep translated timetable answers faithful to an unambiguous source row."""
+    if request.mode != "grounded" or not request.sources or not request.messages:
+        return result
+    question = _normalized_classifier_text(request.messages[-1].content)
+    if "opening_hours" not in _query_concepts(question):
+        return result
+    weekdays = (
+        r"monday|الاثنين|اتنين|tnen|tnein",
+        r"tuesday|الثلاثاء|الثلاثا|tlete|tleta",
+        r"wednesday|الاربعاء|اربعا|arb3a",
+        r"thursday|الخميس|خميس|khamis",
+        r"friday|الجمعة|جمعة|jem3a|jome3a|joum3a",
+        r"saturday|السبت|سبت|sabet",
+        r"sunday|الاحد|احد|a7ad",
+    )
+    days = [
+        pattern for pattern in weekdays if re.search(rf"\b(?:{pattern})\b", question)
+    ]
+    if len(days) != 1:
+        return result
+
+    def clock_values(value: str) -> tuple[str, ...]:
+        normalized = "".join(
+            str(unicodedata.decimal(character)) if character.isdecimal() else character
+            for character in value
+        )
+        return tuple(
+            f"{int(hour):02}:{minute}"
+            for hour, minute in re.findall(
+                r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)(?!\d)", normalized
+            )
+        )
+
+    rows: list[tuple[ProviderSource, str, tuple[str, ...]]] = []
+    for source in request.sources:
+        for line in source.content.splitlines():
+            if re.match(rf"^\s*(?:{days[0]})\b", _normalized_classifier_text(line)):
+                values = clock_values(line)
+                if len(values) >= 2:
+                    rows.append((source, line.strip(), values))
+    if not rows:
+        return result
+    if len({values for _, _, values in rows}) > 1:
+        labels = tuple(dict.fromkeys(source.label for source, _, _ in rows))
+        return replace(
+            result,
+            reply=_conflict_reply(
+                request.messages[-1].content, "en", request.sources, labels
+            ),
+            cited_source_ids=labels,
+        )
+    source, line, expected = rows[0]
+    if clock_values(result.reply) == expected:
+        return result
+    language = request.reply_language or _fallback_language(
+        request.messages[-1].content, "en"
+    )
+    demo = bool(re.search(r"\b(?:demo|fictional|synthetic)\b", source.content, re.I))
+    if language in {"arabic", "lebanese_arabic"}:
+        lead = (
+            "بحسب المصدر التجريبي، الساعات المنشورة هي:"
+            if demo
+            else "بحسب المصدر، الساعات المنشورة هي:"
+        )
+    elif language == "franco_arabic":
+        lead = (
+            "Hasab el masdar el demo, hayde el sa3at el maktoube:"
+            if demo
+            else "Hasab el masdar, hayde el sa3at el maktoube:"
+        )
+    else:
+        lead = (
+            "The demonstration source lists these hours:"
+            if demo
+            else "The source lists these hours:"
+        )
+    return replace(
+        result,
+        reply=f"{lead}\n{line} [{source.label}]",
+        cited_source_ids=(source.label,),
+    )
+
+
 def _validated_generation(
     provider: OwnerChatProvider,
     request: OwnerChatRequest,
@@ -2723,6 +2852,12 @@ def _validated_generation(
             result = provider.generate(request)
             try:
                 validated = _validate_result(result, request)
+                corrected = _enforce_grounded_clock_values(validated, request)
+                if corrected.reply != validated.reply and corrected.usage is None:
+                    corrected = replace(
+                        corrected, usage=_usage_for_result(provider, request, validated)
+                    )
+                validated = corrected
             except OwnerChatProviderError as exc:
                 if isinstance(result, OwnerChatResult):
                     exc.usage = result.usage
@@ -7674,6 +7809,16 @@ def _validate_result(result: object, request: OwnerChatRequest) -> OwnerChatResu
         )
     ):
         raise OwnerChatProviderInvalidResponse(reason="invalid_citations")
+    if request.mode == "grounded":
+        inline_labels = tuple(dict.fromkeys(re.findall(r"\bS[1-9]\d*\b", result.reply)))
+        if any(label not in labels for label in inline_labels):
+            raise OwnerChatProviderInvalidResponse(reason="invalid_citations")
+        return replace(
+            result,
+            cited_source_ids=tuple(
+                dict.fromkeys((*result.cited_source_ids, *inline_labels))
+            ),
+        )
     return result
 
 
@@ -8404,9 +8549,10 @@ def get_conversation_history(
     page = rows[:HISTORY_PAGE_SIZE]
     next_cursor = _encode_cursor(page[-1]) if len(rows) > HISTORY_PAGE_SIZE else None
     page.reverse()
+    passages = _citation_passages(session, page)
     return ConversationHistoryResponse(
         conversation_id=conversation.id,
-        items=[_message_response(message) for message in page],
+        items=[_message_response(message, passages) for message in page],
         next_cursor=next_cursor,
     )
 

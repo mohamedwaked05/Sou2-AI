@@ -873,6 +873,7 @@ def test_grounded_turn_persists_replays_and_histories_safe_citations(
             "page_end": None,
             "section_title": None,
             "available": True,
+            "excerpt": "Grounded return policy",
         }
     ]
     assert provider.requests[0].sources[0].label == "S1"
@@ -924,6 +925,56 @@ def test_invalid_citations_leave_no_assistant(
     )
     assert response.status_code == 503
     assert db_session.scalars(select(OwnerChatMessage)).all()[0].role == "owner"
+
+
+def test_inline_citations_and_passages_stay_scoped_to_authorized_history(
+    api_client, db_session: Session, monkeypatch
+) -> None:
+    user, business = active_business(
+        api_client, db_session, email="inline-citations@example.com"
+    )
+    business_id = uuid.UUID(business["id"])
+    ready_document(
+        db_session,
+        business_id,
+        digest="6" * 64,
+        chunks=[
+            (
+                "Grounded return policy: unopened goods within eight days.",
+                vector(1),
+                "gemini-embedding-001",
+            ),
+            ("Returns require proof of purchase.", vector(1), "gemini-embedding-001"),
+        ],
+    )
+    monkeypatch.setattr(owner_chat, "create_embedding_provider", lambda _: Provider())
+    from app.agent.owner_chat_provider import get_owner_chat_provider
+    from app.main import app
+
+    app.dependency_overrides[get_owner_chat_provider] = lambda: CapturingProvider(
+        OwnerChatResult(
+            reply="Return policy [S1]. Receipt required [S2].", cited_source_ids=("S1",)
+        )
+    )
+    response = submit(
+        api_client, user, business["id"], "What is our return policy?", key="inline"
+    )
+    assert response.status_code == 200, response.text
+    sources = response.json()["assistant_message"]["sources"]
+    assert [item["label"] for item in sources] == ["S1", "S2"]
+    assert [item["excerpt"] for item in sources] == [
+        "Grounded return policy: unopened goods within eight days.",
+        "Returns require proof of purchase.",
+    ]
+    outsider, _ = active_business(
+        api_client, db_session, email="inline-outsider@example.com"
+    )
+    denied = api_client.get(
+        f"/api/v1/businesses/{business_id}/owner-chat/messages",
+        headers=headers(outsider),
+    )
+    assert denied.status_code in {403, 404}
+    assert "excerpt" not in denied.text
 
 
 @pytest.mark.parametrize(
@@ -1082,6 +1133,7 @@ def test_citation_database_trigger_rejects_foreign_source_and_delete_keeps_safe_
     )
     source = history.json()["items"][-1]["sources"][0]
     assert source["available"] is False
+    assert source["excerpt"] is None
     assert source["document_id"] is None
     assert source["filename"] == "catalog.pdf"
     assert db_session.scalar(select(OwnerChatCitation.chunk_id)) is None

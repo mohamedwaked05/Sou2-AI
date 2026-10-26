@@ -38,7 +38,13 @@ import {
   useRef,
   useState,
 } from "react";
-import { Link, Navigate, useLocation, useParams } from "react-router-dom";
+import {
+  Link,
+  Navigate,
+  useLocation,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import {
   api,
   ApiError,
@@ -189,6 +195,18 @@ export function WorkspaceRoute({
   onLogout: () => Promise<void>;
 }) {
   const { id = "", page = "overview" } = useParams();
+  const location = useLocation();
+  const conversationId = new URLSearchParams(location.search).get("conversation");
+  const [lastConversations, setLastConversations] = useState<Record<string, string>>(
+    {},
+  );
+  useEffect(() => {
+    if (conversationId && (page === "chat" || page === "conversations")) {
+      setLastConversations((current) =>
+        current[id] === conversationId ? current : { ...current, [id]: conversationId },
+      );
+    }
+  }, [id, page, conversationId]);
   const [business, setBusiness] = useState<Business | null>(null);
   const [error, setError] = useState("");
   const [errorBusinessId, setErrorBusinessId] = useState("");
@@ -225,6 +243,7 @@ export function WorkspaceRoute({
       dark={dark}
       setDark={setDark}
       onLogout={onLogout}
+      conversationId={conversationId ?? lastConversations[id]}
     >
       <WorkspacePage
         key={`${business.id}:${page}`}
@@ -259,6 +278,7 @@ function AppShell({
   setDark,
   onLogout,
   children,
+  conversationId,
 }: {
   business: Business;
   user: User;
@@ -267,6 +287,7 @@ function AppShell({
   setDark: (value: boolean) => void;
   onLogout: () => Promise<void>;
   children: React.ReactNode;
+  conversationId?: string;
 }) {
   const location = useLocation();
   const [collapsed, setCollapsed] = useState(() => {
@@ -381,7 +402,7 @@ function AppShell({
           <Link
             ref={mobile && index === 0 ? firstMobileLink : undefined}
             key={path}
-            to={`/businesses/${business.id}/${path}`}
+            to={`/businesses/${business.id}/${path}${conversationId && (path === "chat" || path === "conversations") ? `?conversation=${encodeURIComponent(conversationId)}` : ""}`}
             className={page === path ? "active" : ""}
             aria-current={page === path ? "page" : undefined}
             title={collapsed && !mobile ? label : undefined}
@@ -906,7 +927,7 @@ function ChatPage({
         action={
           <Link
             className="btn-secondary"
-            to={`/businesses/${business.id}/conversations`}
+            to={`/businesses/${business.id}/conversations${selectedId ? `?conversation=${encodeURIComponent(selectedId)}` : ""}`}
           >
             <MessageSquare size={18} />
             All conversations
@@ -1009,6 +1030,17 @@ function ChatPage({
 }
 
 function Message({ message }: { message: ChatMessage }) {
+  const sourceTargets = Object.fromEntries(
+    message.sources.map((source) => [
+      source.label,
+      `source-${message.id}-${source.label}`,
+    ]),
+  );
+  const citationReferences = message.role === "assistant"
+    ? (message.content.match(/[[(]S[1-9]\d*(?:\s*[,;]\s*S[1-9]\d*)*[\])]/g) ?? [])
+      .flatMap((reference) => reference.match(/S[1-9]\d*/g) ?? [])
+    : [];
+  const missingLabels = [...new Set(citationReferences)].filter((label) => !sourceTargets[label]);
   return (
     <article className={`message ${message.role === "owner" ? "owner" : "assistant"}`}>
       <span className="message-avatar">
@@ -1016,7 +1048,7 @@ function Message({ message }: { message: ChatMessage }) {
       </span>
       <div>
         <div className="message-bubble">
-          <ChatContent content={message.content} />
+          <ChatContent content={message.content} sourceTargets={sourceTargets} />
         </div>
         {message.role === "owner" && message.generation_state === "failed" && (
           <p role="status">
@@ -1030,20 +1062,34 @@ function Message({ message }: { message: ChatMessage }) {
         {message.role === "owner" && message.generation_state === "pending" && (
           <p role="status">Response is pending.</p>
         )}
-        {message.sources.length > 0 && (
+        {(message.sources.length > 0 || missingLabels.length > 0) && (
           <div className="citations">
             <strong>Sources</strong>
             {message.sources.map((source, index) => (
-              <div key={`${source.filename}-${index}`}>
-                <FileText />{" "}
-                <span>
-                  {source.label || source.filename}
+              <details
+                key={`${source.label}-${index}`}
+                id={sourceTargets[source.label]}
+              >
+                <summary>
+                  <FileText /> {source.label} · {source.filename}
                   {source.page_start
                     ? ` · page ${source.page_start}${source.page_end && source.page_end !== source.page_start ? `–${source.page_end}` : ""}`
                     : ""}
-                </span>
+                  {source.section_title ? ` · ${source.section_title}` : ""}
+                </summary>
                 {!source.available && <em>Unavailable</em>}
-              </div>
+                {source.available && source.excerpt ? (
+                  <blockquote dir="auto">{source.excerpt}</blockquote>
+                ) : (
+                  <p>The cited passage is unavailable.</p>
+                )}
+              </details>
+            ))}
+            {missingLabels.map((label) => (
+              <p key={label}>
+                {label}: source was not recorded for this historical answer. It cannot
+                be verified.
+              </p>
             ))}
           </div>
         )}
@@ -1054,9 +1100,12 @@ function Message({ message }: { message: ChatMessage }) {
 }
 
 function ConversationsPage({ business }: { business: Business }) {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const selectedConversationId = searchParams.get("conversation");
   const [channel, setChannel] = useState<"owner" | "whatsapp">("owner");
   const [conversations, setConversations] = useState<Conversation[] | null>(null);
-  const [selected, setSelected] = useState<Conversation | null>(null);
+  const selected =
+    conversations?.find((item) => item.id === selectedConversationId) ?? null;
   const [messages, setMessages] = useState<ChatMessage[] | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState<"create" | "archive" | "">("");
@@ -1070,7 +1119,24 @@ function ConversationsPage({ business }: { business: Business }) {
       listVersion.current += 1;
     };
   }, []);
-  const selectedConversationId = selected?.id ?? null;
+  useEffect(() => {
+    if (selectedConversationId || !conversations?.length || channel !== "owner") return;
+    const first = conversations.find((item) => !item.archived) ?? conversations[0];
+    setSearchParams(
+      (current) => {
+        if (!current.has("conversation")) current.set("conversation", first.id);
+        return current;
+      },
+      { replace: true },
+    );
+  }, [conversations, selectedConversationId, channel, setSearchParams]);
+  function selectConversation(id: string) {
+    setError("");
+    setSearchParams((current) => {
+      current.set("conversation", id);
+      return current;
+    });
+  }
   const conversationScroll = usePinnedToBottom(
     messages,
     messages !== null,
@@ -1084,14 +1150,6 @@ function ConversationsPage({ business }: { business: Business }) {
       const response = await api.conversations(business.id, true);
       if (!current()) return;
       setConversations(response.items);
-      setSelected((current) => {
-        if (current) {
-          return response.items.find((item) => item.id === current.id) ?? null;
-        }
-        return (
-          response.items.find((item) => !item.archived) ?? response.items[0] ?? null
-        );
-      });
     } catch (caught) {
       if (!current()) return;
       setConversations((items) => items ?? []);
@@ -1134,7 +1192,7 @@ function ConversationsPage({ business }: { business: Business }) {
       if (!active.current) return;
       listVersion.current += 1;
       setConversations((items) => [created, ...(items ?? [])]);
-      setSelected(created);
+      selectConversation(created.id);
     } catch (caught) {
       if (active.current) setError(errorMessage(caught));
     } finally {
@@ -1154,7 +1212,6 @@ function ConversationsPage({ business }: { business: Business }) {
         (items) =>
           items?.map((item) => (item.id === archived.id ? archived : item)) ?? [],
       );
-      setSelected((current) => (current?.id === archived.id ? archived : current));
       setArchiveTarget(null);
     } catch (caught) {
       if (active.current) setError(errorMessage(caught));
@@ -1217,7 +1274,7 @@ function ConversationsPage({ business }: { business: Business }) {
                   key={conversation.id}
                   className={conversation.id === selected?.id ? "selected" : ""}
                   aria-pressed={conversation.id === selected?.id}
-                  onClick={() => setSelected(conversation)}
+                  onClick={() => selectConversation(conversation.id)}
                 >
                   <span>
                     <strong>{conversation.title}</strong>

@@ -76,6 +76,30 @@ function mockLoad(sources: DataSource[] = []) {
 }
 
 describe("Data Sources management", () => {
+  it("refreshes Catalogue approval at expiry without validation or approval actions", async () => {
+    const expiry = new Date(Date.now() + 350).toISOString();
+    const active = configuredSource({
+      status: "ACTIVE",
+      quality_approval_status: "partial",
+      catalogue_approval_expires_at: expiry,
+    });
+    vi.spyOn(api, "dataSources")
+      .mockResolvedValueOnce([active])
+      .mockResolvedValue([
+        { ...active, quality_approval_status: "catalogue_partial_approval_expired" },
+      ]);
+    vi.spyOn(api, "dataSourceProfiles").mockResolvedValue([profile]);
+    const validate = vi.spyOn(api, "validateDataSource");
+    render(<DataSourcesPage business={business} />);
+    expect(
+      await screen.findByText(/Catalogue: Active — partial catalogue/),
+    ).toBeVisible();
+    expect(
+      await screen.findByText(/Catalogue: Approval expired — revalidation required/),
+    ).toBeVisible();
+    expect(api.dataSources).toHaveBeenCalledTimes(2);
+    expect(validate).not.toHaveBeenCalled();
+  });
   it("distinguishes source data errors from a connection failure after validation", async () => {
     mockLoad([configuredSource()]);
     vi.spyOn(api, "validateDataSource").mockResolvedValueOnce(
