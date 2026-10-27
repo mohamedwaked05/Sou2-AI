@@ -28,6 +28,10 @@ def production_settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "_env_file": None,
         "environment": "production",
+        "owner_chat_provider": "gemini",
+        "source_mapping_provider": "gemini",
+        "conversation_summary_provider": "gemini",
+        "customer_chat_provider": "gemini",
         "debug": False,
         "trusted_hosts": ["api.example.com"],
         "allowed_cors_origins": ["https://app.example.com"],

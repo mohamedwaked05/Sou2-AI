@@ -1,11 +1,14 @@
 """Login protection, rotating sessions, logout, and current-user tests."""
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from threading import Barrier
+from zoneinfo import ZoneInfo
 
 import jwt
 import pytest
+from app.api.v1.routes.auth import _set_refresh_cookie
 from app.core.config import get_settings
 from app.core.exceptions import ApplicationError
 from app.core.security import hash_password, token_digest, utc_now
@@ -16,11 +19,24 @@ from app.database.models import (
     User,
 )
 from app.services.auth import refresh_access_token
+from fastapi import Response
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 PASSWORD = "Strong1!Pass"
+
+
+@pytest.mark.parametrize("timezone", ["Etc/UTC", "Asia/Beirut"])
+def test_refresh_cookie_normalizes_database_timezone_without_changing_expiry(timezone):
+    expiry = datetime(2030, 1, 1, 12, tzinfo=ZoneInfo(timezone))
+    response = Response()
+    _set_refresh_cookie(response, "synthetic-token", expiry, get_settings())
+    header = response.headers["set-cookie"]
+    recorded = header.split("expires=", 1)[1].split(";", 1)[0]
+    assert parsedate_to_datetime(recorded) == expiry
+    assert recorded.endswith("GMT")
+    assert "HttpOnly" in header
 
 
 def create_user(

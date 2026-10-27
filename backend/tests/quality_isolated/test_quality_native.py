@@ -455,6 +455,120 @@ def test_real_tenant_partial_approval_replay_activation_revocation(owner_catalog
     )
 
 
+@pytest.mark.parametrize("expired", [False, True])
+def test_unchanged_active_catalogue_renewal_keeps_source_active(
+    owner_catalogue, monkeypatch, expired
+):
+    from app.services import catalogue_quality
+
+    source, client, auth, url, revision_id = owner_catalogue
+    invalidate(source, 1)
+    original = validation_request(owner_catalogue)
+    first = client.post(
+        url + "/quality/approve", headers=auth, json=approval_body(original)
+    )
+    assert first.status_code == 200, first.text
+    assert client.post(url + "/activate", headers=auth).status_code == 200
+    if expired:
+        offset = get_settings().catalogue_partial_approval_ttl_seconds + 1
+
+        class Future(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.now(UTC) + timedelta(seconds=offset)
+
+        monkeypatch.setattr(catalogue_quality, "datetime", Future)
+        replay = client.post(
+            url + "/quality/approve", headers=auth, json=approval_body(original)
+        )
+        assert replay.status_code == 409
+        assert replay.json()["error"]["code"] == "catalogue_quality_report_stale"
+    fresh = validation_request(owner_catalogue)
+    assert fresh["revision_id"] == str(revision_id)
+    body = approval_body(fresh)
+    missing_confirmation = client.post(
+        url + "/quality/approve",
+        headers=auth,
+        json={**body, "confirm_semantics": False},
+    )
+    assert missing_confirmation.status_code == 422
+    renewed = client.post(url + "/quality/approve", headers=auth, json=body)
+    assert renewed.status_code == 200, renewed.text
+    assert renewed.json()["approval_id"] != first.json()["approval_id"]
+    assert renewed.json()["approval_version"] == first.json()["approval_version"] + 1
+    assert client.get(url, headers=auth).json()["status"] == "ACTIVE"
+    with source.platform["factory"]() as session:
+        revision = session.get(SourceMappingRevision, revision_id)
+        assert revision.version == 1 and revision.approved_mapping == fresh["mapping"]
+    replay = client.post(url + "/quality/approve", headers=auth, json=body)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["approval_id"] == renewed.json()["approval_id"]
+
+
+def test_active_renewal_rechecks_source_data_and_keeps_prior_approval(owner_catalogue):
+    source, client, auth, url, _ = owner_catalogue
+    invalidate(source, 1)
+    original = validation_request(owner_catalogue)
+    first = client.post(
+        url + "/quality/approve", headers=auth, json=approval_body(original)
+    )
+    assert first.status_code == 200, first.text
+    assert client.post(url + "/activate", headers=auth).status_code == 200
+    fresh = validation_request(owner_catalogue)
+    invalidate(source, 2)
+    renewed = client.post(
+        url + "/quality/approve", headers=auth, json=approval_body(fresh)
+    )
+    assert renewed.status_code == 409
+    assert renewed.json()["error"]["code"] == "catalogue_quality_report_stale"
+    with source.platform["factory"]() as session:
+        from app.services.catalogue_quality import latest_event
+
+        config = session.get(
+            OperationalDataSourceConfig, uuid.UUID(url.rsplit("/", 1)[1])
+        )
+        assert config.status.value == "ACTIVE"
+        assert str(latest_event(session, config).id) == first.json()["approval_id"]
+
+
+def test_active_source_cannot_approve_a_review_mapping(owner_catalogue):
+    source, client, auth, url, revision_id = owner_catalogue
+    invalidate(source, 1)
+    report = validation_request(owner_catalogue)
+    assert (
+        client.post(
+            url + "/quality/approve", headers=auth, json=approval_body(report)
+        ).status_code
+        == 200
+    )
+    assert client.post(url + "/activate", headers=auth).status_code == 200
+    with source.platform["factory"]() as session:
+        original = session.get(SourceMappingRevision, revision_id)
+        draft = SourceMappingRevision(
+            business_id=original.business_id,
+            source_id=original.source_id,
+            requested_by=original.requested_by,
+            idempotency_key=uuid.uuid4(),
+            version=2,
+            status="proposing",
+            discovery=original.discovery,
+            schema_fingerprint=original.schema_fingerprint,
+            validation_notes=[],
+        )
+        session.add(draft)
+        session.flush()
+        draft.status = "review"
+        draft.proposal = original.proposal
+        session.commit()
+        draft_id = draft.id
+    report = validation_request((*owner_catalogue[:4], draft_id))
+    response = client.post(
+        url + "/quality/approve", headers=auth, json=approval_body(report)
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "mapping_disable_before_approval"
+
+
 def test_stale_data_cannot_be_approved(owner_catalogue):
     source, client, auth, url, _ = owner_catalogue
     invalidate(source, 1)

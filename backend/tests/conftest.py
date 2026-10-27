@@ -1,6 +1,8 @@
 """PostgreSQL integration fixtures with an explicit test-database safety gate."""
 
 import os
+import re
+import uuid
 from collections.abc import Generator
 
 os.environ.setdefault("ENVIRONMENT", "testing")
@@ -24,6 +26,7 @@ from app.services import owner_chat
 from app.services.email import get_email_service
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 TEST_SETTINGS = Settings(_env_file=None)
@@ -94,6 +97,59 @@ def operator_engine(migration_engine: Engine) -> Generator[Engine]:
     )
     yield engine
     engine.dispose()
+
+
+@pytest.fixture
+def legacy_migration_database(migration_engine: Engine, monkeypatch):
+    """Keep reversible historical tests away from permanent revision-19 evidence."""
+    nonce = os.environ.get("SOU2AI_DISPOSABLE_RUN", "")
+    if not re.fullmatch(r"[a-f0-9]{12}", nonce):
+        pytest.fail("Legacy migration rehearsals require a verified disposable server.")
+    with migration_engine.connect() as connection:
+        assert connection.scalar(text("SELECT current_database()")) == "sou2ai_test"
+        assert not connection.scalar(
+            text("SELECT EXISTS(SELECT FROM pg_database WHERE datname='sou2ai_dev')")
+        )
+    name = "sou2ai_legacy_" + nonce + "_" + uuid.uuid4().hex[:12]
+    admin = create_engine(
+        migration_engine.url.set(database="postgres"), isolation_level="AUTOCOMMIT"
+    )
+    with admin.connect() as connection:
+        connection.exec_driver_sql(f'CREATE DATABASE "{name}"')
+        oid = connection.scalar(
+            text("SELECT oid FROM pg_database WHERE datname=:name"), {"name": name}
+        )
+    url = migration_engine.url.set(database=name)
+    monkeypatch.setenv(
+        "MIGRATION_POSTGRESQL_DATABASE_URL", url.render_as_string(hide_password=False)
+    )
+    bootstrap = create_engine(url, hide_parameters=True)
+    runtime = create_engine(
+        make_url(TEST_DATABASE_URL).set(database=name), hide_parameters=True
+    )
+    config = Config("alembic.ini")
+    try:
+        with bootstrap.begin() as connection:
+            assert connection.scalar(text("SELECT current_database()")) == name
+            connection.execute(text("REVOKE CREATE ON SCHEMA public FROM PUBLIC"))
+            connection.execute(
+                text("GRANT USAGE,CREATE ON SCHEMA public TO sou2ai_migrator")
+            )
+        command.upgrade(config, "20261015_18")
+        yield runtime, bootstrap, config
+    finally:
+        runtime.dispose()
+        bootstrap.dispose()
+        with admin.connect() as connection:
+            assert (
+                connection.scalar(
+                    text("SELECT oid FROM pg_database WHERE datname=:name"),
+                    {"name": name},
+                )
+                == oid
+            )
+            connection.exec_driver_sql(f'DROP DATABASE "{name}"')
+        admin.dispose()
 
 
 def _clear_test_database(engine: Engine) -> None:

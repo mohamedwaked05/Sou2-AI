@@ -419,20 +419,47 @@ def approve_partial(
     ) and previous is None:
         raise mapping_error("catalogue_quality_report_stale")
     if previous is not None:
-        policy, coverage = approved_coverage(session, source, revision)
+        try:
+            policy, coverage = approved_coverage(session, source, revision)
+        except SourceMappingError:
+            raise mapping_error("catalogue_quality_report_stale") from None
         if body.approval_type == "partial" and policy is None:
             raise mapping_error("catalogue_quality_report_stale")
         session.commit()
         return coverage or CatalogueCoverage(
             total_records=report.total_records, valid_records=report.valid_records
         )
-    if source.status is OperationalDataSourceStatus.ACTIVE:
-        raise mapping_error("mapping_disable_before_approval")
     mapping = ProductMapping.model_validate(record.mapping)
     if revision.status == "approved" and revision.approved_mapping != record.mapping:
         raise mapping_error("mapping_revision_immutable")
+    active_renewal = source.status is OperationalDataSourceStatus.ACTIVE
+    if active_renewal:
+        event = latest_event(session, source)
+        prior = (
+            session.get(CatalogueQualityReportRecord, event.report_id)
+            if event
+            else None
+        )
+        if (
+            revision.status != "approved"
+            or latest is None
+            or latest.id != revision.id
+            or event is None
+            or event.approval_type not in {"full", "partial"}
+            or prior is None
+            or prior.revision_id != revision.id
+            or prior.mapping != record.mapping
+        ):
+            raise mapping_error("mapping_disable_before_approval")
     connector = connector_for(registry, source)
     discovery = SchemaDiscovery.model_validate(revision.discovery)
+    if (
+        report.schema_fingerprint != revision.schema_fingerprint
+        or report.source_fingerprint != discovery.source_fingerprint
+        or report.exclusion_policy is None
+        or report.exclusion_policy.mapping_digest != mapping_digest(mapping)
+    ):
+        raise mapping_error("catalogue_quality_report_stale")
     try:
         adapter = MappedProductSource(connector, discovery, mapping, revision.version)
         # Hold the consistent external read through the platform approval commit.
@@ -472,7 +499,11 @@ def approve_partial(
                     seconds=get_settings().catalogue_partial_approval_ttl_seconds
                 ),
             )
-            source.status = OperationalDataSourceStatus.VALIDATED
+            source.status = (
+                OperationalDataSourceStatus.ACTIVE
+                if active_renewal
+                else OperationalDataSourceStatus.VALIDATED
+            )
             source.last_validated_at = datetime.now(UTC)
             source.last_successful_health_check_at = source.last_validated_at
             source.failure_code = None

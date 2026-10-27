@@ -181,6 +181,79 @@ def approve(system, family, report):
     )
 
 
+def test_active_catalogue_renewal_preserves_independent_sales_approval(system):
+    from app.database.models import CatalogueQualityApproval
+    from sqlalchemy import select
+    from tests.quality_isolated.test_quality_native import approval_body
+
+    sales_report = validate(system, "sales")
+    sales = approve(system, "sales", sales_report)
+    assert sales.status_code == 200, sales.text
+    product = system.fixture.tables[0]
+    with system.fixture.engine.begin() as connection:
+        connection.execute(
+            product.update()
+            .where(product.c.tenant == "A")
+            .values(label="Synthetic product")
+        )
+    with system.platform["factory"]() as session:
+        revision = session.scalar(
+            select(SourceMappingRevision).where(
+                SourceMappingRevision.source_id == system.source_id
+            )
+        )
+        revision_id = revision.id
+        event = session.get(
+            CatalogueQualityApproval, uuid.UUID(sales.json()["approval_id"])
+        )
+        before = (
+            event.id,
+            event.report_id,
+            event.version,
+            event.expires_at,
+            event.created_at,
+        )
+    for renewal in (False, True):
+        report = system.client.post(
+            system.url + "/quality/validate",
+            headers=system.auth,
+            json={"revision_id": str(revision_id)},
+        )
+        assert report.status_code == 200, report.text
+        body = {**approval_body(report.json()), "approval_type": "full"}
+        response = system.client.post(
+            system.url + "/quality/approve", headers=system.auth, json=body
+        )
+        assert response.status_code == 200, response.text
+        if not renewal:
+            assert (
+                system.client.post(
+                    system.url + "/activate", headers=system.auth
+                ).status_code
+                == 200
+            )
+        assert (
+            system.client.get(system.url, headers=system.auth).json()["status"]
+            == "ACTIVE"
+        )
+    with system.platform["factory"]() as session:
+        events = session.scalars(
+            select(CatalogueQualityApproval).where(
+                CatalogueQualityApproval.source_id == system.source_id,
+                CatalogueQualityApproval.capability == "sales",
+            )
+        ).all()
+        assert len(events) == 1
+        event = events[0]
+        assert (
+            event.id,
+            event.report_id,
+            event.version,
+            event.expires_at,
+            event.created_at,
+        ) == before
+
+
 @pytest.mark.parametrize(
     "family,operation",
     [

@@ -136,6 +136,7 @@ def main():
             "ADMISSION_MODE": "open",
             "OWNER_CHAT_PROVIDER": "mock",
             "SOURCE_MAPPING_PROVIDER": "mock",
+            "GEMINI_API_KEY": "synthetic-quality-test-key",
             "CONVERSATION_SUMMARY_PROVIDER": "mock",
             "CUSTOMER_CHAT_PROVIDER": "mock",
             "TRUSTED_HOSTS": "testserver,localhost,127.0.0.1",

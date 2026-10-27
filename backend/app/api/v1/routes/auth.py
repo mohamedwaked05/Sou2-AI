@@ -58,6 +58,7 @@ def _set_refresh_cookie(
     expires_at: datetime,
     settings: Settings,
 ) -> None:
+    expires_at = expires_at.astimezone(UTC)
     max_age = max(0, int((expires_at - datetime.now(UTC)).total_seconds()))
     response.set_cookie(
         key=settings.refresh_cookie_name,

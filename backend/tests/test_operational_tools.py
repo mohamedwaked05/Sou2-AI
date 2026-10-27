@@ -344,10 +344,11 @@ def executor_setup(client: TestClient, session: Session):
     return user, business, registry, executor
 
 
-def test_registry_contains_five_provider_neutral_tools() -> None:
+def test_registry_contains_six_provider_neutral_tools() -> None:
     registry = build_operational_tool_registry(timeout_seconds=2)
 
     assert tuple(registry) == (
+        "operational_report",
         "product_search",
         CURRENT_INVENTORY_TOOL,
         SALES_SUMMARY_TOOL,
@@ -920,7 +921,7 @@ def test_category_semantic_match_redispatches_inventory_with_source_label(
                 "FROM ai_usage_reservations"
             )
         ).one()
-    assert tuple(reservation) == (30, 6, 36)
+    assert tuple(reservation) == (20, 4, 24)
     with migration_engine.connect() as connection:
         daily_usage = connection.execute(
             text(
@@ -928,7 +929,7 @@ def test_category_semantic_match_redispatches_inventory_with_source_label(
                 "FROM business_ai_usage_daily"
             )
         ).one()
-    assert tuple(daily_usage) == (30, 6, 36)
+    assert tuple(daily_usage) == (20, 4, 24)
 
 
 def test_exact_category_label_bypasses_semantic_resolver_and_releases_reserve(
@@ -978,9 +979,9 @@ def test_exact_category_label_bypasses_semantic_resolver_and_releases_reserve(
         daily_usage = connection.execute(
             text("SELECT total_tokens_used FROM business_ai_usage_daily")
         ).one()
-    assert tuple(reservation) == (534, 20, 4, 24)
+    assert tuple(reservation) == (522, 10, 2, 12)
     assert reservation.total_tokens < reservation.reserved_tokens
-    assert tuple(daily_usage) == (24,)
+    assert tuple(daily_usage) == (12,)
 
 
 def test_category_resolver_timeout_charges_uncertain_usage_once_and_falls_back(
@@ -1036,8 +1037,8 @@ def test_category_resolver_timeout_charges_uncertain_usage_once_and_falls_back(
                 "FROM business_ai_usage_daily"
             )
         ).one()
-    assert tuple(reservation) == (30, 68, 98)
-    assert tuple(daily_usage) == (30, 68, 98)
+    assert tuple(reservation) == (20, 66, 86)
+    assert tuple(daily_usage) == (20, 66, 86)
 
 
 def test_ambiguous_bounded_category_returns_clarification_without_source_lookup(

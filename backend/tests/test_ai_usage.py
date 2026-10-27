@@ -82,7 +82,19 @@ def test_reconciliation_logs_usage_source_without_reclassifying_estimates(
         assert not reconcile_ai_usage(
             session, uuid.uuid4(), usage=usage, outcome=outcome
         )
-    assert len(caplog.records) == 1
+    completed = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("ai_budget_reconciliation ")
+    ]
+    rejected = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("ai_budget_reconciliation_rejected ")
+    ]
+    assert len(completed) == len(rejected) == 1
+    assert rejected[0].levelno == logging.WARNING
+    assert rejected[0].reason == "already_finalized"
     assert f"usage_source={source}" in caplog.text
     assert f"charge_basis={basis}" in caplog.text
     assert session.parameters["authoritative"] is (
@@ -1402,7 +1414,7 @@ def test_provider_error_logs_type_and_reason(
     assert "rate_limited" in all_args
 
 
-def test_unexpected_exception_in_generate_logs_traceback(
+def test_unexpected_exception_in_generate_logs_type_without_private_exception_text(
     api_client: TestClient,
     db_session: Session,
 ) -> None:
@@ -1428,4 +1440,4 @@ def test_unexpected_exception_in_generate_logs_traceback(
         str(a) for call in mock_logger.error.call_args_list for a in call.args
     )
     assert "ValueError" in all_args
-    assert "simulated programming error in generate" in all_args
+    assert "simulated programming error in generate" not in all_args

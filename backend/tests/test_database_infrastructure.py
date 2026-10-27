@@ -2,7 +2,6 @@
 
 import pytest
 from alembic import command
-from alembic.config import Config
 from app.core.config import Settings
 from app.database.session import (
     _reject_privileged_runtime_connection,
@@ -60,23 +59,23 @@ def test_runtime_connection_guard_rejects_bootstrap_role(
 
 
 def test_alembic_downgrade_and_upgrade(
-    database_engine: Engine, alembic_config: Config
+    legacy_migration_database,
 ) -> None:
+    database_engine, _, alembic_config = legacy_migration_database
     database_engine.dispose()
     command.downgrade(alembic_config, "base")
     empty_engine = database_engine.execution_options()
     assert "users" not in inspect(empty_engine).get_table_names()
     empty_engine.dispose()
 
-    command.upgrade(alembic_config, "head")
+    command.upgrade(alembic_config, "20261015_18")
     assert "tool_call_logs" in inspect(database_engine).get_table_names()
 
 
 def test_milestone_7_upgrade_backfills_existing_business_allowance(
-    database_engine: Engine,
-    migration_engine: Engine,
-    alembic_config: Config,
+    legacy_migration_database,
 ) -> None:
+    database_engine, migration_engine, alembic_config = legacy_migration_database
     database_engine.dispose()
     command.downgrade(alembic_config, "20260813_02")
     business_id = "10000000-0000-0000-0000-000000000007"
@@ -104,7 +103,7 @@ def test_milestone_7_upgrade_backfills_existing_business_allowance(
             ),
             {"conversation_id": conversation_id, "business_id": business_id},
         )
-    command.upgrade(alembic_config, "head")
+    command.upgrade(alembic_config, "20261015_18")
     with migration_engine.connect() as connection:
         config = connection.execute(
             text(
@@ -138,10 +137,9 @@ def test_milestone_7_upgrade_backfills_existing_business_allowance(
 
 
 def test_security_hardening_upgrade_preserves_existing_rate_and_usage_data(
-    database_engine: Engine,
-    migration_engine: Engine,
-    alembic_config: Config,
+    legacy_migration_database,
 ) -> None:
+    database_engine, migration_engine, alembic_config = legacy_migration_database
     database_engine.dispose()
     command.downgrade(alembic_config, "20260813_03")
     business_id = "10000000-0000-0000-0000-000000000008"
@@ -228,7 +226,7 @@ def test_security_hardening_upgrade_preserves_existing_rate_and_usage_data(
                 "message_id": message_id,
             },
         )
-    command.upgrade(alembic_config, "head")
+    command.upgrade(alembic_config, "20261015_18")
     with migration_engine.connect() as connection:
         assert (
             connection.scalar(

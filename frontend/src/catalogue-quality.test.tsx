@@ -1,18 +1,6 @@
-import {
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import {
-  api,
-  ApiError,
-  DataSource,
-  ProductMapping,
-  QualityReport,
-} from "./api";
+import { api, ApiError, DataSource, ProductMapping, QualityReport } from "./api";
 import { CatalogueQuality } from "./catalogue-quality";
 
 const mapping: ProductMapping = {
@@ -159,9 +147,7 @@ it("clears confirmation and blocks a changed mapping draft", async () => {
       onRefresh={vi.fn()}
     />,
   );
-  expect(
-    await screen.findByText(/belongs to a different mapping/),
-  ).toBeVisible();
+  expect(await screen.findByText(/belongs to a different mapping/)).toBeVisible();
   fireEvent.click(screen.getByText("Review exclusions (1)"));
   expect(screen.getByRole("checkbox")).not.toBeChecked();
   expect(screen.getByRole("checkbox")).toBeDisabled();
@@ -174,17 +160,13 @@ it("explains stale server approval and does not retain confirmation", async () =
   show();
   await open();
   fireEvent.click(screen.getByRole("checkbox"));
-  fireEvent.click(
-    screen.getByRole("button", { name: "Approve partial catalogue" }),
-  );
+  fireEvent.click(screen.getByRole("button", { name: "Approve partial catalogue" }));
   expect(await screen.findByText(/source or mapping changed/)).toBeVisible();
   expect(screen.getByRole("checkbox")).not.toBeChecked();
 });
 
 it("distinguishes active partial coverage and exposes revocation", async () => {
-  const revoke = vi
-    .spyOn(api, "revokeCatalogueQuality")
-    .mockResolvedValue(undefined);
+  const revoke = vi.spyOn(api, "revokeCatalogueQuality").mockResolvedValue(undefined);
   show({
     ...source,
     status: "ACTIVE",
@@ -197,19 +179,13 @@ it("distinguishes active partial coverage and exposes revocation", async () => {
     },
   });
   expect(await screen.findByText("Active — partial catalogue")).toBeVisible();
-  fireEvent.click(
-    screen.getByRole("button", { name: "Revoke partial approval" }),
-  );
-  await waitFor(() =>
-    expect(revoke).toHaveBeenCalledWith("business", "source"),
-  );
+  fireEvent.click(screen.getByRole("button", { name: "Revoke partial approval" }));
+  await waitFor(() => expect(revoke).toHaveBeenCalledWith("business", "source"));
 });
 
 it("revalidates the current draft without silently approving", async () => {
   vi.mocked(api.catalogueQuality).mockResolvedValue(null);
-  const validate = vi
-    .spyOn(api, "validateCatalogueQuality")
-    .mockResolvedValue(report);
+  const validate = vi.spyOn(api, "validateCatalogueQuality").mockResolvedValue(report);
   const approve = vi.spyOn(api, "approveCatalogueQuality");
   show();
   fireEvent.click(
@@ -218,11 +194,83 @@ it("revalidates the current draft without silently approving", async () => {
   expect(
     await screen.findByText("Review required — partial approval eligible"),
   ).toBeVisible();
-  expect(validate).toHaveBeenCalledWith(
-    "business",
-    "source",
-    "revision",
-    mapping,
-  );
+  expect(validate).toHaveBeenCalledWith("business", "source", "revision", mapping);
   expect(approve).not.toHaveBeenCalled();
+});
+
+it("renews an unchanged active mapping only after fresh validation and owner confirmation", async () => {
+  vi.mocked(api.catalogueQuality).mockResolvedValue({
+    ...report,
+    expires_at: new Date(Date.now() - 1000).toISOString(),
+  });
+  const freshReport = { ...report, id: "fresh-report" };
+  const validate = vi
+    .spyOn(api, "validateCatalogueQuality")
+    .mockResolvedValue(freshReport);
+  const approve = vi.spyOn(api, "approveCatalogueQuality").mockResolvedValue({
+    approval_type: "partial",
+    excluded_records: 1,
+    total_records: 1000,
+    valid_records: 999,
+  });
+  show({
+    ...source,
+    status: "ACTIVE",
+    mapping_version: 1,
+    last_validated_at: new Date(Date.now() - 10000).toISOString(),
+    quality_approval_status: "catalogue_partial_approval_expired",
+    catalogue_approval_expires_at: new Date(Date.now() - 1000).toISOString(),
+  });
+  await open();
+  expect(
+    screen.getByRole("button", { name: "Renew catalogue approval" }),
+  ).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Revalidate catalogue" }));
+  await waitFor(() => expect(validate).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(screen.getByRole("checkbox")).toBeEnabled());
+  expect(approve).not.toHaveBeenCalled();
+  await open();
+  fireEvent.click(screen.getByRole("checkbox"));
+  fireEvent.click(screen.getByRole("button", { name: "Renew catalogue approval" }));
+  await waitFor(() =>
+    expect(approve).toHaveBeenCalledWith("business", "source", freshReport),
+  );
+  expect(
+    await screen.findByText(
+      /source remains active; other capability approvals are unchanged/,
+    ),
+  ).toBeVisible();
+});
+
+it("blocks a different revision from being approved while the source is active", async () => {
+  show({
+    ...source,
+    status: "ACTIVE",
+    mapping_version: 2,
+    quality_approval_status: "partial",
+    catalogue_approval_expires_at: new Date(Date.now() + 10000).toISOString(),
+  });
+  await open();
+  expect(screen.getByRole("checkbox")).toBeDisabled();
+  expect(
+    screen.getByRole("button", { name: "Approve partial catalogue" }),
+  ).toBeDisabled();
+});
+
+it("requires revalidation instead of replaying the report from an active approval", async () => {
+  show({
+    ...source,
+    status: "ACTIVE",
+    mapping_version: 1,
+    quality_approval_status: "partial",
+    catalogue_approval_expires_at: new Date(Date.now() + 10000).toISOString(),
+    last_validated_at: new Date(
+      new Date(report.validated_at).getTime() + 1,
+    ).toISOString(),
+  });
+  await open();
+  expect(screen.getByRole("checkbox")).toBeDisabled();
+  expect(
+    screen.getByRole("button", { name: "Renew catalogue approval" }),
+  ).toBeDisabled();
 });

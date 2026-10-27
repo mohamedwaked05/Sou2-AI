@@ -1,11 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
-import {
-  api,
-  ApiError,
-  DataSource,
-  ProductMapping,
-  QualityReport,
-} from "./api";
+import { api, ApiError, DataSource, ProductMapping, QualityReport } from "./api";
 import { Alert, BusyLabel } from "./ui";
 
 const impactLabels = {
@@ -102,13 +96,24 @@ export function CatalogueQuality({
     report?.revision_id === revisionId &&
     JSON.stringify(report.mapping) === mappingJson;
   const fresh = !!report && new Date(report.expires_at).getTime() > Date.now();
-  const full =
-    report?.invalid_records === 0 && report.structural_status === "PASS";
+  const full = report?.invalid_records === 0 && report.structural_status === "PASS";
+  const activeRenewal =
+    source.status === "ACTIVE" &&
+    source.mapping_version === report?.mapping_version &&
+    !!source.catalogue_approval_expires_at &&
+    ["full", "partial", "catalogue_partial_approval_expired"].includes(
+      source.quality_approval_status ?? "",
+    );
   const eligible =
     current &&
     fresh &&
     (report?.eligible || full) &&
-    source.status !== "ACTIVE";
+    (source.status !== "ACTIVE" ||
+      (activeRenewal &&
+        !!source.last_validated_at &&
+        !!report &&
+        new Date(report.validated_at).getTime() >
+          new Date(source.last_validated_at).getTime()));
   const coverage = source.catalogue_coverage;
 
   return (
@@ -139,9 +144,7 @@ export function CatalogueQuality({
         >
           <BusyLabel
             busy={busy}
-            idle={
-              report ? "Revalidate catalogue" : "Validate catalogue quality"
-            }
+            idle={report ? "Revalidate catalogue" : "Validate catalogue quality"}
           />
         </button>
       </header>
@@ -179,15 +182,15 @@ export function CatalogueQuality({
       )}
       {!report ? (
         <p>
-          No quality report yet. Validation reads the approved scope without
-          changing source records.
+          No quality report yet. Validation reads the approved scope without changing
+          source records.
         </p>
       ) : (
         <>
           {!current && (
             <Alert>
-              This report belongs to a different mapping or draft. Revalidate
-              the mapping displayed here.
+              This report belongs to a different mapping or draft. Revalidate the
+              mapping displayed here.
             </Alert>
           )}
           {!fresh && (
@@ -241,16 +244,11 @@ export function CatalogueQuality({
               <dt>Source activation</dt>
               <dd>
                 {source.status}
-                {coverage?.approval_type === "partial"
-                  ? " — partial coverage"
-                  : ""}
+                {coverage?.approval_type === "partial" ? " — partial coverage" : ""}
               </dd>
             </div>
           </dl>
-          <div
-            className={full ? "quality-neutral" : "quality-warning"}
-            role="status"
-          >
+          <div className={full ? "quality-neutral" : "quality-warning"} role="status">
             <strong>
               {full
                 ? "Validated — full catalogue"
@@ -262,8 +260,8 @@ export function CatalogueQuality({
             <p>{report.recommended_action}</p>
           </div>
           <p>
-            Being below the tolerance never grants approval. Stock, pricing,
-            sales and financial capabilities require separate verified mappings.
+            Being below the tolerance never grants approval. Stock, pricing, sales and
+            financial capabilities require separate verified mappings.
           </p>
           <details>
             <summary>View validation details</summary>
@@ -280,14 +278,12 @@ export function CatalogueQuality({
               ))}
             </dl>
             <dl>
-              {Object.entries(report.relationship_counts ?? {}).map(
-                ([rule, count]) => (
-                  <div key={rule}>
-                    <dt>{rule.replaceAll("_", " ")}</dt>
-                    <dd>{count} optional relationships without a label</dd>
-                  </div>
-                ),
-              )}
+              {Object.entries(report.relationship_counts ?? {}).map(([rule, count]) => (
+                <div key={rule}>
+                  <dt>{rule.replaceAll("_", " ")}</dt>
+                  <dd>{count} optional relationships without a label</dd>
+                </div>
+              ))}
             </dl>
             <ul>
               {report.findings.map((finding) => (
@@ -314,9 +310,8 @@ export function CatalogueQuality({
               Review exclusions ({report.invalid_records ?? "unverified"})
             </summary>
             <p>
-              Only approved identifiers and names are shown. An unavailable
-              identifier has no invented replacement key. Diagnostics are
-              bounded to 50 records.
+              Only approved identifiers and names are shown. An unavailable identifier
+              has no invented replacement key. Diagnostics are bounded to 50 records.
             </p>
             <div className="quality-table-scroll">
               <table className="quality-table">
@@ -332,17 +327,13 @@ export function CatalogueQuality({
                   {report.diagnostics.map((row, index) => (
                     <tr key={index}>
                       <td>
-                        <strong>
-                          {row.identifier ?? "Identifier unavailable"}
-                        </strong>
+                        <strong>{row.identifier ?? "Identifier unavailable"}</strong>
                         <div>{row.name ?? "Name unavailable"}</div>
                       </td>
                       <td>
                         {row.explanation}
                         <details>
-                          <summary>
-                            Relationship concerns and suggested action
-                          </summary>
+                          <summary>Relationship concerns and suggested action</summary>
                           <p>{row.relationship_concerns.join(" ")}</p>
                           <p>{row.suggested_action}</p>
                           <p>{row.locator_note}</p>
@@ -359,8 +350,8 @@ export function CatalogueQuality({
             </div>
             {report.diagnostics_truncated && (
               <p>
-                Additional invalid records exist; exact aggregate counts above
-                cover the full scope.
+                Additional invalid records exist; exact aggregate counts above cover the
+                full scope.
               </p>
             )}
             <label className="quality-confirm">
@@ -374,33 +365,37 @@ export function CatalogueQuality({
               {full
                 ? "full catalogue coverage with zero exclusions"
                 : `excluding exactly ${report.invalid_records} of ${report.total_records} records for catalogue use only`}
-              . This approval does not authorize stock or financial
-              calculations.
+              . This approval does not authorize stock or financial calculations.
             </label>
             <button
               className="btn"
               disabled={busy || !eligible || !confirmed || !reviewing}
               onClick={() =>
                 void run(async () => {
-                  await api.approveCatalogueQuality(
-                    businessId,
-                    source.id,
-                    report,
-                  );
+                  await api.approveCatalogueQuality(businessId, source.id, report);
                   setConfirmed(false);
                   setNotice(
-                    "Coverage approval saved. Activate the source separately after its health check.",
+                    activeRenewal
+                      ? "Catalogue approval renewed. The source remains active; other capability approvals are unchanged."
+                      : "Coverage approval saved. Activate the source separately after its health check.",
                   );
                   await onRefresh();
                 })
               }
             >
-              {full ? "Approve full catalogue" : "Approve partial catalogue"}
+              {activeRenewal
+                ? "Renew catalogue approval"
+                : full
+                  ? "Approve full catalogue"
+                  : "Approve partial catalogue"}
             </button>
             {!eligible && (
               <p>
-                Approval requires a current report for this exact mapping, safe
-                impact, permitted tolerance and an inactive source.
+                Approval requires a current report for this exact mapping, safe impact
+                and permitted tolerance. Active-source renewal also requires its
+                unchanged, previously approved mapping; new or modified mappings require
+                an inactive source. Renewal requires a new validation after the previous
+                approval.
               </p>
             )}
           </details>

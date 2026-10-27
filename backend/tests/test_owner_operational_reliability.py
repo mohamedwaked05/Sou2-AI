@@ -74,7 +74,15 @@ def test_generation_limit_override_is_explicitly_development_only(environment, f
         if environment == "production":
             production_settings(**values)
         else:
-            Settings(_env_file=None, environment=environment, **values)
+            Settings(
+                _env_file=None,
+                environment=environment,
+                owner_chat_provider="gemini",
+                source_mapping_provider="gemini",
+                conversation_summary_provider="gemini",
+                customer_chat_provider="gemini",
+                **values,
+            )
 
 
 @pytest.mark.parametrize(
@@ -319,25 +327,29 @@ def test_pending_selection_revalidates_source_and_preserves_provider_usage(
 
 
 @pytest.mark.parametrize(
-    "reference",
+    "reference,status",
     [
-        "Pepsi Bottle 1.5 L",
-        "PEPSI-1500",
-        "show me Pepsi Bottle 1.5 L in Achrafieh",
-        "the pepsi bottle 1.5 L in achrafieh",
-        "Pepsi Bottle 1.5L",
-        "the pepsi 1.5L in achrafieh",
+        ("Pepsi Bottle 1.5 L", "resolved"),
+        ("PEPSI-1500", "resolved"),
+        ("show me Pepsi Bottle 1.5 L in Achrafieh", "not_found"),
+        ("the pepsi bottle 1.5 L in achrafieh", "not_found"),
+        ("Pepsi Bottle 1.5L", "resolved"),
+        ("the pepsi 1.5L in achrafieh", "not_found"),
     ],
 )
 def test_specific_product_reference_excludes_weaker_token_matches(
     operational_adapter,  # noqa: F811 - imported pytest fixture
     reference,
+    status,
 ):
     result = operational_adapter.resolve_product(
         ProductResolutionQuery(reference=reference)
     )
-    assert result.status == "resolved"
-    assert result.product.sku == "PEPSI-1500"
+    assert result.status == status
+    if status == "resolved":
+        assert result.product.sku == "PEPSI-1500"
+    else:
+        assert result.product is None and result.candidates == ()
 
 
 def test_first_operational_request_with_cold_source_and_real_gemini_adapter(
@@ -412,14 +424,14 @@ def test_first_operational_request_with_cold_source_and_real_gemini_adapter(
             )
         assert response.status_code == 200, response.text
         assert response.json()["owner_message"]["generation_state"] == "completed"
-        assert len(calls) == 2
+        assert len(calls) == 1
         with migration_engine.connect() as connection:
             assert connection.scalar(text("SELECT count(*) FROM tool_call_logs")) == 1
             assert (
                 connection.scalar(
                     text("SELECT total_tokens FROM ai_usage_reservations")
                 )
-                == 24
+                == 12
             )
     finally:
         registry.resolve(FAKE_STORE_PROFILE.key).dispose()
@@ -638,9 +650,16 @@ def test_inventory_override_survives_product_clarification_and_default_stays_sav
         assert saved.location_external_id == "BR-JBEIL"
 
 
-@pytest.mark.parametrize("message", ["kifak", "hello", "how are you?"])
-def test_connected_source_routes_typed_casual_intent_to_conversation(
-    api_client, db_session, message
+@pytest.mark.parametrize(
+    "message,reply_index,modes",
+    [
+        ("kifak", 1, ["operational", "conversation"]),
+        ("hello", 0, ["conversation"]),
+        ("how are you?", 1, ["operational", "conversation"]),
+    ],
+)
+def test_connected_source_routes_casual_messages_without_reading_business_data(
+    api_client, db_session, message, reply_index, modes
 ):
     user, business = active_business(api_client, db_session)
     source = StubSource()
@@ -653,8 +672,11 @@ def test_connected_source_routes_typed_casual_intent_to_conversation(
     configure_operational_chat(db_session, business["id"], source, provider)
     response = submit(api_client, user, business["id"], message, "greeting")
     assert response.status_code == 200, response.text
-    assert response.json()["assistant_message"]["content"] == provider.results[1].reply
-    assert provider.requests[-1].mode == "conversation"
+    assert (
+        response.json()["assistant_message"]["content"]
+        == provider.results[reply_index].reply
+    )
+    assert [request.mode for request in provider.requests] == modes
     assert provider.requests[-1].tools == ()
     assert source.calls == []
 

@@ -378,7 +378,15 @@ def test_authenticated_mapping_flow_and_explicit_variant(catalogue_flow):
     english = call(client, user, path + "/products/search", {"query": "Pepsi"})
     arabic = call(client, user, path + "/products/search", {"query": "بيبسي"})
     assert english.status_code == arabic.status_code == 200
-    assert english.json() == arabic.json()
+    english_result, arabic_result = english.json(), arabic.json()
+    assert english_result["discovery_request"]["query"] == "Pepsi"
+    assert arabic_result["discovery_request"]["query"] == "بيبسي"
+    assert len(english_result["pagination_scope"]) == 64
+    assert len(arabic_result["pagination_scope"]) == 64
+    assert english_result["pagination_scope"] != arabic_result["pagination_scope"]
+    arabic_result["discovery_request"]["query"] = "Pepsi"
+    arabic_result["pagination_scope"] = english_result["pagination_scope"]
+    assert english_result == arabic_result
     result = english.json()
     assert result["status"] == "ambiguous" and len(result["items"]) == 2
     assert all(item["stock"] is None for item in result["items"])
@@ -974,9 +982,9 @@ def exercise_catalogue_owner_chat(flow, expected):
             for name in item["names"]
             if name and name != phrase
         )
-        assert len(calls) == 3
+        assert len(calls) == 2
         before = catalogue_chat_snapshot(migrator, business.id)
-        assert before.held == 0 and before.charged >= 540
+        assert before.held == 0 and before.charged >= 360
         read_count = len(reads)
 
         def forbidden(*args):
@@ -993,12 +1001,13 @@ def exercise_catalogue_owner_chat(flow, expected):
             assert replay.status_code == 200
             assert replay.json() == {**original.json(), "replayed": True}
         assert catalogue_chat_snapshot(migrator, business.id) == before
-        assert len(reads) == read_count and len(calls) == 3
+        assert len(reads) == read_count and len(calls) == 2
         tool_schema = calls[0]["generationConfig"]["responseJsonSchema"]["anyOf"][0]
         assert tool_schema["properties"]["tool_name"]["enum"] == ["product_search"]
-        assert (
-            "external_product_id"
-            not in tool_schema["properties"]["arguments"]["properties"]
+        arguments = tool_schema["properties"]["arguments"]
+        assert arguments["additionalProperties"] is False
+        assert {"business_id", "source_id", "user_id", "sql"}.isdisjoint(
+            arguments["properties"]
         )
     finally:
         event.remove(registry.external.engine, "before_cursor_execute", record_read)
@@ -1095,7 +1104,7 @@ def test_catalogue_selection_rejects_a_reapproved_mapping(catalogue_flow):
 
 @pytest.mark.parametrize("change", ["permissions", "schema", "timeout", "provenance"])
 def test_catalogue_tool_availability_revalidates_approved_source(
-    catalogue_flow, change
+    catalogue_flow, change, monkeypatch
 ):
     prepare_approved(catalogue_flow)
     client, session, migrator, user, business, _, registry, _ = catalogue_flow
@@ -1115,9 +1124,11 @@ def test_catalogue_tool_availability_revalidates_approved_source(
                 )
             )
     elif change == "timeout":
-        connector.config = connector.config.model_copy(
-            update={"query_timeout_seconds": 3}
-        )
+
+        def timeout(*args, **kwargs):
+            raise SourceMappingError("source_query_timeout")
+
+        monkeypatch.setattr(connector, "connection", timeout)
     else:
         connector.source_fingerprint = "b" * 64
     assert executor.available_definitions(user, business.id) == ()
@@ -1209,7 +1220,7 @@ def test_catalogue_pending_survives_failed_turn_and_failure_replay(catalogue_flo
     selected = submit(client, user, business.id, "Pepsi Mini", "selected")
     assert selected.status_code == 200
     assert "Pepsi Mini" in selected.json()["assistant_message"]["content"]
-    assert len(calls) == 3 and catalogue_chat_snapshot(migrator, business.id).held == 0
+    assert len(calls) == 2 and catalogue_chat_snapshot(migrator, business.id).held == 0
 
 
 @pytest.mark.parametrize(
@@ -1243,7 +1254,7 @@ def test_catalogue_chat_unsupported_operations_do_not_fabricate(
     reply = response.json()["assistant_message"]["content"]
     assert "unknown" in reply and "999" not in reply
     assert catalogue_chat_snapshot(migrator, business.id).tools == before.tools
-    assert len(calls) == 1
+    assert len(calls) == 0
 
 
 def test_sqlserver_opaque_schema_application_flow(catalogue_flow):

@@ -130,11 +130,17 @@ def test_partial_product_name_is_ambiguous_with_bounded_safe_candidates(
     )
 
 
-def test_natural_language_product_reference_is_resolved_by_source_tokens(
+def test_source_reference_does_not_discard_unmatched_terms(
     operational_adapter: PostgreSQLOperationalAdapter,
 ) -> None:
     resolution = operational_adapter.resolve_product(
         ProductResolutionQuery(reference="how many pepsi we have left")
+    )
+
+    assert resolution.status == "not_found"
+    assert resolution.candidates == ()
+    resolution = operational_adapter.resolve_product(
+        ProductResolutionQuery(reference="pepsi")
     )
 
     assert resolution.status == "ambiguous"

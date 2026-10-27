@@ -276,7 +276,7 @@ def test_create_rejects_raw_connection_details_without_echoing_values(
             excluded_sale_statuses=("PENDING", "COMPLETED"),
         ),
         replace(FAKE_STORE_MAPPING, active_reservation_statuses=()),
-        replace(FAKE_STORE_MAPPING, required_capabilities=("products",)),
+        replace(FAKE_STORE_MAPPING, required_capabilities=("best_sellers",)),
     ],
 )
 def test_mapping_profile_definition_rejects_incomplete_semantics(
@@ -284,6 +284,12 @@ def test_mapping_profile_definition_rejects_incomplete_semantics(
 ) -> None:
     with pytest.raises(MappingProfileError):
         mapping.validate_definition()
+
+
+def test_mapping_profile_supports_a_catalogue_only_capability_set() -> None:
+    replace(
+        FAKE_STORE_MAPPING, required_capabilities=("products",)
+    ).validate_definition()
 
 
 def test_failed_validation_cannot_activate_and_never_leaks_exception(

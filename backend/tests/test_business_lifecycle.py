@@ -665,10 +665,9 @@ def test_lifecycle_schema_has_one_head_and_no_legacy_active_column(
 
 
 def test_lifecycle_migration_backfills_legacy_rows_and_round_trips(
-    database_engine: Engine,
-    migration_engine: Engine,
-    alembic_config: Config,
+    legacy_migration_database,
 ) -> None:
+    database_engine, migration_engine, alembic_config = legacy_migration_database
     active_id = uuid.uuid4()
     pending_id = uuid.uuid4()
     owner_id = uuid.uuid4()
@@ -703,7 +702,7 @@ def test_lifecycle_migration_backfills_legacy_rows_and_round_trips(
                         "active": is_active,
                     },
                 )
-        command.upgrade(alembic_config, "head")
+        command.upgrade(alembic_config, "20261015_18")
         with migration_engine.connect() as connection:
             rows = dict(
                 connection.execute(
@@ -737,14 +736,13 @@ def test_lifecycle_migration_backfills_legacy_rows_and_round_trips(
                 for column in inspect(connection).get_columns("businesses")
             }
     finally:
-        command.upgrade(alembic_config, "head")
+        command.upgrade(alembic_config, "20261015_18")
 
 
 def test_security_migration_downgrade_upgrade_preserves_history(
-    database_engine: Engine,
-    migration_engine: Engine,
-    alembic_config: Config,
+    legacy_migration_database,
 ) -> None:
+    database_engine, migration_engine, alembic_config = legacy_migration_database
     database_engine.dispose()
     migration_engine.dispose()
     with migration_engine.connect() as connection:
@@ -760,7 +758,7 @@ def test_security_migration_downgrade_upgrade_preserves_history(
                 )
                 == before
             )
-        command.upgrade(alembic_config, "head")
+        command.upgrade(alembic_config, "20261015_18")
         with migration_engine.connect() as connection:
             assert (
                 connection.scalar(
@@ -779,4 +777,4 @@ def test_security_migration_downgrade_upgrade_preserves_history(
                 == "sou2ai_migrator"
             )
     finally:
-        command.upgrade(alembic_config, "head")
+        command.upgrade(alembic_config, "20261015_18")
