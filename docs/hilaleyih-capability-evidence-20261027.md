@@ -102,6 +102,12 @@ discarded to obtain an approval.
 
 ## Verification and remaining limitations
 
+- Corrected two additional runtime regressions found by the complete suite:
+  explicit location-preference commands bypass the business-address knowledge
+  fast path, and a validated Catalogue cancellation takes precedence over
+  changed-product wording. Invalidated saved locations now receive an accurate
+  message. Ordinary location, delivery, returns and Friday-hours policy routing
+  retains regression coverage.
 - 99 frontend tests, TypeScript, lint, production build and isolated Chrome
   navigation checks at three viewport widths passed.
 - 246 core backend checks and 18 updated operational-contract checks passed.
@@ -120,11 +126,23 @@ discarded to obtain an approval.
 - Pricing, Inventory and Revenue refusal checks used zero charged tokens. No
   live 500-chunk capacity attempt was repeated; bounded processing and retry
   behavior were verified with isolated providers.
-- The complete legacy backend run is **not green**: 1,130 passed, 62 failed,
-  two skipped. Unresolved operational clarification/state and provider-contract
-  regressions remain. No blanket test exclusions or weaker production guards
-  were introduced to hide them. This report does not certify the whole project
-  as complete.
+- The final complete legacy backend run passed: **1,199 passed, two skipped,
+  zero failures**. The two opt-in tests require private historical-source and
+  isolated SQL Server fixture credentials; actual Hilaleyih validation was
+  performed separately through its restricted source configuration.
+- Legacy tests now exercise the current deterministic rendering and exact token
+  accounting, bounded completed-owner history, evidenced pending transitions,
+  real intervening exchanges and independent reporting/deadline clocks. Invalid
+  or foreign selections must fail closed without source reads. Cancellation
+  tests first establish a real active question through the normal conversation
+  API. No blanket exclusions or weaker production guards were introduced.
+
+Catalogue and Sales approval renewal still requires the exact owner confirmation
+requested during this run. Fresh validation is not approval, and expired reports
+must be replaced and their evidence compared before any normal approval request.
+Pricing, Inventory and Revenue remain unavailable for the evidence reasons above.
+These outstanding approvals and source definitions prevent certifying the entire
+product as complete.
 
 The connected authenticated Chrome origin was previously denied by saved browser
 permissions. API and isolated-browser evidence do not replace an authenticated

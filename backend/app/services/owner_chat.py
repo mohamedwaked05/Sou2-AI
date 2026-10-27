@@ -963,6 +963,14 @@ def _query_concepts(value: str) -> frozenset[str]:
 
 
 def _is_knowledge_policy_request(value: str) -> bool:
+    text = _normalized_classifier_text(value)
+    preference_request = re.search(r"\bpreferences?\b", text) or (
+        re.search(r"\bdefault\b", text)
+        and re.search(r"\b(?:use|set|choose|select|clear|remove|reset|stop)\b", text)
+    )
+    if preference_request and re.search(r"\b(?:location|branch|warehouse)\b", text):
+        # A saved operational preference is not the business's address policy.
+        return False
     concepts = _query_concepts(value)
     if concepts & {
         "inventory",
@@ -3036,6 +3044,11 @@ def _operational_synthesis_fallback(
             )
         elif action == "cleared":
             reply = "I will no longer use a default location for inventory questions."
+        elif action == "invalidated":
+            reply = (
+                "Your saved inventory location is no longer available. "
+                "Choose a source location."
+            )
         else:
             reply = "I could not save that inventory location preference."
     elif (
@@ -5905,7 +5918,7 @@ def _run_operational_loop(
             )
         if (
             (required_catalogue_choice or offered_reference)
-            and not changed_reference
+            and (not changed_reference or result.pending_reply == "cancel")
             and not catalogue_refinement
         ):
             selection = (

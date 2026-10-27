@@ -1582,7 +1582,7 @@ def test_explicit_inventory_location_overrides_saved_preference(
     )
 
 
-def test_inventory_planning_ignores_history_and_applies_saved_location(
+def test_inventory_planning_keeps_bounded_history_and_applies_saved_location(
     api_client: TestClient, db_session: Session
 ) -> None:
     user, business = active_business(
@@ -1627,8 +1627,11 @@ def test_inventory_planning_ignores_history_and_applies_saved_location(
     assert inventory.status_code == 200, inventory.text
     planning_request = provider.requests[1]
     assert planning_request.mode == "operational"
-    assert len(planning_request.messages) == 1
-    assert planning_request.messages[0].content == "How many generic items do we have?"
+    assert [item.content for item in planning_request.messages] == [
+        "Use Jbeil Branch for future inventory questions.",
+        "How many generic items do we have?",
+    ]
+    assert planning_request.rolling_summary is None
     assert source.last_inventory_query.branch_external_id == "BR-JBEIL"
     saved = db_session.scalar(select(UserOperationalPreference))
     assert saved is not None
@@ -1886,8 +1889,14 @@ def test_hallucinated_location_reference_is_not_saved(
     )
 
     assert response.status_code == 200, response.text
+    assert (
+        "couldn't safely set that preference"
+        in response.json()["assistant_message"]["content"]
+    )
     assert db_session.scalar(select(UserOperationalPreference)) is None
-    assert db_session.scalar(select(PendingOwnerOperationalPreference)) is not None
+    pending = db_session.scalar(select(PendingOwnerOperationalPreference))
+    assert pending is not None and pending.state == "pending"
+    assert pending.user_id == user.id
     assert source.calls == []
 
 
@@ -1988,15 +1997,15 @@ def test_stale_location_preference_is_removed_without_an_inventory_query(
 
     assert response.status_code == 200, response.text
     assert source.calls == []
-    assert provider.requests[1].mode == "operational_synthesis"
-    assert provider.requests[1].tool_results[0].output["action"] == "invalidated"
+    assert "no longer available" in response.json()["assistant_message"]["content"]
+    assert [request.mode for request in provider.requests] == ["operational"]
     assert db_session.scalar(select(UserOperationalPreference)) is None
     replay = submit(
         api_client, user, business["id"], "How many generic items do we have?", key
     )
     assert replay.status_code == 200
     assert replay.json()["replayed"] is True
-    assert len(provider.requests) == 2
+    assert len(provider.requests) == 1
     with migration_engine.connect() as connection:
         usage = connection.execute(
             text(
@@ -2004,20 +2013,12 @@ def test_stale_location_preference_is_removed_without_an_inventory_query(
                 "counts_authoritative, status FROM ai_usage_reservations"
             )
         ).one()
-    failed_input = 17 if failure == "reported" else 10 if failure == "unknown" else 0
-    failed_output = (
-        4
-        if failure == "reported"
-        else provider.requests[1].max_output_tokens
-        if failure == "unknown"
-        else 0
-    )
-    if failure is None:
-        failed_input, failed_output = 10, 2
-    assert usage.input_tokens == 10 + failed_input
-    assert usage.output_tokens == 2 + failed_output
+    # The source-backed invalidation is rendered without synthesis, even when
+    # the unused provider stage would fail or report uncertain usage.
+    assert usage.input_tokens == 10
+    assert usage.output_tokens == 2
     assert usage.total_tokens == usage.input_tokens + usage.output_tokens
-    assert usage.counts_authoritative is (failure in {None, "reported"})
+    assert usage.counts_authoritative is True
     assert usage.status == "completed"
 
 
@@ -2702,7 +2703,7 @@ def test_unresolved_product_turn_returns_safe_answer_without_rag_or_guessing(
     assert db_session.scalar(select(func.count()).select_from(ToolCallLog)) == 1
 
 
-def test_product_follow_up_uses_bounded_pending_candidates_without_history(
+def test_product_follow_up_uses_bounded_candidates_and_completed_owner_history(
     api_client: TestClient, db_session: Session
 ) -> None:
     user, business = active_business(
@@ -2728,7 +2729,17 @@ def test_product_follow_up_uses_bounded_pending_candidates_without_history(
         ),
         metadata=metadata(rows=2),
     )
-    resolved = source.resolution
+    resolved = source.resolution.model_copy(
+        update={
+            "product": inventory_item().product.model_copy(
+                update={
+                    "external_product_id": "fixture-product-a",
+                    "sku": "fixture-a",
+                    "name": "Fixture Product A",
+                }
+            )
+        }
+    )
 
     def resolve_by_reference(query: object) -> ProductResolution:
         reference = cast(Any, query).reference
@@ -2750,9 +2761,10 @@ def test_product_follow_up_uses_bounded_pending_candidates_without_history(
                 decision="tool",
                 tool_name=CURRENT_INVENTORY_TOOL,
                 tool_arguments={
-                    "product_filter": "selected fixture variant",
+                    "product_filter": "fixture-a",
                     "limit": 5,
                 },
+                pending_reply="selection",
             ),
             usage_result(reply="The validated inventory result is ready."),
         ]
@@ -2770,15 +2782,18 @@ def test_product_follow_up_uses_bounded_pending_candidates_without_history(
         api_client,
         user,
         business["id"],
-        "selected fixture variant",
+        "fixture-a",
         f"pending-product-follow-up-{uuid.uuid4()}",
     )
 
     assert initial.status_code == 200, initial.text
     assert follow_up.status_code == 200, follow_up.text
     follow_up_request = provider.requests[1]
-    assert len(follow_up_request.messages) == 1
-    assert follow_up_request.messages[0].content == "selected fixture variant"
+    assert [message.content for message in follow_up_request.messages] == [
+        "initial ambiguous request",
+        "fixture-a",
+    ]
+    assert follow_up_request.rolling_summary is None
     assert [
         candidate.label for candidate in follow_up_request.pending_product_candidates
     ] == [

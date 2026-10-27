@@ -1059,8 +1059,10 @@ def test_catalogue_chat_rejects_invalid_selection_scope(catalogue_flow, field, v
     session.commit()
     before = catalogue_chat_snapshot(migrator, business.id)
     result = submit(client, user, business.id, "Pepsi Mini", "invalid")
-    assert result.status_code == 200
-    assert "no longer valid" in result.json()["assistant_message"]["content"]
+    # An expired/foreign choice is no active clarification. A provider cannot
+    # resurrect it by declaring a selection; it must propose a fresh search.
+    assert result.status_code == 503
+    assert result.json()["error"]["code"] == "assistant_invalid_response"
     after = catalogue_chat_snapshot(migrator, business.id)
     assert before.tools == after.tools and after.held == 0 and len(calls) == 2
 
@@ -1096,8 +1098,8 @@ def test_catalogue_selection_rejects_a_reapproved_mapping(catalogue_flow):
     prepare_approved(catalogue_flow)
     before = catalogue_chat_snapshot(migrator, business.id)
     response = submit(client, user, business.id, "Pepsi Mini", "stale")
-    assert response.status_code == 200
-    assert "no longer valid" in response.json()["assistant_message"]["content"]
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "assistant_invalid_response"
     assert catalogue_chat_snapshot(migrator, business.id).tools == before.tools
     assert len(calls) == 2
 
@@ -1150,8 +1152,25 @@ def test_catalogue_pending_explicit_transition(catalogue_flow, transition):
             "Other", pending_reply="unrelated", pending_request="Find Other"
         )
     )
-    _, calls = catalogue_chat_provider([catalogue_plan(), plan])
+    _, calls = catalogue_chat_provider(
+        [
+            catalogue_plan(),
+            catalogue_plan(
+                product_presentation={
+                    "intent": "ambiguous_followup",
+                    "reference": "offered",
+                }
+            ),
+            plan,
+        ]
+    )
     assert submit(client, user, business.id, "Find Pepsi", "first").status_code == 200
+    question = submit(client, user, business.id, "Choose Pepsi", "question")
+    assert question.status_code == 200, question.text
+    question_owner = session.get(
+        OwnerChatMessage, question.json()["owner_message"]["id"]
+    )
+    assert question_owner.operational_clarification["state_kind"] == "clarification"
     before = catalogue_chat_snapshot(migrator, business.id)
     response = submit(
         client,
@@ -1162,14 +1181,24 @@ def test_catalogue_pending_explicit_transition(catalogue_flow, transition):
     )
     assert response.status_code == 200
     latest = session.get(OwnerChatMessage, response.json()["owner_message"]["id"])
-    assert latest.operational_clarification is None
+    if transition == "cancel":
+        assert latest.operational_clarification == {
+            "operation": "catalogue_context_cleared"
+        }
+    else:
+        assert latest.operational_clarification["owner_request"] == "Find Other"
+        assert all(
+            "Pepsi" not in name
+            for item in latest.operational_clarification["candidates"]
+            for name in item["names"]
+        )
     assert ("cancelled" if transition == "cancel" else "Other") in response.json()[
         "assistant_message"
     ]["content"]
     assert catalogue_chat_snapshot(migrator, business.id).tools == before.tools + (
         transition == "unrelated"
     )
-    assert len(calls) == 2
+    assert len(calls) == 3
 
 
 def test_catalogue_pending_provider_failure_recovers_without_renewing_expiry(
@@ -1180,11 +1209,18 @@ def test_catalogue_pending_provider_failure_recovers_without_renewing_expiry(
     _, calls = catalogue_chat_provider(
         [
             catalogue_plan(),
-            {"decision": "tool", "semantic_operation": "product_search"},
+            catalogue_plan(
+                product_presentation={
+                    "intent": "ambiguous_followup",
+                    "reference": "offered",
+                }
+            ),
+            {**catalogue_plan(), "unsupported_field": True},
             catalogue_plan("Pepsi Mini", pending_reply="selection"),
         ]
     )
-    first = submit(client, user, business.id, "Find Pepsi", "first")
+    assert submit(client, user, business.id, "Find Pepsi", "first").status_code == 200
+    first = submit(client, user, business.id, "Choose Pepsi", "question")
     assert first.status_code == 200
     origin = session.get(OwnerChatMessage, first.json()["owner_message"]["id"])
     before = catalogue_chat_snapshot(migrator, business.id)

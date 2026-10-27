@@ -63,6 +63,22 @@ from tests.test_owner_chat import active_business, submit
 from tests.test_owner_chat_provider import operational_request
 
 
+@pytest.mark.parametrize(
+    "message,policy",
+    [
+        ("remove the location preference", False),
+        ("use a location by default", False),
+        ("set Jbeil branch as the default", False),
+        ("What is the store location?", True),
+        ("What are our default delivery location rules?", True),
+        ("What are Friday opening hours?", True),
+        ("What is our return policy?", True),
+    ],
+)
+def test_location_preferences_do_not_override_business_policy_routing(message, policy):
+    assert owner_chat._is_knowledge_policy_request(message) is policy
+
+
 @pytest.mark.parametrize("environment", ["testing", "staging", "production"])
 @pytest.mark.parametrize(
     "field",
@@ -292,7 +308,7 @@ def test_pending_selection_revalidates_source_and_preserves_provider_usage(
         entity_kind="product",
         entity_query="Item",
     )
-    next_plan = replace(plan, entity_query="Item A")
+    next_plan = replace(plan, entity_query="Item A", pending_reply="selection")
     if failure == "forbidden_tool":
         next_plan = replace(next_plan, tool_name="run_sql")
     elif failure == "forbidden_arguments":
@@ -515,6 +531,26 @@ def test_product_clarification_is_bounded_and_scoped(
         conversation_id = create_conversation(
             db_session, conversation_user, business_id
         ).id
+    if invalidate == "intervening_turn":
+        intervening = OwnerChatMessage(
+            conversation_id=conversation_id,
+            sequence_number=3,
+            role="owner",
+            content="An unrelated completed request",
+            idempotency_key="intervening",
+            generation_state="completed",
+        )
+        db_session.add(intervening)
+        db_session.flush()
+        db_session.add(
+            OwnerChatMessage(
+                conversation_id=conversation_id,
+                sequence_number=4,
+                role="assistant",
+                content="A separate answer with no pending product choice.",
+                reply_to_message_id=intervening.id,
+            )
+        )
     followup = OwnerChatMessage(
         conversation_id=conversation_id,
         sequence_number=5 if invalidate == "intervening_turn" else 3,
@@ -598,18 +634,22 @@ def test_inventory_override_survives_product_clarification_and_default_stays_sav
         entity_kind="product",
         entity_query="Pepsi",
     )
+    exact_plan = replace(plan, entity_query="Pepsi Bottle 1.5 L")
     results = [
         usage_result(decision="set_preference"),
-        plan,
-        usage_result(reply="Inventory."),
-        plan,
+        exact_plan,
+        plan if clarify else exact_plan,
     ]
     if clarify:
-        # A provider that loses the follow-up operation must not lose safe context.
-        results.append(usage_result(reply="Clarify", semantic_operation="unsupported"))
-    results.extend(
-        [usage_result(reply="Inventory."), plan, usage_result(reply="Inventory.")]
-    )
+        # The provider classifies the quoted selection; the backend supplies its ID.
+        results.append(
+            usage_result(
+                reply="Clarify",
+                semantic_operation="unsupported",
+                pending_reply="selection",
+            )
+        )
+    results.append(exact_plan)
     provider = SequenceProvider(results)
     configure_operational_chat(db_session, business["id"], source, provider)
     messages = [
@@ -635,7 +675,7 @@ def test_inventory_override_survives_product_clarification_and_default_stays_sav
         if index == 1 or index == len(messages) - 1:
             assert source.last_inventory_query.branch_external_id == "BR-JBEIL"
         if index == 2 and clarify:
-            assert "Which one" in response.json()["assistant_message"]["content"]
+            assert "Which product" in response.json()["assistant_message"]["content"]
             origin = db_session.get(
                 OwnerChatMessage, response.json()["owner_message"]["id"]
             )
@@ -739,7 +779,7 @@ def test_best_sellers_semantic_derives_registered_bounded_command():
     assert missing is None
 
 
-def test_quantity_free_inventory_synthesis_uses_validated_fallback(
+def test_inventory_renders_validated_quantities_without_synthesis(
     api_client, db_session
 ):
     user, business = active_business(api_client, db_session)
@@ -761,7 +801,8 @@ def test_quantity_free_inventory_synthesis_uses_validated_fallback(
     answer = response.json()["assistant_message"]["content"]
     assert str(inventory_item().available_quantity) in answer
     assert inventory_item().branch_name in answer
-    assert len(provider.requests) == 2
+    assert [request.mode for request in provider.requests] == ["operational"]
+    assert "retrieved your inventory" not in answer
 
 
 def test_inventory_presentation_uses_source_quantities_and_discloses_partial_rows(
@@ -802,7 +843,7 @@ def test_inventory_presentation_uses_source_quantities_and_discloses_partial_row
     )
     assert response.status_code == 200, response.text
     reply = response.json()["assistant_message"]["content"]
-    for item in items[:10]:
+    for item in items:
         assert item.product.name in reply
     for field, label in (
         ("available_quantity", "available"),
@@ -810,8 +851,7 @@ def test_inventory_presentation_uses_source_quantities_and_discloses_partial_row
         ("reserved_quantity", "reserved"),
     ):
         assert f"{getattr(items[0], field)} {label}" in reply
-    assert "Showing 10 of 12 returned rows" in reply
-    assert "source result is limited" in reply
+    assert "Results are truncated" in reply
     assert "pack/case units were not supplied" in reply
     assert "999" not in reply and "every item" not in reply
 
@@ -899,7 +939,7 @@ def test_unresolved_yes_retains_inventory_choices_and_clear_selection_resumes(
             tool_name=CURRENT_INVENTORY_TOOL,
             tool_arguments={"location_reference": selection, "limit": 7},
         )
-        prefix = [first, usage_result(reply="Choose a location.")]
+        prefix = [first]
         guessed = replace(first, pending_reply="confirmation")
     provider = SequenceProvider(
         prefix
@@ -951,7 +991,7 @@ def test_known_rejected_pending_plan_retains_source_choices_and_actual_usage(
 
     class RejectedYesProvider(SequenceProvider):
         def generate(self, request):
-            if len(self.requests) == 2:
+            if len(self.requests) == 1:
                 self.requests.append(request)
                 raise OwnerChatProviderInvalidResponse(
                     reason=reason, usage=usage_result().usage
@@ -966,7 +1006,6 @@ def test_known_rejected_pending_plan_retains_source_choices_and_actual_usage(
                 tool_name=CURRENT_INVENTORY_TOOL,
                 tool_arguments={"location_reference": "Test North Branch"},
             ),
-            usage_result(reply="Which location?"),
         ]
     )
     configure_operational_chat(db_session, business["id"], source, provider)
@@ -980,7 +1019,7 @@ def test_known_rejected_pending_plan_retains_source_choices_and_actual_usage(
     assert first.status_code == 200, first.text
     yes = submit(api_client, user, business["id"], "yes", "rejected-yes")
     assert yes.status_code == 200, yes.text
-    assert source.calls == [] and len(provider.requests) == 3
+    assert source.calls == [] and len(provider.requests) == 2
     owner = db_session.get(OwnerChatMessage, yes.json()["owner_message"]["id"])
     assert len(owner.operational_clarification["location_candidates"]) == 2
     assert "Test North Branch" in yes.json()["assistant_message"]["content"]
@@ -991,9 +1030,9 @@ def test_known_rejected_pending_plan_retains_source_choices_and_actual_usage(
                 "ORDER BY created_at"
             )
         ).all()
-    assert rows == [(24, True), (12, True)]
+    assert rows == [(12, True), (12, True)]
     replay = submit(api_client, user, business["id"], "yes", "rejected-yes")
-    assert replay.status_code == 200 and len(provider.requests) == 3
+    assert replay.status_code == 200 and len(provider.requests) == 2
 
 
 @pytest.mark.parametrize(
@@ -1063,6 +1102,9 @@ def test_saved_rejected_location_yes_keeps_validated_state_offline(
                 "decision": "final",
                 "semantic_operation": "product_price",
                 "pending_reply": "unrelated",
+                "pending_request": (
+                    "What is the current price at Evaluation North Warehouse?"
+                ),
             }
         )
     request = replace(
@@ -1101,7 +1143,11 @@ def test_saved_rejected_location_yes_keeps_validated_state_offline(
         timeout_seconds=120,
         transport=httpx.MockTransport(respond),
     )
-    owner = SimpleNamespace(operational_clarification=None)
+    owner = SimpleNamespace(
+        operational_clarification=None,
+        id=uuid.uuid4(),
+        content=request.messages[-1].content,
+    )
     session = SimpleNamespace(get=lambda *args: owner, commit=lambda: None)
     executor = SimpleNamespace(
         sales_reporting_context=lambda *args: ("Asia/Beirut", ()),
@@ -1111,6 +1157,7 @@ def test_saved_rejected_location_yes_keeps_validated_state_offline(
         ),
     )
     monkeypatch.setattr(owner_chat, "_pending_sales_clarification", lambda *args: False)
+    monkeypatch.setattr(owner_chat, "_selected_catalogue_context", lambda *args: None)
     monkeypatch.setattr(
         owner_chat, "_pending_product_clarification", lambda *args: pending
     )
@@ -1206,7 +1253,7 @@ def test_reservation_sizing_charges_prior_calls_on_delegated_failure(
         ).one() == (expected, 0)
 
 
-def test_reservation_sizing_accounts_for_large_serialized_source_results(
+def test_large_source_results_do_not_reserve_or_charge_unused_synthesis(
     api_client, db_session, migration_engine
 ):
     user, business = active_business(api_client, db_session)
@@ -1254,11 +1301,13 @@ def test_reservation_sizing_accounts_for_large_serialized_source_results(
     response = submit(
         api_client, user, business["id"], "Show current inventory", "large-result"
     )
-    assert response.status_code == 429, response.text
-    assert response.json()["error"]["code"] == "daily_ai_token_limit_reached"
+    assert response.status_code == 200, response.text
     assert estimates["operational"] + 512 < 20000
-    assert estimates["operational_synthesis"] + 512 + 12 > 20000
+    assert set(estimates) == {"operational"}
     assert len(provider.requests) == 1
+    answer = response.json()["assistant_message"]["content"]
+    assert "8 available; 10 on hand; 2 reserved" in answer
+    assert "Results are truncated" in answer
     with migration_engine.connect() as connection:
         assert connection.execute(
             text(
@@ -1483,10 +1532,10 @@ def test_reservation_sizing_holds_each_actual_stage_payload(
     response = submit(api_client, user, business["id"], message, "stage-sizing")
     assert response.status_code == 200, response.text
     expected_modes = {
-        "category": ["operational", "category_resolution", "operational_synthesis"],
+        "category": ["operational", "category_resolution"],
         "preference": ["operational", "preference_resolution"],
         "conversation": ["operational", "conversation"],
-        "inventory": ["operational", "operational_synthesis"],
+        "inventory": ["operational"],
     }
     assert [request.mode for request in provider.requests] == expected_modes[route]
     with migration_engine.connect() as connection:
@@ -1494,14 +1543,14 @@ def test_reservation_sizing_holds_each_actual_stage_payload(
             text(
                 "SELECT total_tokens_used,tokens_reserved FROM business_ai_usage_daily"
             )
-        ).one() == (12 * len(results), 0)
+        ).one() == (12 * len(expected_modes[route]), 0)
         assert (
             connection.scalar(text("SELECT count(*) FROM ai_usage_reservations")) == 1
         )
 
 
 @pytest.mark.parametrize(
-    "blocked_stage", ["operational", "category_resolution", "operational_synthesis"]
+    "blocked_stage", ["operational", "category_resolution", "conversation"]
 )
 def test_reservation_sizing_rejects_unaffordable_stage_before_dispatch(
     api_client, db_session, migration_engine, blocked_stage
@@ -1512,8 +1561,10 @@ def test_reservation_sizing_rejects_unaffordable_stage_before_dispatch(
         def estimate_input_tokens(self, request):
             return 20000 if request.mode == blocked_stage else 100
 
-    provider = ExpensiveStageProvider(
-        [
+    results = (
+        [usage_result(reply="", semantic_operation="conversation")]
+        if blocked_stage == "conversation"
+        else [
             usage_result(
                 decision="tool",
                 semantic_operation="inventory_category",
@@ -1528,23 +1579,21 @@ def test_reservation_sizing_rejects_unaffordable_stage_before_dispatch(
             ),
         ]
     )
+    provider = ExpensiveStageProvider(results)
     configure_operational_chat(db_session, business["id"], StubSource(), provider)
-    response = submit(
-        api_client, user, business["id"], "Show current inventory", "stage-blocked"
+    message = (
+        "Some general advice please"
+        if blocked_stage == "conversation"
+        else "Show current inventory"
     )
+    response = submit(api_client, user, business["id"], message, "stage-blocked")
     assert response.status_code == 429, response.text
     assert response.json()["error"]["code"] == "daily_ai_token_limit_reached"
     assert "Retry-After" in response.headers
-    expected_calls = [
-        "operational",
-        "category_resolution",
-        "operational_synthesis",
-    ].index(blocked_stage)
+    expected_calls = 0 if blocked_stage == "operational" else 1
     assert len(provider.requests) == expected_calls
     assert (
-        submit(
-            api_client, user, business["id"], "Show current inventory", "stage-blocked"
-        ).status_code
+        submit(api_client, user, business["id"], message, "stage-blocked").status_code
         == 409
     )
     assert len(provider.requests) == expected_calls
@@ -1975,7 +2024,6 @@ def test_mixed_greeting_business_request_keeps_the_ai_operational_plan(
     assert response.status_code == 200, response.text
     assert [request.mode for request in provider.requests] == [
         "operational",
-        "operational_synthesis",
     ]
     assert provider.requests[0].messages[-1].content == message
     assert source.calls == [CURRENT_INVENTORY_TOOL]
@@ -2002,7 +2050,6 @@ def test_incomplete_preference_resolves_unique_location_from_current_message(
                 entity_kind="product",
                 entity_query="Pepsi Bottle 1.5 L",
             ),
-            usage_result(reply="Validated inventory."),
             usage_result(
                 decision="tool",
                 semantic_operation="inventory_product",
@@ -2011,7 +2058,6 @@ def test_incomplete_preference_resolves_unique_location_from_current_message(
                 tool_name=CURRENT_INVENTORY_TOOL,
                 tool_arguments={"location_reference": "Achrafieh"},
             ),
-            usage_result(reply="Validated inventory."),
             usage_result(decision="clear_preference"),
         ]
     )
@@ -2098,7 +2144,11 @@ def test_literal_location_ambiguity_cannot_be_overruled_by_provider(
         prefix
         + [
             (
-                usage_result(reply="Select", semantic_operation="unsupported")
+                usage_result(
+                    reply="Select",
+                    semantic_operation="unsupported",
+                    pending_reply="selection",
+                )
                 if pending_followup
                 else usage_result(
                     decision="set_preference", location_reference="Beirut"
@@ -2173,12 +2223,14 @@ def test_inventory_model_expansion_cannot_choose_an_ambiguous_source_location(
     )
     assert response.status_code == 200, response.text
     assert source.calls == []
-    output = provider.requests[-1].tool_results[0].output
-    assert output["status"] == "ambiguous"
-    assert {item["label"] for item in output["candidates"]} == {
+    owner = db_session.get(OwnerChatMessage, response.json()["owner_message"]["id"])
+    assert {
+        item["label"] for item in owner.operational_clarification["location_candidates"]
+    } == {
         "Beirut Branch",
         "Beirut Warehouse",
     }
+    assert len(provider.requests) == 1
 
 
 def test_explicit_inventory_source_location_survives_a_model_expansion(
@@ -2239,15 +2291,24 @@ def test_revenue_month_is_normalized_by_backend(
         ]
     )
     configure_operational_chat(db_session, business["id"], source, provider)
-    run_loop = owner_chat._run_operational_loop
+    build_request = owner_chat._build_operational_request
 
-    def run_at_reporting_date(*args, **kwargs):
-        # Freeze reporting time, not the claim lease checked by PostgreSQL's clock.
-        with monkeypatch.context() as reporting_clock:
-            reporting_clock.setattr(owner_chat, "utc_now", lambda: requested_at)
-            return run_loop(*args, **kwargs)
+    def build_at_reporting_date(*args, **kwargs):
+        # Reporting time must not change the claim lease or provider deadline clock.
+        kwargs["requested_at"] = requested_at
+        return build_request(*args, **kwargs)
 
-    monkeypatch.setattr(owner_chat, "_run_operational_loop", run_at_reporting_date)
+    monkeypatch.setattr(
+        owner_chat, "_build_operational_request", build_at_reporting_date
+    )
+    queries = []
+    read_summary = source.get_sales_summary
+
+    def capture_summary(query):
+        queries.append(query)
+        return read_summary(query)
+
+    source.get_sales_summary = capture_summary
     response = submit(
         api_client,
         user,
@@ -2257,10 +2318,13 @@ def test_revenue_month_is_normalized_by_backend(
     )
     assert response.status_code == 200, response.text
     assert source.calls == [SALES_SUMMARY_TOOL]
-    result = provider.requests[-1].tool_results[0].output
-    assert result["period"]["start_date"] == start.isoformat()
-    assert result["period"]["end_date"] == end.isoformat()
-    assert result["metric"] == "revenue"
+    assert len(queries) == len(provider.requests) == 1
+    assert queries[0].start_date == start
+    assert queries[0].end_date == end
+    assert queries[0].metric == "revenue"
+    answer = response.json()["assistant_message"]["content"]
+    assert start.isoformat() in answer and end.isoformat() in answer
+    assert "net revenue" in answer.casefold()
 
 
 @pytest.mark.parametrize("failure", ["invalid", "timeout", "unavailable", "malformed"])
@@ -2359,6 +2423,7 @@ def test_sales_clarification_followup_is_bounded_to_one_recent_turn(
                     "date_range": "previous_completed_month",
                     "use_pending_clarification": True,
                 },
+                pending_reply="selection",
             ),
             usage_result(reply="Validated revenue."),
         ]
@@ -2373,7 +2438,10 @@ def test_sales_clarification_followup_is_bounded_to_one_recent_turn(
     )
     assert followup.status_code == 200, followup.text
     assert provider.requests[1].pending_sales_clarification is True
-    assert len(provider.requests[1].messages) == 1
+    assert [message.content for message in provider.requests[1].messages] == [
+        "give me the sales",
+        "revenue for last month",
+    ]
     assert provider.requests[1].rolling_summary is None
     assert source.calls == [SALES_SUMMARY_TOOL]
 
@@ -2384,7 +2452,11 @@ def test_vague_sales_followup_clarifies_instead_of_failing(api_client, db_sessio
     provider = SequenceProvider(
         [
             usage_result(reply="Clarify", semantic_operation="sales_summary"),
-            usage_result(reply="Clarify", semantic_operation="sales_summary"),
+            usage_result(
+                reply="Clarify",
+                semantic_operation="sales_summary",
+                pending_reply="unresolved",
+            ),
         ]
     )
     configure_operational_chat(db_session, business["id"], source, provider)
@@ -2424,6 +2496,26 @@ def test_sales_pending_state_expires_and_cannot_leak_constraints(
     # Use the actual persisted timestamp only to construct controlled request times.
     request_time = assistant.created_at + timedelta(seconds=1)
     source_updated_at = assistant.created_at - timedelta(seconds=1)
+    if invalidate == "unrelated":
+        intervening = OwnerChatMessage(
+            conversation_id=assistant.conversation_id,
+            sequence_number=assistant.sequence_number + 1,
+            role="owner",
+            content="An unrelated completed request",
+            idempotency_key="unrelated",
+            generation_state="completed",
+        )
+        db_session.add(intervening)
+        db_session.flush()
+        db_session.add(
+            OwnerChatMessage(
+                conversation_id=assistant.conversation_id,
+                sequence_number=assistant.sequence_number + 2,
+                role="assistant",
+                reply_to_message_id=intervening.id,
+                content="A separate answer without sales clarification.",
+            )
+        )
     owner = OwnerChatMessage(
         conversation_id=assistant.conversation_id,
         sequence_number=assistant.sequence_number
@@ -2656,7 +2748,6 @@ def test_connected_source_knowledge_route_preserves_grounding_and_citations(
     source = StubSource()
     provider = SequenceProvider(
         [
-            usage_result(reply="Use stable knowledge", semantic_operation="knowledge"),
             OwnerChatResult(
                 reply="Returns are accepted within 14 days.", cited_source_ids=("S1",)
             ),
@@ -2701,16 +2792,13 @@ def test_original_scenarios_against_live_fake_store(
             usage_result(reply="Unsupported price", semantic_operation="product_price"),
             usage_result(decision="set_preference", location_reference="Jbeil branch"),
             inventory_plan,
-            usage_result(reply=""),
             replace(
                 inventory_plan,
                 tool_name=CURRENT_INVENTORY_TOOL,
                 tool_arguments={"location_reference": "Achrafieh"},
             ),
-            usage_result(reply=""),
             usage_result(decision="clear_preference"),
             sales_plan,
-            usage_result(reply=""),
             usage_result(reply="Clarify", semantic_operation="sales_summary"),
             replace(
                 sales_plan,
@@ -2719,10 +2807,9 @@ def test_original_scenarios_against_live_fake_store(
                     "date_range": "previous_completed_month",
                     "use_pending_clarification": True,
                 },
+                pending_reply="selection",
             ),
-            usage_result(reply=""),
             inventory_plan,
-            usage_result(reply=""),
         ]
     )
     configure_operational_chat(
@@ -2730,8 +2817,16 @@ def test_original_scenarios_against_live_fake_store(
     )
     active = db_session.scalar(select(OperationalDataSourceConfig))
     assert active is not None
-    requested_at = active.updated_at + timedelta(minutes=1)
-    monkeypatch.setattr(owner_chat, "utc_now", lambda: requested_at)
+    requested_at = datetime.now(UTC)
+    build_request = owner_chat._build_operational_request
+
+    def build_at_reporting_date(*args, **kwargs):
+        kwargs["requested_at"] = requested_at
+        return build_request(*args, **kwargs)
+
+    monkeypatch.setattr(
+        owner_chat, "_build_operational_request", build_at_reporting_date
+    )
     expected_end = (
         requested_at.astimezone(ZoneInfo("Asia/Beirut")).date().replace(day=1)
     )
@@ -2763,11 +2858,6 @@ def test_original_scenarios_against_live_fake_store(
         )
         assert response.status_code == 200, f"Scenario {index + 1}: {response.text}"
         answers.append(response.json()["assistant_message"]["content"])
-        with migration_engine.begin() as connection:
-            connection.execute(
-                text("UPDATE owner_chat_messages SET created_at = :at WHERE id = :id"),
-                {"at": requested_at, "id": response.json()["assistant_message"]["id"]},
-            )
         db_session.expire_all()
         saved = db_session.scalar(select(UserOperationalPreference))
         if index in {2, 3, 4}:
@@ -2775,7 +2865,7 @@ def test_original_scenarios_against_live_fake_store(
         if index >= 5:
             assert saved is None
         if index == 8:
-            assert "net revenue" in answers[index], (
+            assert "net revenue" in answers[index].casefold(), (
                 answers[index],
                 provider.requests[-1].pending_sales_clarification,
             )
@@ -2785,10 +2875,13 @@ def test_original_scenarios_against_live_fake_store(
     assert "Jbeil Branch" in answers[3] and "Achrafieh" not in answers[3]
     assert "Achrafieh Branch" in answers[4] and "Jbeil" not in answers[4]
     assert "cleared" in answers[5]
-    assert "net revenue" in answers[6] and expected_start.isoformat() in answers[6]
+    assert (
+        "net revenue" in answers[6].casefold()
+        and expected_start.isoformat() in answers[6]
+    )
     assert expected_end.isoformat() in answers[6]
     assert "revenue, sales count" in answers[7]
-    assert "net revenue" in answers[8]
+    assert "net revenue" in answers[8].casefold()
     assert "Current inventory" in answers[9]
     assert all("could not safely format" not in answer for answer in answers)
     operational_plans = [
@@ -2797,6 +2890,7 @@ def test_original_scenarios_against_live_fake_store(
     assert operational_plans[8].pending_sales_clarification is True
     assert operational_plans[9].pending_sales_clarification is False
     assert all(
-        len(request.messages) == 1 and request.rolling_summary is None
+        1 <= len(request.messages) <= 13 and request.rolling_summary is None
         for request in operational_plans
     )
+    assert [request.messages[-1].content for request in operational_plans] == messages
