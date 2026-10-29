@@ -93,6 +93,7 @@ def normalize_cors_origin(value: str) -> tuple[str, str]:
 
 
 class Settings(BaseSettings):
+    hilaleyih_test_mode: bool = False
     catalogue_max_invalid_percent: Decimal = Field(
         default=Decimal("1.0"),
         ge=0,

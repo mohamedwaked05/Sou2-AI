@@ -7953,6 +7953,17 @@ def _generate_claimed_turn(
         # product or category reference is not lost before tool selection.
         knowledge_followup = _knowledge_followup_query(session, owner_message)
         policy_request = _is_knowledge_policy_request(owner_message.content)
+        if not (knowledge_followup or policy_request):
+            from app.services.hilaleyih_test import answer as hilaleyih_test_answer
+
+            test_result = hilaleyih_test_answer(
+                session, business_id, user, owner_message, settings, profiles
+            )
+            if test_result is not None:
+                _persist_result(
+                    session, business_id, claim, test_result, None, None, ()
+                )
+                return True
         is_live_operational = _is_live_operational_request(owner_message.content)
         has_pending_preference = (
             session.scalar(
