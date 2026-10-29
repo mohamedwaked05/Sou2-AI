@@ -31,8 +31,8 @@ from app.integrations.hilaleyih_test import (
     BUSINESS_ID,
     SOURCE_ID,
     HilaleyihHistoricalReader,
+    demand_proxy,
     estimated_price,
-    stable_quantity,
 )
 from app.integrations.profiles import ConnectionProfileRegistry
 from app.schemas.source_mapping import CatalogueResult
@@ -72,12 +72,93 @@ def product_query(message: str) -> str:
     )
     noise = set(
         "what how much many is are does do the this that product it its of for "
-        "cost costs price prices pricing stock inventory bottles bottlequantity "
-        "check in at our please me give have we available availability".split()
+        "cost costs price prices pricing stock inventory bottle bottles "
+        "barcode identifier sku code check in at our please me give have we "
+        "available availability".split()
     )
     words = re.findall(r"\d+(?:\.\d+)?|[^\W\d_]+", message.casefold())
     return " ".join(
         "bottle" if word == "bottles" else word for word in words if word not in noise
+    )
+
+
+def product_identifier(message: str) -> str | None:
+    explicit = re.search(
+        r"\b(?:product\s+)?(?:barcode|identifier|sku|code)\s*[:#]?\s*"
+        r"([a-z0-9][a-z0-9._-]{0,127})",
+        message,
+        re.I,
+    )
+    if explicit:
+        return explicit[1].rstrip("?.")
+    return message.strip() if re.fullmatch(r"\d{6,}", message.strip()) else None
+
+
+def exact_product(result: CatalogueResult, query: str) -> CatalogueResult:
+    """Prefer a unique complete source name/identity, never a guessed variant."""
+    normalized = product_query(query).replace(" ", "")
+    exact = tuple(
+        product
+        for product in result.items
+        if query.strip() in (product.external_product_id, product.sku)
+        or any(
+            product_query(name).replace(" ", "") == normalized for name in product.names
+        )
+    )
+    if not result.truncated and exact:
+        return result.model_copy(
+            update={
+                "items": exact,
+                "status": "resolved" if len(exact) == 1 else "ambiguous",
+            }
+        )
+    return result
+
+
+def render_inventory(name: str, evidence: Mapping[str, Any]) -> str:
+    prefix = f"Hilaleyih Market — {name}: "
+    if evidence.get("balance") is not None:
+        return (
+            f"{prefix}historical source balance {evidence['balance']} "
+            f"{evidence['unit']} from {evidence['balance_records']} matched "
+            "StockInventory records (company hila23, matching product/unit, "
+            "unique source warehouse keys). Source balance date is unknown. "
+            "Confidence: low. Not verified current stock."
+        )
+    quantity = demand_proxy(
+        Decimal(str(evidence["demand_quantity"])), evidence["calendar_days"] or 0
+    )
+    if quantity is None or not evidence["usable_lines"] or not evidence["unit"]:
+        return (
+            f"{prefix}no evidence-based numerical estimate is possible. "
+            f"{evidence['balance_reason']} Product-specific usable base-unit "
+            f"sales records: {evidence['usable_lines']}; unusable quantity/unit "
+            f"records: {evidence['unusable_lines']}. Confidence: insufficient. "
+            "Missing evidence does not mean zero stock."
+        )
+    records = ", ".join(evidence["records"])
+    return (
+        f"{prefix}{quantity} {evidence['unit']} DEMO stock proxy. "
+        f"{evidence['balance_reason']} Source: SalesFooter joined to Paid SI "
+        "SalesHeader, company hila23, using the complete document identity. "
+        f"Historical period: {evidence['first_date']} through "
+        f"{evidence['last_date']} inclusive (Asia/Beirut), "
+        f"{evidence['calendar_days']} calendar days. "
+        f"{evidence['usable_lines']} usable product lines supply "
+        f"{evidence['demand_quantity']} {evidence['unit']} positive demand "
+        f"(paid quantity plus free quantity, verified same unit and pack factor 1). "
+        f"Excluded negative documents/lines: {evidence['negative_lines']} "
+        "(classification unverified); unusable unit/quantity lines: "
+        f"{evidence['unusable_lines']}; orphan lines: {evidence['orphan_lines']}. "
+        "Replenishment assumption: restock once to seven days of average "
+        "historical demand, rounded up to one source unit; no safety stock. "
+        f"Calculation: ceil({evidence['demand_quantity']} / "
+        f"{evidence['calendar_days']} × 7) = {quantity} {evidence['unit']}. "
+        "This is a modeled replenishment target, not an observed on-hand balance. "
+        f"Example source record keys (type/invoice/line/company/partition): {records}. "
+        "Confidence: low; historical demand and an assumed replenishment target "
+        "cannot establish current stock. One store only; "
+        "not verified current inventory."
     )
 
 
@@ -133,6 +214,8 @@ def answer(
     if not enabled(settings, business_id) or profiles is None:
         return None
     text = owner.content.casefold()
+    identifier = product_identifier(owner.content)
+    branch_request = bool(re.search(r"\bjbeil\b|\bbranch(?:es)?\b", text))
     operation = (
         "pricing"
         if re.search(r"\b(price|prices|pricing|cost)\b", text)
@@ -144,6 +227,10 @@ def answer(
         if re.search(r"how many products.*catalogue", text)
         else "sales"
         if re.search(r"\bpaid\s+si\b.*\b(?:documents|sales)\b", text)
+        else "product"
+        if identifier
+        else "inventory"
+        if branch_request
         else None
     )
     previous = session.scalar(
@@ -165,9 +252,31 @@ def answer(
     if (
         operation is None
         and context
-        and context.get("candidates")
-        and (text.strip().isdigit() or (product_query(text) and len(text.split()) <= 8))
+        and (
+            text.strip().isdigit()
+            or owner.content.strip() in context.get("candidates", [])
+            or (
+                "candidate_names" not in context
+                and (context.get("candidates") or context.get("product_id"))
+                and product_query(text)
+                and len(text.split()) <= 8
+            )
+            or (
+                product_query(text)
+                and set(product_query(text).split())
+                <= {
+                    token
+                    for names in context.get("candidate_names", {}).values()
+                    for name in names
+                    for token in product_query(name).split()
+                }
+            )
+        )
     ):
+        operation = context["capability"]
+    if operation is None and re.search(r"\d+(?:\.\d+)?\s*(?:ml|l|kg|g)\b", text):
+        operation = "product"
+    if identifier and context and operation == "product":
         operation = context["capability"]
     if operation is None:
         return None
@@ -205,7 +314,15 @@ def answer(
         return result
 
     try:
-        if operation == "catalogue":
+        if branch_request:
+            reply = (
+                "Hilaleyih Market is one store and has no branches. "
+                "There is no Jbeil branch or branch-specific stock. "
+                "I can check the selected product for Hilaleyih Market only."
+            )
+            if context:
+                owner.operational_clarification = dict(context, capability="inventory")
+        elif operation == "catalogue":
             result = lookup({"browse": True, "limit": 1})
             total = result.matched_records
             if total is None and result.coverage:
@@ -266,58 +383,94 @@ def answer(
                 or context.get("source_fingerprint") != scope.source_fingerprint
             ):
                 context = None
-            location = (
-                "jbeil"
-                if re.search(r"\bjbeil\b", text)
-                else (context.get("location", "default") if context else "default")
-            )
-            unknown_branch = re.search(r"\b(?:in|at) (?:the )?(\w+) branch\b", text)
-            query = product_query(owner.content)
-            query = query.replace("jbeil branch", "").strip()
+            query = identifier or product_query(owner.content)
             choices = context.get("candidates", []) if context else []
-            selected = None
-            if context and context.get("product_id"):
-                selected = lookup(
+            offered_names = context.get("candidate_names", {}) if context else {}
+            selected_id = None
+            invalid_number = False
+            if text.strip() in choices:
+                selected_id = text.strip()
+            elif re.fullmatch(r"\d{1,3}", text.strip()) and choices:
+                index = int(text.strip()) - 1
+                if 0 <= index < len(choices):
+                    selected_id = choices[index]
+                else:
+                    invalid_number = True
+            elif query and offered_names:
+                matches = [
+                    key
+                    for key, names in offered_names.items()
+                    if any(
+                        product_query(name).replace(" ", "")
+                        == product_query(query).replace(" ", "")
+                        for name in names
+                    )
+                ]
+                if len(matches) == 1:
+                    selected_id = matches[0]
+            if not selected_id and context and context.get("product_id"):
+                current = lookup(
                     {
                         "external_product_id": context["product_id"],
                         "mapping_version": scope.mapping_version,
                     }
                 )
-                if selected.status != "resolved":
-                    context = None
-                    selected = None
-            if text.strip().isdigit() and choices:
-                index = int(text.strip()) - 1
-                if not 0 <= index < len(choices):
-                    return OwnerChatResult(
-                        reply="Choose a product number from the offered variants."
-                    )
-                arguments = {
-                    "external_product_id": choices[index],
-                    "mapping_version": scope.mapping_version,
-                }
-            elif selected and (
-                not query
-                or set(query.split())
-                <= set(product_query(" ".join(selected.items[0].names)).split())
-            ):
-                arguments = {
-                    "external_product_id": selected.items[0].external_product_id,
-                    "mapping_version": scope.mapping_version,
-                }
-            elif query:
-                arguments = {"query": query, "limit": 20}
-            else:
-                arguments = None
-            if unknown_branch and unknown_branch[1] not in {"jbeil", "default"}:
-                reply = (
-                    "Choose a DEMO test location: default or Jbeil. These are "
-                    "simulated location labels, not verified source branches."
-                )
-            elif arguments is None:
+                if current.status == "resolved" and (
+                    not query
+                    or set(product_query(query).split())
+                    <= set(product_query(" ".join(current.items[0].names)).split())
+                ):
+                    selected_id = current.items[0].external_product_id
+            if invalid_number:
+                owner.operational_clarification = context
+                reply = "Choose a product number from the offered variants."
+            elif not query and not selected_id and not choices:
                 reply = "Which catalogue product and variant do you mean?"
             else:
-                result = lookup(arguments)
+                if selected_id:
+                    result = lookup(
+                        {
+                            "external_product_id": selected_id,
+                            "mapping_version": scope.mapping_version,
+                        }
+                    )
+                elif query:
+                    result = lookup({"query": query, "limit": 50})
+                    if choices and not context.get("product_id") and not identifier:
+                        narrowed = tuple(
+                            p for p in result.items if p.external_product_id in choices
+                        )
+                        result = result.model_copy(
+                            update={
+                                "items": narrowed,
+                                "status": "not_found"
+                                if not narrowed
+                                else "resolved"
+                                if len(narrowed) == 1
+                                else "ambiguous",
+                            }
+                        )
+                    result = exact_product(result, query)
+                else:
+                    items = []
+                    for choice in choices:
+                        checked = lookup(
+                            {
+                                "external_product_id": choice,
+                                "mapping_version": scope.mapping_version,
+                            }
+                        )
+                        items.extend(checked.items)
+                    result = CatalogueResult(
+                        items=tuple(items),
+                        truncated=False,
+                        mapping_version=scope.mapping_version,
+                        status="not_found"
+                        if not items
+                        else "resolved"
+                        if len(items) == 1
+                        else "ambiguous",
+                    )
                 state = {
                     "operation": "hilaleyih_test",
                     "capability": operation,
@@ -329,20 +482,28 @@ def answer(
                     "mapping_version": scope.mapping_version,
                     "schema_fingerprint": scope.schema_fingerprint,
                     "source_fingerprint": scope.source_fingerprint,
-                    "location": location,
+                    "candidates": [p.external_product_id for p in result.items],
+                    "candidate_names": {
+                        p.external_product_id: list(p.names) for p in result.items
+                    },
                 }
                 if result.status == "not_found":
+                    if choices and not identifier and not context.get("product_id"):
+                        owner.operational_clarification = context
                     reply = (
-                        "No matching valid catalogue product was found. "
-                        "Please give its exact name or barcode."
+                        "This barcode/identifier was not found in the authorized "
+                        "valid catalogue. Please check it; I cannot invent a product."
+                        if identifier
+                        else "No matching valid catalogue product was found. "
+                        "Please give an offered name, number, or barcode."
                     )
                 elif result.status == "ambiguous":
-                    state["candidates"] = [p.external_product_id for p in result.items]
                     owner.operational_clarification = state
                     reply = (
                         "Which catalogue variant do you mean?\n"
                         + "\n".join(
-                            f"{i}. {' / '.join(p.names)}"
+                            f"{i}. {' / '.join(p.names)} "
+                            f"(identifier {p.external_product_id})"
                             for i, p in enumerate(result.items, 1)
                         )
                         + (
@@ -357,16 +518,14 @@ def answer(
                     owner.operational_clarification = state
                     name = " / ".join(product.names)
                     if operation == "inventory":
-                        quantity = stable_quantity(
-                            product.external_product_id, location
-                        )
+                        evidence = HilaleyihHistoricalReader(
+                            connector_for(profiles, source), settings
+                        ).inventory(product.external_product_id)
+                        reply = render_inventory(name, evidence)
+                    elif operation == "product":
                         reply = (
-                            f"Hilaleyih test mode — {name}: {quantity} DEMO stock "
-                            f"units at the {location.title()} test location. "
-                            "Stable simulated quantity; source quantities do not "
-                            "establish a reliable current balance. Not verified "
-                            "current inventory. Test locations and units do not "
-                            "verify source branch or pack semantics."
+                            f"Catalogue product: {name}; "
+                            f"identifier {product.external_product_id}."
                         )
                     else:
                         row = HilaleyihHistoricalReader(
@@ -379,7 +538,7 @@ def answer(
                             and Decimal(str(amount)) >= 0
                         ):
                             reply = (
-                                f"Hilaleyih test mode — {name}: historical Selling1 "
+                                f"Hilaleyih test mode ? {name}: historical Selling1 "
                                 f"source amount {amount}; "
                                 f"source currency code {row['ItemCurr']}; "
                                 f"source unit {row['Unit'] or 'missing'}. "
@@ -391,7 +550,7 @@ def answer(
                         else:
                             estimate = estimated_price(product.external_product_id)
                             reply = (
-                                f"Hilaleyih test mode — {name}: DEMO price estimate "
+                                f"Hilaleyih test mode ? {name}: DEMO price estimate "
                                 f"{estimate:.2f} synthetic demo currency units "
                                 "per test item. Deterministic simulated "
                                 "amount; not a verified current checkout price."
@@ -404,6 +563,17 @@ def answer(
             "or approval. A fresh authorized validation/read is required "
             f"({error.code})."
         )
+    if (
+        context
+        and owner.operational_clarification is None
+        and operation
+        in {
+            "catalogue",
+            "sales",
+            "financial",
+        }
+    ):
+        owner.operational_clarification = context
     audit.latency_ms = int((time.monotonic() - started) * 1000)
     session.add(audit)
     return OwnerChatResult(reply=reply)

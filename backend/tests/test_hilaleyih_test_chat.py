@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from app.agent.owner_chat_provider import get_owner_chat_provider
 from app.core.config import get_settings
 from app.database.models import ToolCallLog
-from app.integrations.hilaleyih_test import SOURCE_ID, stable_quantity
+from app.integrations.hilaleyih_test import SOURCE_ID
 from app.main import app
 from app.schemas.source_mapping import CatalogueProduct, CatalogueResult
 from app.services import hilaleyih_test as demo
@@ -111,6 +111,24 @@ def test_seven_acceptance_questions_use_persisted_authenticated_owner_path(
             assert product_id == product.external_product_id
             return {"Selling1": 1234, "ItemCurr": "unverified", "Unit": None}
 
+        def inventory(self, _product_id):
+            return dict(
+                unit="pc",
+                balance=None,
+                balance_reason="No matched balance.",
+                first_date="2023-01-02",
+                last_date="2023-02-02",
+                calendar_days=32,
+                line_count=10,
+                usable_lines=10,
+                demand_quantity=64,
+                negative_lines=0,
+                negative_quantity=0,
+                unusable_lines=0,
+                orphan_lines=0,
+                records=["synthetic-source-record"],
+            )
+
         def financial_summary(self, *_args):
             return [
                 dict(
@@ -135,7 +153,7 @@ def test_seven_acceptance_questions_use_persisted_authenticated_owner_path(
         ("What is the price of Pepsi Bottle 1.5 L?", "source amount 1234"),
         ("How much does this product cost?", "source amount 1234"),
         ("How many Pepsi bottles are in stock?", "DEMO stock"),
-        ("Check stock in the Jbeil branch.", "Jbeil test location"),
+        ("Check stock in the Jbeil branch.", "has no branches"),
         ("How many products are in our catalogue?", "9,343"),
         ("How many Paid SI sales documents were recorded in February 2023?", "5,815"),
         ("Give me historical revenue for February 2023.", "= 92"),
@@ -145,8 +163,8 @@ def test_seven_acceptance_questions_use_persisted_authenticated_owner_path(
         assert response.status_code == 200, response.text
         answer = response.json()["assistant_message"]["content"]
         assert expected in answer, answer
-        if index == 3:
-            assert str(stable_quantity(product.external_product_id, "jbeil")) in answer
+        if index == 2:
+            assert "14 pc DEMO stock proxy" in answer
         replay = submit(api_client, user, business["id"], question, key=str(index))
         assert (
             replay.json()["assistant_message"]["id"]
@@ -155,10 +173,10 @@ def test_seven_acceptance_questions_use_persisted_authenticated_owner_path(
     assert len(db_session.scalars(select(ToolCallLog)).all()) == 7
     for index, (question, expected) in enumerate(
         [
-            ("How many Pepsi bottles are in stock?", "Which catalogue variant"),
+            ("How many Pepsi bottles are in stock?", "DEMO stock proxy"),
             ("1", "DEMO stock"),
-            ("Check stock in the Jbeil branch.", "Jbeil test location"),
-            ("Check stock in the Unknown branch.", "Choose a DEMO test location"),
+            ("Check stock in the Jbeil branch.", "has no branches"),
+            ("Check stock in the Unknown branch.", "has no branches"),
             ("What is the price of nonexistent?", "No matching valid catalogue"),
             ("How much does this product cost?", "Which catalogue product"),
         ]

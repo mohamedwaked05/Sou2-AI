@@ -11,8 +11,8 @@ from app.integrations.discovery import SourceMappingError
 from app.integrations.hilaleyih_test import (
     BUSINESS_ID,
     HilaleyihHistoricalReader,
+    demand_proxy,
     estimated_price,
-    stable_quantity,
 )
 from app.services.hilaleyih_test import (
     enabled,
@@ -37,20 +37,18 @@ def test_exact_tenant_and_explicit_switch_are_required():
     assert not enabled(settings, uuid.UUID(BUSINESS_ID))
 
 
-def test_all_catalogue_identities_have_stable_bounded_demo_values():
-    # Synthetic identities exercise the whole algorithm, without private records.
-    values = [stable_quantity(str(i), "jbeil") for i in range(9343)]
-    assert all(0 <= quantity <= 200 for quantity in values)
-    assert values == [stable_quantity(str(i), "jbeil") for i in range(9343)]
-    assert len(set(values)) == 201
-    assert any(values[i] != stable_quantity(str(i), "default") for i in range(100))
+def test_prices_cover_catalogue_and_stock_requires_positive_quantity_evidence():
     assert all(Decimal("0.50") <= estimated_price(str(i)) <= 20 for i in range(9343))
+    assert demand_proxy(Decimal(288), 46) == 44
+    assert demand_proxy(Decimal(0), 46) is None
+    assert demand_proxy(Decimal(288), 0) is None
+    assert demand_proxy(Decimal(-2), 46) is None
 
 
 @pytest.mark.parametrize(
     ("question", "expected"),
     [
-        ("What is the price of Pepsi Bottle 1.5 L?", "pepsi bottle 1.5 l"),
+        ("What is the price of Pepsi Bottle 1.5 L?", "pepsi 1.5 l"),
         ("How much does this product cost?", ""),
         ("How many Pepsi bottles are in stock?", "pepsi"),
         ("Check stock in the Jbeil branch.", ""),
